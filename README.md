@@ -13,6 +13,7 @@ LeanCast is a lightweight native Windows app launcher. A global shortcut opens a
 - Keyboard-first controls: Up/Down, Enter, Ctrl+Shift+Enter, Esc
 - Configurable global shortcut, default `Alt+Space`
 - Compact mode, Windows accent sync, and custom accent color
+- Manual and daily GitHub Release update checks with verified installers
 - Background tray menu: Open LeanCast, Settings, Quit
 
 AI chat and AI provider settings were removed in the native remake.
@@ -39,7 +40,7 @@ Prerequisites on Windows:
 - Optional: NSIS if you want the CPack NSIS installer target
 
 ```powershell
-cmake -S . -B build-native -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build-native -G "Visual Studio 18 2026" -A x64
 cmake --build build-native --config Release
 ctest --test-dir build-native -C Release
 cpack --config build-native/CPackConfig.cmake -C Release
@@ -47,12 +48,15 @@ cpack --config build-native/CPackConfig.cmake -C Release
 
 The executable is produced as `build-native/Release/LeanCast.exe` with Visual Studio generators.
 
+Plugin authors should start with [docs/plugin-development.md](docs/plugin-development.md). Release and updater packaging notes are in [docs/releasing.md](docs/releasing.md).
+
 ## Settings and Cache
 
 Runtime data is stored under `%APPDATA%\LeanCast`:
 
-- `settings.json` stores `shortcut`, `recentApps`, `compactMode`, `syncAccentColor`, and `customAccentColor`
+- `settings.json` stores launcher preferences, recent usage, appearance settings, and update-check state
 - `icon-cache-native/` stores resolved PNG icons keyed by icon source
+- `update-log.txt` records update checks and installer verification events
 
 Older AI-related fields are ignored and are not written back by the native app.
 

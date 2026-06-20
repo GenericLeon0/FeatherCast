@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace leancast::shortcut {
@@ -32,6 +33,12 @@ struct HookResult {
   bool consume = false;
   bool toggle = false;
   bool suppressWinStart = false;
+};
+
+struct HotKeySpec {
+  bool supported = false;
+  UINT modifiers = 0;
+  UINT vk = 0;
 };
 
 inline std::wstring Trim(std::wstring value) {
@@ -168,6 +175,108 @@ inline std::wstring FormatShortcut(bool ctrl, bool alt, bool shift, bool win, UI
   return out;
 }
 
+struct RecordingResult {
+  bool consume = true;
+  bool done = false;
+  bool canceled = false;
+  std::wstring shortcut;
+};
+
+class ShortcutRecorder {
+ public:
+  void Reset() {
+    modifiers_ = {};
+    singleModifierCandidate_ = 0;
+    singleModifierChord_ = false;
+  }
+
+  RecordingResult Handle(UINT vk, bool down, bool up) {
+    if (down && vk == VK_ESCAPE) {
+      Reset();
+      RecordingResult result;
+      result.canceled = true;
+      return result;
+    }
+
+    if (down) {
+      if (IsModifier(vk)) {
+        OnModifierDown(GenericModifier(vk));
+        return {};
+      }
+
+      if (AnyModifierPressed()) {
+        singleModifierChord_ = true;
+        const auto key = KeyName(vk);
+        if (!key.empty()) {
+          return Finish(FormatShortcut(modifiers_.ctrl, modifiers_.alt, modifiers_.shift, modifiers_.win, vk));
+        }
+      }
+      return {};
+    }
+
+    if (up && IsModifier(vk)) {
+      const UINT generic = GenericModifier(vk);
+      const bool shouldRecordSingle = singleModifierCandidate_ == generic && !singleModifierChord_;
+      SetModifier(generic, false);
+      if (shouldRecordSingle) {
+        return Finish(FormatShortcut(false, false, false, false, 0, true, generic));
+      }
+      if (!AnyModifierPressed()) {
+        singleModifierCandidate_ = 0;
+        singleModifierChord_ = false;
+      }
+      return {};
+    }
+
+    return {};
+  }
+
+ private:
+  void OnModifierDown(UINT generic) {
+    const bool hadModifiers = AnyModifierPressed();
+    const bool alreadyPressed = IsModifierPressed(generic);
+    SetModifier(generic, true);
+
+    if (!hadModifiers && !alreadyPressed) {
+      singleModifierCandidate_ = generic;
+      singleModifierChord_ = false;
+    } else if (singleModifierCandidate_ != generic || hadModifiers) {
+      singleModifierChord_ = true;
+    }
+  }
+
+  bool AnyModifierPressed() const {
+    return modifiers_.ctrl || modifiers_.alt || modifiers_.shift || modifiers_.win;
+  }
+
+  bool IsModifierPressed(UINT generic) const {
+    if (generic == VK_CONTROL) return modifiers_.ctrl;
+    if (generic == VK_MENU) return modifiers_.alt;
+    if (generic == VK_SHIFT) return modifiers_.shift;
+    if (generic == VK_LWIN) return modifiers_.win;
+    return false;
+  }
+
+  void SetModifier(UINT generic, bool pressed) {
+    if (generic == VK_CONTROL) modifiers_.ctrl = pressed;
+    else if (generic == VK_MENU) modifiers_.alt = pressed;
+    else if (generic == VK_SHIFT) modifiers_.shift = pressed;
+    else if (generic == VK_LWIN) modifiers_.win = pressed;
+  }
+
+  RecordingResult Finish(std::wstring shortcut) {
+    Reset();
+    RecordingResult result;
+    result.done = true;
+    result.shortcut = std::move(shortcut);
+    return result;
+  }
+
+  PressedModifiers modifiers_;
+  UINT singleModifierCandidate_ = 0;
+  bool singleModifierChord_ = false;
+};
+
 inline ShortcutSpec ParseShortcut(const std::wstring& input) {
   ShortcutSpec spec;
   const std::wstring raw = Trim(input);
@@ -229,6 +338,26 @@ inline ShortcutSpec ParseShortcut(const std::wstring& input) {
   return spec;
 }
 
+inline HotKeySpec ToHotKeySpec(const ShortcutSpec& shortcut) {
+  HotKeySpec hotKey;
+  if (!shortcut.valid || shortcut.singleModifier || shortcut.vk == 0) return hotKey;
+
+  if (shortcut.ctrl) hotKey.modifiers |= MOD_CONTROL;
+  if (shortcut.alt) hotKey.modifiers |= MOD_ALT;
+  if (shortcut.shift) hotKey.modifiers |= MOD_SHIFT;
+  if (shortcut.win) hotKey.modifiers |= MOD_WIN;
+  hotKey.modifiers |= 0x4000;  // MOD_NOREPEAT, kept literal for older SDKs.
+  hotKey.vk = shortcut.vk;
+  hotKey.supported = hotKey.modifiers != 0;
+  return hotKey;
+}
+
+inline bool ShouldHandleInLowLevelHook(const ShortcutSpec& shortcut, bool registeredHotKeyActive) {
+  if (!shortcut.valid) return false;
+  if (shortcut.singleModifier) return true;
+  return !registeredHotKeyActive;
+}
+
 class ShortcutRuntime {
  public:
   HookResult Handle(const ShortcutSpec& shortcut, UINT vk, bool down, bool up, PressedModifiers modifiers) {
@@ -250,6 +379,7 @@ class ShortcutRuntime {
         if (singleModifierDown_ && !singleModifierChord_) {
           result.toggle = true;
           result.suppressWinStart = shortcut.singleModifierVk == VK_LWIN;
+          result.consume = !result.suppressWinStart;
         }
         singleModifierDown_ = false;
         singleModifierChord_ = false;
@@ -264,11 +394,17 @@ class ShortcutRuntime {
                          modifiers.shift == shortcut.shift &&
                          modifiers.win == shortcut.win;
       if (exact) {
-        HookResult result{true, !targetKeyDown_, false};
+        HookResult result{true, !targetKeyDown_, shortcut.win && !targetKeyDown_};
         targetKeyDown_ = true;
+        shortcutActive_ = true;
         return result;
       }
     } else if (up && vk == shortcut.vk) {
+      if (shortcutActive_) {
+        targetKeyDown_ = false;
+        shortcutActive_ = false;
+        return HookResult{true, false, false};
+      }
       targetKeyDown_ = false;
     }
 
@@ -279,6 +415,7 @@ class ShortcutRuntime {
   bool singleModifierDown_ = false;
   bool singleModifierChord_ = false;
   bool targetKeyDown_ = false;
+  bool shortcutActive_ = false;
 };
 
 }  // namespace leancast::shortcut

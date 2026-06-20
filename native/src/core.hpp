@@ -129,8 +129,11 @@ inline std::wstring JoinKeywords(const std::vector<std::wstring>& keywords) {
   return out;
 }
 
-inline double ScoreItem(const std::wstring& query, const SearchItem& item, const std::set<std::wstring>& recentIds) {
-  const auto queryTokens = Tokens(query);
+// Scores an item against an already-normalized query and its tokens. Hoisting the
+// query normalization/tokenization to the caller avoids recomputing it for every
+// item on every keystroke; the scoring is otherwise identical to the public overload.
+inline double ScoreItem(const std::wstring& normalizedQuery, const std::vector<std::wstring>& queryTokens,
+                        const SearchItem& item, const std::set<std::wstring>& recentIds) {
   if (queryTokens.empty()) return 0;
 
   const std::vector<WeightedField> fields = {
@@ -147,10 +150,9 @@ inline double ScoreItem(const std::wstring& query, const SearchItem& item, const
     total += best;
   }
 
-  const std::wstring q = Normalize(query);
   const std::wstring name = Normalize(item.name);
-  if (name == q) total += 2500;
-  else if (name.rfind(q, 0) == 0) total += 1200;
+  if (name == normalizedQuery) total += 2500;
+  else if (name.rfind(normalizedQuery, 0) == 0) total += 1200;
 
   if (recentIds.contains(item.id) || recentIds.contains(item.path)) total += 260;
   if (item.pinned) total += 1000;
@@ -160,6 +162,10 @@ inline double ScoreItem(const std::wstring& query, const SearchItem& item, const
   if (item.source == L"alias") total += 90;
   if (item.systemEssential) total += 70;
   return total;
+}
+
+inline double ScoreItem(const std::wstring& query, const SearchItem& item, const std::set<std::wstring>& recentIds) {
+  return ScoreItem(Normalize(query), Tokens(query), item, recentIds);
 }
 
 inline std::vector<size_t> Search(const std::wstring& query, const std::vector<SearchItem>& items, const std::set<std::wstring>& recentIds = {}) {
@@ -173,17 +179,22 @@ inline std::vector<size_t> Search(const std::wstring& query, const std::vector<S
   struct Scored {
     size_t index = 0;
     double score = 0;
+    std::wstring lowerName;
   };
+
+  // Normalize/tokenize the query once instead of per item.
+  const std::wstring normalizedQuery = Normalize(query);
+  const std::vector<std::wstring> queryTokens = Tokens(query);
 
   std::vector<Scored> scored;
   for (size_t i = 0; i < items.size(); ++i) {
-    const double score = ScoreItem(query, items[i], recentIds);
-    if (score >= 0) scored.push_back({i, score});
+    const double score = ScoreItem(normalizedQuery, queryTokens, items[i], recentIds);
+    if (score >= 0) scored.push_back({i, score, Lower(items[i].name)});
   }
 
-  std::sort(scored.begin(), scored.end(), [&](const Scored& a, const Scored& b) {
+  std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
     if (a.score != b.score) return a.score > b.score;
-    return Lower(items[a.index].name) < Lower(items[b.index].name);
+    return a.lowerName < b.lowerName;
   });
 
   std::vector<size_t> out;
