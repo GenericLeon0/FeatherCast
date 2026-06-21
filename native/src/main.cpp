@@ -37,13 +37,16 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,6 +56,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -170,6 +174,7 @@ enum class HitType {
   SaveShortcut,
   ClearShortcut,
   CompactToggle,
+  AnimationsToggle,
   AccentToggle,
   AccentColor,
   StartupToggle,
@@ -265,6 +270,7 @@ struct Settings {
   };
   std::map<std::wstring, UsageStat> usageStats;
   bool compactMode = false;
+  bool animationsEnabled = true;
   bool syncAccentColor = true;
   std::wstring customAccentColor = L"#5b6cff";
   bool startOnStartup = false;
@@ -416,9 +422,37 @@ struct Section {
   std::vector<DisplayItem> items;
 };
 
+// Query-independent search corpus. This is the expensive part to build (it deep-
+// copies every app/window/file into DisplayItems and derives a SearchItem for
+// each), but it only changes when the underlying data or settings change, never
+// when the query text changes. It is therefore built once per data/settings
+// version (BuildSnapshot) and shared across keystrokes via shared_ptr<const>, so
+// typing fast no longer rebuilds the corpus on every character. Immutable once
+// built, so the search worker can read it without locking.
+struct SearchSnapshot {
+  // Non-empty search path (pool is parallel to searchItems).
+  std::vector<DisplayItem> pool;
+  std::vector<leancast::core::SearchItem> searchItems;
+
+  // Empty-query path (pre-bucketed; needs settings_).
+  std::vector<DisplayItem> pinned;
+  std::vector<DisplayItem> recent;
+  std::vector<DisplayItem> windowItems;
+  std::vector<DisplayItem> system;
+  std::vector<DisplayItem> systemFolders;
+  std::vector<DisplayItem> commandItems;
+  std::vector<DisplayItem> snippetItems;
+  std::vector<DisplayItem> clipboardItems;
+
+  // Clipboard browse-view path (parallel to clipboardItems).
+  std::vector<leancast::core::SearchItem> clipboardSearchItems;
+};
+
 // Self-contained snapshot of everything the search engine needs to produce a
-// result set. Built on the UI thread (the only place settings_/apps_ are read)
-// and handed to ComputeResults, which is pure and may run on a worker thread.
+// result set. The heavy, query-independent corpus is referenced through a shared
+// SearchSnapshot; the remaining fields are cheap and query/mode specific, so they
+// are gathered on the UI thread per request. Handed to ComputeResults, which is
+// pure and may run on a worker thread.
 struct QueryRequest {
   unsigned long long generation = 0;
   std::wstring query;
@@ -431,27 +465,15 @@ struct QueryRequest {
   std::map<std::wstring, std::wstring> searchEngines;   // web search prefixes
   std::map<std::wstring, double> currencyRates;          // code -> rate per USD
 
-  // Non-empty search path (pool is parallel to searchItems).
-  std::vector<DisplayItem> pool;
-  std::vector<leancast::core::SearchItem> searchItems;
+  // Cached, query-independent corpus shared across keystrokes.
+  std::shared_ptr<const SearchSnapshot> snapshot;
 
-  // Empty-query path (pre-bucketed on the UI thread; needs settings_).
-  std::vector<DisplayItem> pinned;
-  std::vector<DisplayItem> recent;
-  std::vector<DisplayItem> windowItems;
-  std::vector<DisplayItem> system;
-  std::vector<DisplayItem> systemFolders;
-  std::vector<DisplayItem> commandItems;
+  // Query-dependent extension results (from the extension result cache).
   std::vector<DisplayItem> extensionItems;
-  std::vector<DisplayItem> snippetItems;
-  std::vector<DisplayItem> clipboardItems;
 
-  // Action-mode path.
+  // Action-mode path (target-specific; built per request).
   std::vector<DisplayItem> actions;
   std::vector<leancast::core::SearchItem> actionSearchItems;
-
-  // Clipboard browse-view path (parallel to clipboardItems).
-  std::vector<leancast::core::SearchItem> clipboardSearchItems;
 };
 
 struct ResultsCollection {
@@ -1637,6 +1659,7 @@ Settings LoadSettings() {
   settings.appAliases = JsonStringObject(json, "appAliases");
   settings.usageStats = JsonUsageStats(json, "usageStats");
   settings.compactMode = JsonBool(json, "compactMode", settings.compactMode);
+  settings.animationsEnabled = JsonBool(json, "animationsEnabled", settings.animationsEnabled);
   settings.syncAccentColor = JsonBool(json, "syncAccentColor", settings.syncAccentColor);
   if (auto custom = JsonString(json, "customAccentColor")) settings.customAccentColor = Utf8ToWide(*custom);
   settings.startOnStartup = JsonBool(json, "startOnStartup", settings.startOnStartup);
@@ -1678,6 +1701,7 @@ void SaveSettings(const Settings& settings) {
   WriteUsageStats(file, settings.usageStats);
   file << ",\n";
   file << "  \"compactMode\": " << (settings.compactMode ? "true" : "false") << ",\n";
+  file << "  \"animationsEnabled\": " << (settings.animationsEnabled ? "true" : "false") << ",\n";
   file << "  \"syncAccentColor\": " << (settings.syncAccentColor ? "true" : "false") << ",\n";
   file << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\",\n";
   file << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << ",\n";
@@ -1977,6 +2001,7 @@ class LeanCastApp {
     RegisterShortcutHotKey();
     InstallHook();
     StartSearchWorker();
+    StartIconWorkers();
     StartAppDiscovery();
     StartCurrencyFetch();
     StartAutomaticUpdateCheck();
@@ -2058,8 +2083,17 @@ class LeanCastApp {
                 return 0;
               }
             }
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            // Only repaint when the caret blink phase actually flips; an otherwise
+            // idle overlay no longer re-renders five times a second.
+            const bool phase = CaretPhase();
+            if (phase != lastCaretPhase_) {
+              lastCaretPhase_ = phase;
+              InvalidateRect(hwnd_, nullptr, FALSE);
+            }
           }
+        } else if (wParam == 2) {
+          if (visible_ && animating_) InvalidateRect(hwnd_, nullptr, FALSE);
+          else KillTimer(hwnd_, 2);
         }
         return 0;
       case WM_CREATE:
@@ -2136,7 +2170,13 @@ class LeanCastApp {
         ShowOverlay(View::Search);
         return 0;
       case WM_ICON_READY:
+        RequestSearch();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return 0;
       case WM_REBUILD_RESULTS:
+        // Data-mutation sites (apps_/windows_/fileIndex_/snippets_/clipboard) and
+        // settings changes mark snapshotDirty_ themselves; this also fires for
+        // async extension results, which do not affect the cached corpus.
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
@@ -2464,6 +2504,7 @@ class LeanCastApp {
         apps_ = std::move(apps);
         appsReady_ = true;
       }
+      snapshotDirty_ = true;
       if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
       BuildFileIndex(stopToken);
       if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
@@ -2542,6 +2583,7 @@ class LeanCastApp {
       std::lock_guard lock(dataMutex_);
       fileIndex_ = std::move(files);
     }
+    snapshotDirty_ = true;
     {
       std::lock_guard lock(storageMutex_);
       if (storage_.IsOpen()) storage_.ReplaceFileIndex(storageEntries);
@@ -2608,7 +2650,7 @@ class LeanCastApp {
     }
 
     settings_.lastUpdateCheck = UnixNow();
-    SaveSettings(settings_);
+    PersistSettings();
     const std::wstring dismissedVersion = settings_.dismissedUpdateVersion;
 
     updateWorkerRunning_ = true;
@@ -2772,11 +2814,11 @@ class LeanCastApp {
                                        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1);
         if (choice == IDYES) {
           settings_.dismissedUpdateVersion.clear();
-          SaveSettings(settings_);
+          PersistSettings();
           StartUpdateDownload(std::move(result->release), result->manual);
         } else if (!result->manual) {
           settings_.dismissedUpdateVersion = result->release.tagName;
-          SaveSettings(settings_);
+          PersistSettings();
         }
         return;
       }
@@ -2970,6 +3012,7 @@ class LeanCastApp {
       std::lock_guard lock(dataMutex_);
       windows_ = std::move(windows);
     }
+    snapshotDirty_ = true;
   }
 
   std::vector<DisplayItem> BuiltInCommands() const {
@@ -3037,6 +3080,14 @@ class LeanCastApp {
   // Cheap result sets (empty query, action mode) are computed synchronously so
   // callers that immediately show/position the window see correct sizing with
   // no flicker; the expensive full-pool search is offloaded to the worker.
+  // Persist settings and invalidate the cached search corpus, since several
+  // settings (pinnedApps, appAliases, usageStats, hiddenApps, showStoreApps,
+  // quicklinks, recentApps) feed into the snapshot's items and ranking.
+  void PersistSettings() {
+    SaveSettings(settings_);
+    snapshotDirty_ = true;
+  }
+
   void RequestSearch() {
     QueryRequest req = GatherRequest();
     if (!req.compactClear && !req.empty && !req.actionMode) {
@@ -3049,20 +3100,15 @@ class LeanCastApp {
     }
   }
 
-  // UI thread: snapshot all inputs the engine needs. This is the only place
-  // settings_/apps_/windows_ are read for a search, keeping ComputeResults pure.
+  // UI thread: snapshot all inputs the engine needs. The heavy, query-independent
+  // corpus is taken from a cached SearchSnapshot (rebuilt only when data/settings
+  // change), so this stays cheap per keystroke. Only query/mode-specific fields
+  // are gathered here. This is the only place settings_/apps_/windows_ are read
+  // for a search, keeping ComputeResults pure.
   QueryRequest GatherRequest() {
     QueryRequest req;
     req.generation = ++searchGeneration_;
     req.query = query_;
-
-    std::vector<AppEntry> apps;
-    std::vector<WindowEntry> windows;
-    {
-      std::lock_guard lock(dataMutex_);
-      apps = apps_;
-      windows = windows_;
-    }
 
     const bool empty = Trim(query_).empty();
     req.empty = empty;
@@ -3080,6 +3126,45 @@ class LeanCastApp {
 
     if (req.compactClear) return req;
 
+    if (snapshotDirty_ || !snapshot_) {
+      snapshot_ = BuildSnapshot();
+      snapshotDirty_ = false;
+    }
+    req.snapshot = snapshot_;
+
+    // Action mode builds a small, target-specific list each call.
+    if (req.actionMode) {
+      req.actions = ActionsFor(actionTarget_);
+      if (!empty) {
+        for (const auto& item : req.actions) req.actionSearchItems.push_back(ToSearchItem(item));
+      }
+      return req;
+    }
+
+    // Query-dependent extension results (read from the extension result cache).
+    if (!empty) {
+      for (const auto& extensionResult : extensions_.CachedResultsFor(query_)) {
+        req.extensionItems.push_back(ExtensionDisplay(extensionResult));
+      }
+    }
+
+    return req;
+  }
+
+  // Builds the query-independent search corpus once per data/settings version.
+  // Expensive (deep-copies every app/window/file and derives a SearchItem each),
+  // so it runs only when snapshotDirty_ is set, not on every keystroke.
+  std::shared_ptr<const SearchSnapshot> BuildSnapshot() {
+    auto snap = std::make_shared<SearchSnapshot>();
+
+    std::vector<AppEntry> apps;
+    std::vector<WindowEntry> windows;
+    {
+      std::lock_guard lock(dataMutex_);
+      apps = apps_;
+      windows = windows_;
+    }
+
     std::vector<DisplayItem> appItems;
     for (const auto& app : apps) {
       if (ContainsAnyAppKey(settings_.hiddenApps, app)) continue;
@@ -3095,21 +3180,13 @@ class LeanCastApp {
       appItems.push_back(AppDisplay(folder));
     }
     for (const auto& snippet : snippets_) {
-      req.snippetItems.push_back(SnippetDisplay(snippet));
+      snap->snippetItems.push_back(SnippetDisplay(snippet));
     }
     for (const auto& entry : clipboardHistory_) {
-      req.clipboardItems.push_back(ClipboardDisplay(entry));
+      snap->clipboardItems.push_back(ClipboardDisplay(entry));
     }
-
-    // Dedicated browse views need only their own category; skip the rest.
-    if (browseView_ == BrowseView::Clipboard) {
-      if (!empty) {
-        for (const auto& item : req.clipboardItems) req.clipboardSearchItems.push_back(ToSearchItem(item));
-      }
-      return req;
-    }
-    if (browseView_ == BrowseView::Emoji) {
-      return req;
+    for (const auto& item : snap->clipboardItems) {
+      snap->clipboardSearchItems.push_back(ToSearchItem(item));
     }
 
     std::vector<DisplayItem> windowItems;
@@ -3117,54 +3194,43 @@ class LeanCastApp {
       for (const auto& window : windows) windowItems.push_back(WindowDisplay(window));
     }
     auto commandItems = BuiltInCommands();
-    if (!empty && !req.actionMode) {
-      for (const auto& extensionResult : extensions_.CachedResultsFor(query_)) {
-        req.extensionItems.push_back(ExtensionDisplay(extensionResult));
-      }
-    }
 
-    if (req.actionMode) {
-      req.actions = ActionsFor(actionTarget_);
-      if (!empty) {
-        for (const auto& item : req.actions) req.actionSearchItems.push_back(ToSearchItem(item));
-      }
-      return req;
-    }
-
-    if (empty) {
+    // Empty-state buckets.
+    {
       std::map<std::wstring, DisplayItem> byId;
       for (const auto& item : appItems) {
         for (const auto& key : AppKeys(item.app)) byId[key] = item;
       }
       for (const auto& item : appItems) {
-        if (ContainsAnyAppKey(settings_.pinnedApps, item.app)) req.pinned.push_back(item);
+        if (ContainsAnyAppKey(settings_.pinnedApps, item.app)) snap->pinned.push_back(item);
       }
       for (const auto& id : settings_.recentApps) {
-        if (byId.contains(id)) req.recent.push_back(byId[id]);
+        if (byId.contains(id)) snap->recent.push_back(byId[id]);
       }
       for (const auto& item : appItems) {
-        if (item.app.systemEssential || item.app.source == L"alias" || item.app.source == L"quicklink") req.system.push_back(item);
-        if (item.app.source == L"system-folder") req.systemFolders.push_back(item);
+        if (item.app.systemEssential || item.app.source == L"alias" || item.app.source == L"quicklink") snap->system.push_back(item);
+        if (item.app.source == L"system-folder") snap->systemFolders.push_back(item);
       }
-      req.windowItems = std::move(windowItems);
-      req.commandItems = std::move(commandItems);
-      return req;
     }
+    snap->windowItems = windowItems;    // also folded into the pool below
+    snap->commandItems = commandItems;  // also folded into the pool below
 
+    // Non-empty general search pool (parallel to searchItems). Files & folders
+    // are only searched when there is a query, so they live solely in the pool.
     std::vector<DisplayItem> pool = std::move(windowItems);
-    pool.insert(pool.end(), req.snippetItems.begin(), req.snippetItems.end());
-    pool.insert(pool.end(), req.clipboardItems.begin(), req.clipboardItems.end());
+    pool.insert(pool.end(), snap->snippetItems.begin(), snap->snippetItems.end());
+    pool.insert(pool.end(), snap->clipboardItems.begin(), snap->clipboardItems.end());
     pool.insert(pool.end(), appItems.begin(), appItems.end());
     pool.insert(pool.end(), commandItems.begin(), commandItems.end());
-    // Files & folders are only searched when there is a query, keeping the empty
-    // state app-focused and avoiding scanning churn on every keystroke.
     {
       std::lock_guard lock(dataMutex_);
       for (const auto& file : fileIndex_) pool.push_back(AppDisplay(file));
     }
-    for (const auto& item : pool) req.searchItems.push_back(ToSearchItem(item));
-    req.pool = std::move(pool);
-    return req;
+    snap->searchItems.reserve(pool.size());
+    for (const auto& item : pool) snap->searchItems.push_back(ToSearchItem(item));
+    snap->pool = std::move(pool);
+
+    return snap;
   }
 
   // Pure engine: QueryRequest -> ResultsCollection. No member/UI state access,
@@ -3194,11 +3260,11 @@ class LeanCastApp {
       // Render nothing.
     } else if (req.browseView == BrowseView::Clipboard) {
       if (req.empty) {
-        addSection(L"Clipboard History", take(req.clipboardItems));
+        addSection(L"Clipboard History", take(req.snapshot->clipboardItems));
       } else {
-        auto order = leancast::core::Search(req.query, req.clipboardSearchItems);
+        auto order = leancast::core::Search(req.query, req.snapshot->clipboardSearchItems);
         std::vector<DisplayItem> hits;
-        for (const auto index : order) hits.push_back(req.clipboardItems[index]);
+        for (const auto index : order) hits.push_back(req.snapshot->clipboardItems[index]);
         addSection(L"Clipboard History", take(hits));
       }
     } else if (req.browseView == BrowseView::Emoji) {
@@ -3217,14 +3283,14 @@ class LeanCastApp {
         addSection(L"Actions", take(hits));
       }
     } else if (req.empty) {
-      addSection(L"Pinned", take(req.pinned, 12));
-      addSection(L"Recently used", take(req.recent, 8));
-      addSection(L"Open windows", take(req.windowItems));
-      addSection(L"Snippets", take(req.snippetItems, 8));
-      addSection(L"Clipboard History", take(req.clipboardItems, 5));
-      addSection(L"System Folders", take(req.systemFolders, 12));
-      addSection(L"System essentials", take(req.system, 8));
-      addSection(L"Commands", take(req.commandItems, 8));
+      addSection(L"Pinned", take(req.snapshot->pinned, 12));
+      addSection(L"Recently used", take(req.snapshot->recent, 8));
+      addSection(L"Open windows", take(req.snapshot->windowItems));
+      addSection(L"Snippets", take(req.snapshot->snippetItems, 8));
+      addSection(L"Clipboard History", take(req.snapshot->clipboardItems, 5));
+      addSection(L"System Folders", take(req.snapshot->systemFolders, 12));
+      addSection(L"System essentials", take(req.snapshot->system, 8));
+      addSection(L"Commands", take(req.snapshot->commandItems, 8));
     } else {
       const std::wstring trimmed = Trim(req.query);
       if (StartsWith(trimmed, L">")) {
@@ -3263,12 +3329,13 @@ class LeanCastApp {
 
       addSection(L"Extensions", take(req.extensionItems, 20));
 
-      auto order = leancast::core::Search(req.query, req.searchItems, req.recentIds);
+      auto order = leancast::core::Search(req.query, req.snapshot->searchItems, req.recentIds);
       const size_t limit = static_cast<size_t>(req.limit);
       if (order.size() > limit) order.resize(limit);
 
       std::vector<DisplayItem> hits;
-      for (const auto index : order) hits.push_back(req.pool[index]);
+      hits.reserve(order.size());
+      for (const auto index : order) hits.push_back(req.snapshot->pool[index]);
 
       if (!hits.empty()) addSection(L"Best match", take({hits.front()}, 1));
 
@@ -3509,13 +3576,25 @@ class LeanCastApp {
       SetFocus(hwnd_);
     }
 
+    // Ignore the mouse pointer until it is actually moved, so an overlay that
+    // opens under the cursor does not hover-select the result beneath it.
+    GetCursorPos(&mouseAnchor_);
+    ignoreMouseUntilMove_ = true;
+
     SetTimer(hwnd_, 1, 200, nullptr);
     visible_ = true;
+    animating_ = settings_.animationsEnabled;
+    if (animating_) {
+      animStart_ = GetTickCount64();
+      SetTimer(hwnd_, 2, 16, nullptr);  // fast repaint timer for the reveal animation
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
   void HideOverlay(bool restoreFocus) {
     KillTimer(hwnd_, 1);
+    KillTimer(hwnd_, 2);
+    animating_ = false;
     visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
     overlayMonitor_ = nullptr;
@@ -3751,11 +3830,36 @@ class LeanCastApp {
       renderTarget_->BeginDraw();
       renderTarget_->Clear(D2D1::ColorF(0.0f, 0.0f));
       hits_.clear();
+
+      // Whole-panel open animation: scale up + rise + fade as one unit. The
+      // transparent (DWM-composited) corners let the scale read cleanly.
+      const PanelAnim pa = ComputePanelAnim();
+      const bool animatingPanel = pa.opacity < 1.0f;
+      if (animatingPanel) {
+        RECT rc{};
+        GetClientRect(hwnd_, &rc);
+        const float pivotX = (rc.right - rc.left) * 0.5f;
+        renderTarget_->SetTransform(
+            D2D1::Matrix3x2F::Scale(pa.scale, pa.scale, D2D1::Point2F(pivotX, 0.0f)) *
+            D2D1::Matrix3x2F::Translation(0.0f, pa.dy));
+        renderTarget_->PushLayer(
+            D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                  D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                  D2D1::IdentityMatrix(), pa.opacity),
+            nullptr);
+      }
+
       DrawSearch();
+
+      if (animatingPanel) {
+        renderTarget_->PopLayer();
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+      }
       const HRESULT hr = renderTarget_->EndDraw();
       if (hr == D2DERR_RECREATE_TARGET) {
         renderTarget_.Reset();
-        iconBitmaps_.clear();
+        ClearIconBitmaps();
+        brushCache_.clear();
       }
       activeRT_ = nullptr;
       activeDC_.Reset();
@@ -3775,6 +3879,7 @@ class LeanCastApp {
       DrawSettings();
       const HRESULT hr = settingsRenderTarget_->EndDraw();
       if (hr == D2DERR_RECREATE_TARGET) {
+        brushCache_.erase(settingsRenderTarget_.Get());
         settingsRenderTarget_.Reset();
       }
       activeRT_ = nullptr;
@@ -3783,9 +3888,23 @@ class LeanCastApp {
     EndPaint(settingsHwnd_, &ps);
   }
 
+  static uint32_t ColorKey(const D2D1_COLOR_F& color) {
+    auto clamp8 = [](float v) -> uint32_t {
+      const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+      return static_cast<uint32_t>(c * 255.0f + 0.5f);
+    };
+    return (clamp8(color.r) << 24) | (clamp8(color.g) << 16) | (clamp8(color.b) << 8) | clamp8(color.a);
+  }
+
+  // Reuse solid-color brushes across draw calls. Brushes are device-bound, so the
+  // cache is keyed by the active render target as well as the color.
   ComPtr<ID2D1SolidColorBrush> Brush(D2D1_COLOR_F color) {
+    auto& byColor = brushCache_[activeRT_];
+    const uint32_t key = ColorKey(color);
+    if (auto it = byColor.find(key); it != byColor.end()) return it->second;
     ComPtr<ID2D1SolidColorBrush> brush;
     activeRT_->CreateSolidColorBrush(color, brush.GetAddressOf());
+    if (brush) byColor.emplace(key, brush);
     return brush;
   }
 
@@ -3845,6 +3964,30 @@ class LeanCastApp {
     }
   }
 
+  static bool CaretPhase() {
+    const UINT blink = GetCaretBlinkTime();
+    return (GetTickCount() / (blink ? blink : 530)) % 2 == 0;
+  }
+
+  // Width of `text` in the input font, used to place the caret. Cached so a steady
+  // (non-typing) overlay doesn't rebuild an IDWriteTextLayout on every repaint.
+  float MeasureCaretOffset(const std::wstring& text, float width) {
+    if (text == caretMeasureText_ && width == caretMeasureWidth_) return caretOffset_;
+    float offset = 0.0f;
+    ComPtr<IDWriteTextLayout> layout;
+    if (SUCCEEDED(dwriteFactory_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
+                                                   inputFormat_.Get(), width - 94 - 52, 48,
+                                                   layout.GetAddressOf()))) {
+      DWRITE_TEXT_METRICS metrics{};
+      layout->GetMetrics(&metrics);
+      offset = metrics.width;
+    }
+    caretMeasureText_ = text;
+    caretMeasureWidth_ = width;
+    caretOffset_ = offset;
+    return offset;
+  }
+
   void DrawSearch() {
     RECT rc{};
     GetClientRect(hwnd_, &rc);
@@ -3863,23 +4006,9 @@ class LeanCastApp {
     float caretX = 52.0f;
     if (!query_.empty()) {
       ClampCaret();
-      const std::wstring beforeCaret = query_.substr(0, caret_);
-      ComPtr<IDWriteTextLayout> layout;
-      HRESULT hr = dwriteFactory_->CreateTextLayout(
-          beforeCaret.c_str(),
-          static_cast<UINT32>(beforeCaret.size()),
-          inputFormat_.Get(),
-          width - 94 - 52,
-          48,
-          layout.GetAddressOf()
-      );
-      if (SUCCEEDED(hr)) {
-        DWRITE_TEXT_METRICS metrics{};
-        layout->GetMetrics(&metrics);
-        caretX = 52.0f + metrics.width;
-      }
+      caretX = 52.0f + MeasureCaretOffset(query_.substr(0, caret_), width);
     }
-    const bool showCaret = (GetTickCount() / GetCaretBlinkTime()) % 2 == 0;
+    const bool showCaret = CaretPhase();
     if (showCaret) {
       auto caretBrush = Brush(D2DColor(accent));
       activeRT_->DrawLine(
@@ -3925,13 +4054,36 @@ class LeanCastApp {
       for (const auto& item : section.items) {
         RectF rowRect{8, y, width - 8, y + 46};
         if (rowRect.bottom >= resultsTop && rowRect.top <= resultsBottom) {
-          DrawResultRow(item, rowRect, rowIndex);
+          const RowAnim anim = ComputeRowAnim(rowIndex);
+          const bool revealing = anim.opacity < 1.0f || anim.dx != 0.0f;
+          if (revealing) {
+            // Compose the row slide onto the current transform (the panel
+            // pop), so both animations layer instead of overwriting each other.
+            D2D1_MATRIX_3X2_F base;
+            activeRT_->GetTransform(&base);
+            activeRT_->SetTransform(D2D1::Matrix3x2F::Translation(-anim.dx, 0.0f) * base);
+            activeRT_->PushLayer(
+                D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                      D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                      D2D1::IdentityMatrix(), anim.opacity),
+                nullptr);
+            DrawResultRow(item, rowRect, rowIndex);
+            activeRT_->PopLayer();
+            activeRT_->SetTransform(base);
+          } else {
+            DrawResultRow(item, rowRect, rowIndex);
+          }
         }
         y += 48;
         ++rowIndex;
       }
     }
     activeRT_->PopAxisAlignedClip();
+
+    if (animating_ && static_cast<double>(GetTickCount64() - animStart_) >= AnimFinishMs()) {
+      animating_ = false;
+      KillTimer(hwnd_, 2);
+    }
 
     if (sections_.empty()) {
       DrawTextBlock(appsReady_ ? L"No results" : L"Loading apps...", {0, 170, width, 210}, centerFormat_.Get(), D2DColor(theme_.textMuted));
@@ -3943,6 +4095,48 @@ class LeanCastApp {
       DrawTextBlock(L"LeanCast", {16, height - 28.0f, 160, height - 12.0f}, footerFormat_.Get(), D2DColor(theme_.textPrimary));
       DrawTextBlock(L"Up/Down Navigate | Enter Open | Tab Actions | Esc Close", {200, height - 28.0f, width - 16.0f, height - 12.0f}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
     }
+  }
+
+  // Open-search reveal animation tuning. Two motions layer together: the whole
+  // panel eases in as one unit (a quick fade + subtle scale-up + upward slide),
+  // while result rows additionally stagger in from the left, top-first. Capped
+  // stagger keeps the whole reveal short regardless of row count.
+  static constexpr double kAnimDurationMs = 150.0;
+  static constexpr float kAnimStartScale = 0.97f;
+  static constexpr float kAnimSlidePx = 10.0f;
+  static constexpr double kRowDurationMs = 170.0;
+  static constexpr double kRowStaggerMs = 28.0;
+  static constexpr float kRowSlidePx = 26.0f;
+  static constexpr int kRowMaxStaggerRows = 9;
+
+  struct PanelAnim { float opacity; float scale; float dy; };
+
+  PanelAnim ComputePanelAnim() const {
+    if (!animating_) return {1.0f, 1.0f, 0.0f};
+    double t = static_cast<double>(GetTickCount64() - animStart_) / kAnimDurationMs;
+    t = std::clamp(t, 0.0, 1.0);
+    const double eased = 1.0 - std::pow(1.0 - t, 3.0);  // ease-out cubic
+    return {
+        static_cast<float>(eased),
+        static_cast<float>(kAnimStartScale + (1.0f - kAnimStartScale) * eased),
+        static_cast<float>((1.0 - eased) * kAnimSlidePx),
+    };
+  }
+
+  struct RowAnim { float opacity; float dx; };
+
+  RowAnim ComputeRowAnim(int rowIndex) const {
+    if (!animating_) return {1.0f, 0.0f};
+    const double elapsed = static_cast<double>(GetTickCount64() - animStart_);
+    const double delay = std::min(rowIndex, kRowMaxStaggerRows) * kRowStaggerMs;
+    double t = (elapsed - delay) / kRowDurationMs;
+    t = std::clamp(t, 0.0, 1.0);
+    const double eased = 1.0 - std::pow(1.0 - t, 3.0);  // ease-out cubic
+    return {static_cast<float>(eased), static_cast<float>((1.0 - eased) * kRowSlidePx)};
+  }
+
+  double AnimFinishMs() const {
+    return std::max(kAnimDurationMs, kRowMaxStaggerRows * kRowStaggerMs + kRowDurationMs);
   }
 
   void DrawResultRow(const DisplayItem& item, RectF rowRect, int rowIndex) {
@@ -4028,7 +4222,7 @@ class LeanCastApp {
   int SettingsContentHeight() const {
     float h = kSettTop;
     h += kSettSection + kSettShortcut;            // Shortcut
-    h += kSettSection + 3 * kSettRow;             // General
+    h += kSettSection + 4 * kSettRow;             // General
     h += kSettSection + 4 * kSettRow;             // Results
     h += kSettSection + kSettRow + (settings_.syncAccentColor ? 0.0f : 48.0f);  // Appearance
     h += kSettSection + kSettMaint;               // Maintenance
@@ -4145,6 +4339,9 @@ class LeanCastApp {
     DrawSettingRowLabel(y, kSettRow, L"Compact Mode", L"Show only the search bar at rest; results expand below.", width - 90);
     DrawSwitch(y, kSettRow, settings_.compactMode, HitType::CompactToggle, width);
     y += kSettRow;
+    DrawSettingRowLabel(y, kSettRow, L"Enable Animations", L"Animate results when the search opens.", width - 90);
+    DrawSwitch(y, kSettRow, settings_.animationsEnabled, HitType::AnimationsToggle, width);
+    y += kSettRow;
 
     // ---- Results ----
     y = DrawSettingsSection(y, L"RESULTS", width);
@@ -4196,16 +4393,42 @@ class LeanCastApp {
     hits_.push_back({rect, type});
   }
 
+  // Look up the cached bitmap, promoting it to most-recently-used. The (UI-thread-only)
+  // iconBitmaps_/iconLru_ pair is not guarded by iconQueueMutex_ on purpose.
+  ComPtr<ID2D1Bitmap> CachedIconBitmap(const std::wstring& key) {
+    auto it = iconBitmaps_.find(key);
+    if (it == iconBitmaps_.end()) return nullptr;
+    iconLru_.splice(iconLru_.begin(), iconLru_, it->second.lruIt);
+    return it->second.bitmap;
+  }
+
+  void StoreIconBitmap(const std::wstring& key, ComPtr<ID2D1Bitmap> bitmap) {
+    if (auto existing = iconBitmaps_.find(key); existing != iconBitmaps_.end()) {
+      iconLru_.erase(existing->second.lruIt);
+    }
+    iconLru_.push_front(key);
+    iconBitmaps_[key] = IconCacheEntry{std::move(bitmap), iconLru_.begin()};
+    while (iconBitmaps_.size() > kIconCacheCap && !iconLru_.empty()) {
+      iconBitmaps_.erase(iconLru_.back());
+      iconLru_.pop_back();
+    }
+  }
+
+  void ClearIconBitmaps() {
+    iconBitmaps_.clear();
+    iconLru_.clear();
+  }
+
   ComPtr<ID2D1Bitmap> IconBitmap(const std::wstring& key) {
     if (key.empty() || !renderTarget_) return nullptr;
-    if (iconBitmaps_.contains(key)) return iconBitmaps_[key];
+    if (auto cached = CachedIconBitmap(key)) return cached;
 
     const auto png = IconCachePath(key);
     std::error_code ec;
     if (std::filesystem::exists(png, ec)) {
       auto bitmap = LoadBitmapFromFile(png);
       if (bitmap) {
-        iconBitmaps_[key] = bitmap;
+        StoreIconBitmap(key, bitmap);
         return bitmap;
       }
     }
@@ -4214,24 +4437,47 @@ class LeanCastApp {
     return nullptr;
   }
 
+  // Hand the key to the persistent icon worker pool. No thread is created here,
+  // so repeated searches no longer accumulate threads.
   void QueueIcon(const std::wstring& key) {
     {
       std::lock_guard lock(iconQueueMutex_);
       if (pendingIcons_.contains(key)) return;
       pendingIcons_.insert(key);
+      iconJobs_.push_back(key);
     }
+    iconCv_.notify_one();
+  }
 
+  void StartIconWorkers() {
+    const unsigned hw = std::thread::hardware_concurrency();
+    const size_t workers = std::min<size_t>(3, std::max<unsigned>(2, hw / 2));
     std::lock_guard threadLock(workerThreadsMutex_);
-    iconThreads_.emplace_back([this, key](std::stop_token stopToken) {
-      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-      if (!stopToken.stop_requested() && !stopThreads_) ResolveIconToCache(key);
+    for (size_t i = 0; i < workers; ++i) {
+      iconThreads_.emplace_back([this](std::stop_token stopToken) { IconWorkerLoop(stopToken); });
+    }
+  }
+
+  void IconWorkerLoop(std::stop_token stopToken) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    for (;;) {
+      std::wstring key;
+      {
+        std::unique_lock lock(iconQueueMutex_);
+        iconCv_.wait(lock, [&] { return !iconJobs_.empty() || stopThreads_ || stopToken.stop_requested(); });
+        if (stopThreads_ || stopToken.stop_requested()) break;
+        key = std::move(iconJobs_.front());
+        iconJobs_.pop_front();
+      }
+
+      if (!stopThreads_ && !stopToken.stop_requested()) ResolveIconToCache(key);
       {
         std::lock_guard lock(iconQueueMutex_);
         pendingIcons_.erase(key);
       }
-      if (!stopToken.stop_requested() && !stopThreads_) PostMessageW(hwnd_, WM_ICON_READY, 0, 0);
-      CoUninitialize();
-    });
+      if (!stopThreads_ && !stopToken.stop_requested()) PostMessageW(hwnd_, WM_ICON_READY, 0, 0);
+    }
+    CoUninitialize();
   }
 
   ComPtr<ID2D1Bitmap> LoadBitmapFromFile(const std::filesystem::path& path) {
@@ -4495,6 +4741,16 @@ class LeanCastApp {
       mouseTracking_ = true;
     }
 
+    // Suppress hover until the cursor leaves the spot it occupied when the
+    // overlay opened; a window appearing under the pointer fires WM_MOUSEMOVE
+    // even though the user never moved the mouse.
+    if (ignoreMouseUntilMove_) {
+      POINT cursor{};
+      GetCursorPos(&cursor);
+      if (cursor.x == mouseAnchor_.x && cursor.y == mouseAnchor_.y) return;
+      ignoreMouseUntilMove_ = false;
+    }
+
     bool gearNow = false;
     for (const auto& hit : hits_) {
       if (hit.type == HitType::Gear && PointInRect(hit.rect, x, y)) {
@@ -4601,7 +4857,7 @@ class LeanCastApp {
           shortcutRuntime_ = ShortcutRuntime{};
           RegisterShortcutHotKey();
           pendingShortcut_.clear();
-          SaveSettings(settings_);
+          PersistSettings();
         }
         break;
       case HitType::ClearShortcut:
@@ -4610,33 +4866,33 @@ class LeanCastApp {
         shortcutRuntime_ = ShortcutRuntime{};
         UnregisterShortcutHotKey();
         pendingShortcut_.clear();
-        SaveSettings(settings_);
+        PersistSettings();
         break;
       case HitType::StartupToggle:
         settings_.startOnStartup = !settings_.startOnStartup;
         SetStartOnStartup(settings_.startOnStartup);
-        SaveSettings(settings_);
+        PersistSettings();
         break;
       case HitType::UpdateChecksToggle:
         settings_.updateChecksEnabled = !settings_.updateChecksEnabled;
         if (settings_.updateChecksEnabled) settings_.lastUpdateCheck = 0;
-        SaveSettings(settings_);
+        PersistSettings();
         break;
       case HitType::ShowWindowsToggle:
         settings_.showOpenWindows = !settings_.showOpenWindows;
-        SaveSettings(settings_);
+        PersistSettings();
         RefreshWindows();
         RequestSearch();
         break;
       case HitType::ShowStoreAppsToggle:
         settings_.showStoreApps = !settings_.showStoreApps;
-        SaveSettings(settings_);
+        PersistSettings();
         RequestSearch();
         break;
       case HitType::ClearRecents:
         settings_.recentApps.clear();
         settings_.usageStats.clear();
-        SaveSettings(settings_);
+        PersistSettings();
         RequestSearch();
         break;
       case HitType::ClearIconCache:
@@ -4647,31 +4903,35 @@ class LeanCastApp {
         break;
       case HitType::OverlayWidthDown:
         settings_.overlayWidth = std::clamp(OverlayWidth() - 40, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
-        SaveSettings(settings_);
+        PersistSettings();
         ApplyWindowSize();
         break;
       case HitType::OverlayWidthUp:
         settings_.overlayWidth = std::clamp(OverlayWidth() + 40, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
-        SaveSettings(settings_);
+        PersistSettings();
         ApplyWindowSize();
         break;
       case HitType::MaxResultsDown:
         settings_.maxResults = std::clamp(settings_.maxResults - 25, MIN_RESULTS, MAX_RESULT_SETTING);
-        SaveSettings(settings_);
+        PersistSettings();
         RequestSearch();
         break;
       case HitType::MaxResultsUp:
         settings_.maxResults = std::clamp(settings_.maxResults + 25, MIN_RESULTS, MAX_RESULT_SETTING);
-        SaveSettings(settings_);
+        PersistSettings();
         RequestSearch();
         break;
       case HitType::CompactToggle:
         settings_.compactMode = !settings_.compactMode;
-        SaveSettings(settings_);
+        PersistSettings();
+        break;
+      case HitType::AnimationsToggle:
+        settings_.animationsEnabled = !settings_.animationsEnabled;
+        PersistSettings();
         break;
       case HitType::AccentToggle:
         settings_.syncAccentColor = !settings_.syncAccentColor;
-        SaveSettings(settings_);
+        PersistSettings();
         ResizeSettingsWindow();
         break;
       case HitType::AccentColor:
@@ -4706,7 +4966,7 @@ class LeanCastApp {
     if (ChooseColorW(&cc)) {
       settings_.customAccentColor = HexFromColorRef(cc.rgbResult);
       settings_.syncAccentColor = false;
-      SaveSettings(settings_);
+      PersistSettings();
     }
     suppressHide_ = false;
     SetForegroundWindow(settingsHwnd_);
@@ -4833,7 +5093,7 @@ class LeanCastApp {
       case CommandKind::ClearRecents:
         settings_.recentApps.clear();
         settings_.usageStats.clear();
-        SaveSettings(settings_);
+        PersistSettings();
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -4856,6 +5116,7 @@ class LeanCastApp {
           std::lock_guard lock(storageMutex_);
           if (storage_.IsOpen()) storage_.ClearClipboardHistory();
         }
+        snapshotDirty_ = true;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -4866,6 +5127,7 @@ class LeanCastApp {
         return;
       case CommandKind::ReloadSnippets:
         snippets_ = LoadSnippets();
+        snapshotDirty_ = true;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -4960,28 +5222,28 @@ class LeanCastApp {
         return;
       case ActionKind::Pin:
         if (!id.empty() && !ContainsValue(settings_.pinnedApps, id)) settings_.pinnedApps.insert(settings_.pinnedApps.begin(), id);
-        SaveSettings(settings_);
+        PersistSettings();
         actionMode_ = false;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case ActionKind::Unpin:
         for (const auto& key : AppKeys(app)) RemoveValue(settings_.pinnedApps, key);
-        SaveSettings(settings_);
+        PersistSettings();
         actionMode_ = false;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case ActionKind::Hide:
         if (!id.empty() && !ContainsValue(settings_.hiddenApps, id)) settings_.hiddenApps.push_back(id);
-        SaveSettings(settings_);
+        PersistSettings();
         actionMode_ = false;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case ActionKind::Unhide:
         for (const auto& key : AppKeys(app)) RemoveValue(settings_.hiddenApps, key);
-        SaveSettings(settings_);
+        PersistSettings();
         actionMode_ = false;
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -5050,6 +5312,7 @@ class LeanCastApp {
         clipboardHistory_.end());
     clipboardHistory_.insert(clipboardHistory_.begin(), std::move(entry));
     if (clipboardHistory_.size() > CLIPBOARD_HISTORY_LIMIT) clipboardHistory_.resize(CLIPBOARD_HISTORY_LIMIT);
+    snapshotDirty_ = true;  // clipboard history feeds the search corpus
     if (visible_) {
       RequestSearch();
       InvalidateRect(hwnd_, nullptr, FALSE);
@@ -5103,12 +5366,13 @@ class LeanCastApp {
   }
 
   void ClearIconCache() {
-    StopIconThreads();
+    // Drain the queue but keep the persistent worker pool alive.
     {
       std::lock_guard lock(iconQueueMutex_);
+      iconJobs_.clear();
       pendingIcons_.clear();
     }
-    iconBitmaps_.clear();
+    ClearIconBitmaps();
     std::error_code ec;
     std::filesystem::remove_all(IconCacheDir(), ec);
     std::filesystem::create_directories(IconCacheDir(), ec);
@@ -5118,10 +5382,12 @@ class LeanCastApp {
   }
 
   void StopIconThreads() {
+    iconCv_.notify_all();
     std::lock_guard lock(workerThreadsMutex_);
     for (auto& thread : iconThreads_) {
       if (thread.joinable()) thread.request_stop();
     }
+    iconCv_.notify_all();
     for (auto& thread : iconThreads_) {
       if (thread.joinable()) thread.join();
     }
@@ -5183,7 +5449,7 @@ class LeanCastApp {
     auto& usage = settings_.usageStats[id];
     usage.launches = std::min(usage.launches + 1, 1000000);
     usage.lastUsed = UnixNow();
-    SaveSettings(settings_);
+    PersistSettings();
   }
 
   void OnTray(LPARAM lParam) {
@@ -5221,6 +5487,8 @@ class LeanCastApp {
   HWND lastActiveWindow_ = nullptr;
   bool visible_ = false;
   bool suppressHide_ = false;
+  ULONGLONG animStart_ = 0;
+  bool animating_ = false;
   View view_ = View::Search;
   HMONITOR overlayMonitor_ = nullptr;
   std::wstring query_;
@@ -5233,6 +5501,8 @@ class LeanCastApp {
   bool recording_ = false;
   bool gearHovered_ = false;
   bool mouseTracking_ = false;
+  bool ignoreMouseUntilMove_ = false;
+  POINT mouseAnchor_ = {0, 0};
   int settingsHover_ = -1;
   std::wstring pendingShortcut_;
   ShortcutRecorder shortcutRecorder_;
@@ -5248,6 +5518,10 @@ class LeanCastApp {
   std::optional<QueryRequest> pendingRequest_;
   ResultsCollection latestResult_;
   unsigned long long searchGeneration_ = 0;
+  // Cached query-independent search corpus, rebuilt lazily when marked dirty.
+  // Dirtied from background discovery threads, so the flag is atomic.
+  std::shared_ptr<const SearchSnapshot> snapshot_;
+  std::atomic<bool> snapshotDirty_ = true;
   std::mutex workerThreadsMutex_;
   std::vector<std::jthread> iconThreads_;
   std::mutex dataMutex_;
@@ -5273,15 +5547,31 @@ class LeanCastApp {
   std::vector<DisplayItem> flatItems_;
   std::vector<HitTarget> hits_;
   std::mutex iconQueueMutex_;
+  std::condition_variable iconCv_;
   std::set<std::wstring> pendingIcons_;
-  std::map<std::wstring, ComPtr<ID2D1Bitmap>> iconBitmaps_;
+  std::deque<std::wstring> iconJobs_;
+  // LRU-bounded in-memory bitmap cache. iconLru_ holds keys most-recent-first;
+  // each map entry stores its position so it can be promoted/evicted in O(1).
+  struct IconCacheEntry {
+    ComPtr<ID2D1Bitmap> bitmap;
+    std::list<std::wstring>::iterator lruIt;
+  };
+  std::list<std::wstring> iconLru_;
+  std::unordered_map<std::wstring, IconCacheEntry> iconBitmaps_;
+  static constexpr size_t kIconCacheCap = 256;
 
   ComPtr<ID2D1Factory> d2dFactory_;
   ComPtr<IDWriteFactory> dwriteFactory_;
   ComPtr<IWICImagingFactory> wicFactory_;
   ComPtr<ID2D1HwndRenderTarget> renderTarget_;
   ComPtr<ID2D1HwndRenderTarget> settingsRenderTarget_;
+  std::wstring caretMeasureText_ = L"\x01";  // sentinel that never equals a real measured prefix
+  float caretMeasureWidth_ = -1.0f;
+  float caretOffset_ = 0.0f;
+  bool lastCaretPhase_ = false;
   ID2D1RenderTarget* activeRT_ = nullptr;
+  // Per-render-target cache of solid-color brushes, keyed by packed RGBA.
+  std::unordered_map<ID2D1RenderTarget*, std::unordered_map<uint32_t, ComPtr<ID2D1SolidColorBrush>>> brushCache_;
   ComPtr<ID2D1DeviceContext> activeDC_;  // QI of activeRT_ for color-emoji DrawText, when available
   ComPtr<IDWriteTextFormat> inputFormat_;
   ComPtr<IDWriteTextFormat> rowFormat_;

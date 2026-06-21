@@ -187,6 +187,7 @@ inline std::vector<size_t> Search(const std::wstring& query, const std::vector<S
   const std::vector<std::wstring> queryTokens = Tokens(query);
 
   std::vector<Scored> scored;
+  scored.reserve(items.size());
   for (size_t i = 0; i < items.size(); ++i) {
     const double score = ScoreItem(normalizedQuery, queryTokens, items[i], recentIds);
     if (score >= 0) scored.push_back({i, score, Lower(items[i].name)});
