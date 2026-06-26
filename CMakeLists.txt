@@ -1,61 +1,64 @@
-cmake_minimum_required(VERSION 3.22)
+﻿cmake_minimum_required(VERSION 3.22)
 
 if(NOT WIN32)
-  message(FATAL_ERROR "LeanCast Native is a Windows-only Win32 application.")
+  message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(LeanCastNative VERSION 0.4.5 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.5.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(LEANCAST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/build/icon.ico")
-set(LEANCAST_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/native/app.manifest")
-configure_file(native/LeanCast.rc.in native/LeanCast.rc @ONLY)
+set(FEATHERCAST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/build/icon.ico")
+set(FEATHERCAST_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/native/app.manifest")
+configure_file(native/FeatherCast.rc.in native/FeatherCast.rc @ONLY)
 configure_file(native/src/version.hpp.in generated/version.hpp @ONLY)
 
-add_library(LeanCastSQLite STATIC
+add_library(FeatherCastSQLite STATIC
   third_party/sqlite/sqlite3.c
 )
 
-target_include_directories(LeanCastSQLite PUBLIC third_party/sqlite)
+target_include_directories(FeatherCastSQLite PUBLIC third_party/sqlite)
 
-target_compile_definitions(LeanCastSQLite PRIVATE
+target_compile_definitions(FeatherCastSQLite PRIVATE
   SQLITE_OMIT_LOAD_EXTENSION
   SQLITE_THREADSAFE=1
 )
 
-add_executable(LeanCast WIN32
+add_executable(FeatherCast WIN32
   native/src/main.cpp
-  ${CMAKE_CURRENT_BINARY_DIR}/native/LeanCast.rc
+  ${CMAKE_CURRENT_BINARY_DIR}/native/FeatherCast.rc
 )
 
-add_executable(LeanCastPluginHost
+add_executable(FeatherCastPluginHost
   native/src/plugin_host.cpp
 )
 
-target_compile_definitions(LeanCast PRIVATE
+target_compile_definitions(FeatherCast PRIVATE
   UNICODE
   _UNICODE
   NOMINMAX
   WIN32_LEAN_AND_MEAN
 )
 
-target_include_directories(LeanCast PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_include_directories(FeatherCast PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
-target_compile_definitions(LeanCastPluginHost PRIVATE
+target_compile_definitions(FeatherCastPluginHost PRIVATE
   UNICODE
   _UNICODE
   NOMINMAX
   WIN32_LEAN_AND_MEAN
 )
 
-target_include_directories(LeanCastPluginHost PRIVATE native/src)
+target_include_directories(FeatherCastPluginHost PRIVATE native/src)
 
-target_link_libraries(LeanCast PRIVATE
-  LeanCastSQLite
+target_link_libraries(FeatherCast PRIVATE
+  FeatherCastSQLite
   d2d1
+  d3d11
+  dxgi
+  dcomp
   dwrite
   windowscodecs
   shell32
@@ -72,64 +75,72 @@ target_link_libraries(LeanCast PRIVATE
 )
 
 if(MSVC)
-  target_link_options(LeanCast PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${LEANCAST_MANIFEST}")
+  target_link_options(FeatherCast PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${FEATHERCAST_MANIFEST}")
 endif()
 
-add_executable(LeanCastCoreTests
+add_executable(FeatherCastCoreTests
   native/tests/core_tests.cpp
 )
 
-add_library(LeanCastTestExtension SHARED
+add_library(FeatherCastTestExtension SHARED
   native/tests/test_extension.cpp
 )
 
-add_library(LeanCastBadApiExtension SHARED
+add_library(FeatherCastV1TestExtension SHARED
   native/tests/test_extension.cpp
 )
 
-add_executable(LeanCastPluginHostTests
+add_library(FeatherCastBadApiExtension SHARED
+  native/tests/test_extension.cpp
+)
+
+add_executable(FeatherCastPluginHostTests
   native/tests/plugin_host_tests.cpp
 )
 
-target_compile_features(LeanCastCoreTests PRIVATE cxx_std_23)
-target_include_directories(LeanCastCoreTests PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_compile_definitions(LeanCastCoreTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(LeanCastCoreTests PRIVATE LeanCastSQLite advapi32)
+target_compile_features(FeatherCastCoreTests PRIVATE cxx_std_23)
+target_include_directories(FeatherCastCoreTests PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_definitions(FeatherCastCoreTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(FeatherCastCoreTests PRIVATE FeatherCastSQLite advapi32)
 
-target_compile_features(LeanCastPluginHost PRIVATE cxx_std_23)
-target_compile_features(LeanCastTestExtension PRIVATE cxx_std_23)
-target_compile_features(LeanCastBadApiExtension PRIVATE cxx_std_23)
-target_compile_features(LeanCastPluginHostTests PRIVATE cxx_std_23)
+target_compile_features(FeatherCastPluginHost PRIVATE cxx_std_23)
+target_compile_features(FeatherCastTestExtension PRIVATE cxx_std_23)
+target_compile_features(FeatherCastV1TestExtension PRIVATE cxx_std_23)
+target_compile_features(FeatherCastBadApiExtension PRIVATE cxx_std_23)
+target_compile_features(FeatherCastPluginHostTests PRIVATE cxx_std_23)
 
-target_include_directories(LeanCastTestExtension PRIVATE native/src)
-target_include_directories(LeanCastBadApiExtension PRIVATE native/src)
-target_include_directories(LeanCastPluginHostTests PRIVATE native/src)
+target_include_directories(FeatherCastTestExtension PRIVATE native/src)
+target_include_directories(FeatherCastV1TestExtension PRIVATE native/src)
+target_include_directories(FeatherCastBadApiExtension PRIVATE native/src)
+target_include_directories(FeatherCastPluginHostTests PRIVATE native/src)
 
-target_compile_definitions(LeanCastBadApiExtension PRIVATE LEANCAST_TEST_BAD_API)
-target_compile_definitions(LeanCastPluginHostTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FeatherCastV1TestExtension PRIVATE FEATHERCAST_TEST_API_VERSION=1)
+target_compile_definitions(FeatherCastBadApiExtension PRIVATE FEATHERCAST_TEST_BAD_API)
+target_compile_definitions(FeatherCastPluginHostTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 enable_testing()
-add_test(NAME LeanCastCoreTests COMMAND LeanCastCoreTests)
-add_test(NAME LeanCastPluginHostTests
-  COMMAND LeanCastPluginHostTests
-    $<TARGET_FILE:LeanCastPluginHost>
-    $<TARGET_FILE:LeanCastTestExtension>
-    $<TARGET_FILE:LeanCastBadApiExtension>
+add_test(NAME FeatherCastCoreTests COMMAND FeatherCastCoreTests)
+add_test(NAME FeatherCastPluginHostTests
+  COMMAND FeatherCastPluginHostTests
+    $<TARGET_FILE:FeatherCastPluginHost>
+    $<TARGET_FILE:FeatherCastTestExtension>
+    $<TARGET_FILE:FeatherCastV1TestExtension>
+    $<TARGET_FILE:FeatherCastBadApiExtension>
 )
 
-install(TARGETS LeanCast LeanCastPluginHost RUNTIME DESTINATION bin)
+install(TARGETS FeatherCast FeatherCastPluginHost RUNTIME DESTINATION bin)
 
-set(CPACK_PACKAGE_NAME "LeanCast")
+set(CPACK_PACKAGE_NAME "FeatherCast")
 set(CPACK_PACKAGE_VENDOR "Leon")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
-set(CPACK_PACKAGE_FILE_NAME "LeanCast-${PROJECT_VERSION}-win64")
+set(CPACK_PACKAGE_FILE_NAME "FeatherCast-${PROJECT_VERSION}-win64")
 set(CPACK_GENERATOR "ZIP;NSIS")
-set(CPACK_NSIS_DISPLAY_NAME "LeanCast")
-set(CPACK_NSIS_PACKAGE_NAME "LeanCast")
-set(CPACK_PACKAGE_EXECUTABLES "LeanCast" "LeanCast")
-set(CPACK_NSIS_MUI_ICON "${LEANCAST_ICON}")
-set(CPACK_NSIS_MUI_UNIICON "${LEANCAST_ICON}")
-set(CPACK_NSIS_MUI_FINISHPAGE_RUN "LeanCast.exe")
+set(CPACK_NSIS_DISPLAY_NAME "FeatherCast")
+set(CPACK_NSIS_PACKAGE_NAME "FeatherCast")
+set(CPACK_PACKAGE_EXECUTABLES "FeatherCast" "FeatherCast")
+set(CPACK_NSIS_MUI_ICON "${FEATHERCAST_ICON}")
+set(CPACK_NSIS_MUI_UNIICON "${FEATHERCAST_ICON}")
+set(CPACK_NSIS_MUI_FINISHPAGE_RUN "FeatherCast.exe")
 set(CPACK_NSIS_EXTRA_DEFINES "!define MUI_FINISHPAGE_RUN_PARAMETERS \\\"--show\\\"")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 include(CPack)

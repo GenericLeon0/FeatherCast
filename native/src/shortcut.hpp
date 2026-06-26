@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <windows.h>
 
@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace leancast::shortcut {
+namespace feathercast::shortcut {
 
 struct ShortcutSpec {
   bool ctrl = false;
@@ -418,4 +418,4 @@ class ShortcutRuntime {
   bool shortcutActive_ = false;
 };
 
-}  // namespace leancast::shortcut
+}  // namespace feathercast::shortcut

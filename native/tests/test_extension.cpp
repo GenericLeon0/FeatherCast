@@ -1,4 +1,4 @@
-#include "IExtension.h"
+﻿#include "IExtension.h"
 
 #include <windows.h>
 
@@ -25,15 +25,17 @@ bool Contains(const char* text, const char* needle) {
 
 }  // namespace
 
-LEANCAST_EXTENSION_EXPORT uint32_t LeanCastExtensionApiVersion() {
-#ifdef LEANCAST_TEST_BAD_API
+FEATHERCAST_EXTENSION_EXPORT uint32_t FeatherCastExtensionApiVersion() {
+#ifdef FEATHERCAST_TEST_BAD_API
   return 999;
+#elif defined(FEATHERCAST_TEST_API_VERSION)
+  return FEATHERCAST_TEST_API_VERSION;
 #else
-  return LEANCAST_EXTENSION_API_VERSION;
+  return FEATHERCAST_EXTENSION_API_VERSION;
 #endif
 }
 
-LEANCAST_EXTENSION_EXPORT uint32_t LeanCastExtensionHandleJson(const char* requestUtf8,
+FEATHERCAST_EXTENSION_EXPORT uint32_t FeatherCastExtensionHandleJson(const char* requestUtf8,
                                                                char* responseUtf8,
                                                                uint32_t responseCapacity) {
   if (Contains(requestUtf8, "\"query\":\"throw\"")) {
@@ -49,7 +51,34 @@ LEANCAST_EXTENSION_EXPORT uint32_t LeanCastExtensionHandleJson(const char* reque
   if (Contains(requestUtf8, "\"query\":\"malformed\"")) {
     return WriteResponse("{\"items\":[", responseUtf8, responseCapacity);
   }
+  if (Contains(requestUtf8, "\"query\":\"version\"")) {
+    if (Contains(requestUtf8, "\"apiVersion\":1")) {
+      return WriteResponse("{\"items\":[{\"id\":\"version\",\"title\":\"API v1\"}]}",
+                           responseUtf8, responseCapacity);
+    }
+    if (Contains(requestUtf8, "\"apiVersion\":2")) {
+      return WriteResponse("{\"items\":[{\"id\":\"version\",\"title\":\"API v2\"}]}",
+                           responseUtf8, responseCapacity);
+    }
+    return WriteResponse("{\"items\":[{\"id\":\"version\",\"title\":\"API unknown\"}]}",
+                         responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"detail\"")) {
+    return WriteResponse(
+        "{\"items\":[{\"id\":\"set-query\",\"title\":\"Detailed Result\","
+        "\"subtitle\":\"Markdown detail\",\"score\":9,"
+        "\"detail\":{\"type\":\"markdown\",\"title\":\"Detail Title\","
+        "\"body\":\"# Heading\\n- Bullet\\n`inline`\\n```\\ncode\\n```\"},"
+        "\"payload\":{\"token\":\"detail\"}}]}",
+        responseUtf8, responseCapacity);
+  }
   if (Contains(requestUtf8, "\"type\":\"activate\"")) {
+    if (Contains(requestUtf8, "\"itemId\":\"set-query\"")) {
+      return WriteResponse(
+          "{\"handled\":true,\"closeOverlay\":false,"
+          "\"action\":{\"type\":\"setQuery\",\"value\":\"follow up\"}}",
+          responseUtf8, responseCapacity);
+    }
     return WriteResponse(
         "{\"handled\":true,\"closeOverlay\":true,"
         "\"action\":{\"type\":\"copyText\",\"value\":\"activated\"}}",

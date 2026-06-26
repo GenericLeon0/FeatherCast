@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <windows.h>
 
@@ -17,9 +17,10 @@
 #include <string_view>
 #include <vector>
 
-namespace leancast::extensions {
+namespace feathercast::extensions {
 
-inline constexpr uint32_t kApiVersion = 1;
+inline constexpr uint32_t kApiVersion = 2;
+inline constexpr uint32_t kMinSupportedApiVersion = 1;
 inline constexpr size_t kMaxResponseBytes = 1024 * 1024;
 inline constexpr int kDefaultQueryLimit = 20;
 
@@ -412,6 +413,9 @@ struct QueryResultItem {
   std::vector<std::wstring> keywords;
   double score = 0.0;
   std::wstring iconPath;
+  std::wstring detailType;
+  std::wstring detailTitle;
+  std::wstring detailBody;
   std::string payloadJson = "{}";
 };
 
@@ -435,6 +439,11 @@ inline std::optional<QueryResponse> ParseQueryResponse(const std::string& json, 
     item.keywords = JsonStringArray(object, "keywords");
     if (auto score = JsonNumber(object, "score")) item.score = *score;
     if (auto iconPath = JsonString(object, "iconPath")) item.iconPath = Utf8ToWide(*iconPath);
+    if (const auto detail = JsonObjectSlice(object, "detail")) {
+      if (auto type = JsonString(*detail, "type")) item.detailType = Utf8ToWide(*type);
+      if (auto title = JsonString(*detail, "title")) item.detailTitle = Utf8ToWide(*title);
+      if (auto body = JsonString(*detail, "body")) item.detailBody = Utf8ToWide(*body);
+    }
     item.payloadJson = JsonObjectSlice(object, "payload").value_or("{}");
     response.items.push_back(std::move(item));
   }
@@ -446,6 +455,7 @@ enum class HostActionType {
   OpenUrl,
   OpenPath,
   CopyText,
+  SetQuery,
 };
 
 struct ActivationResponse {
@@ -459,6 +469,7 @@ inline HostActionType HostActionTypeFromString(const std::string& value) {
   if (value == "openUrl") return HostActionType::OpenUrl;
   if (value == "openPath") return HostActionType::OpenPath;
   if (value == "copyText") return HostActionType::CopyText;
+  if (value == "setQuery") return HostActionType::SetQuery;
   return HostActionType::None;
 }
 
@@ -481,6 +492,7 @@ inline std::string BuildQueryRequestJson(const Manifest& manifest, const std::fi
        << ",\"type\":\"query\""
        << ",\"query\":" << QuoteWide(query)
        << ",\"limit\":" << std::max(1, limit)
+       << ",\"capabilities\":{\"detailMarkdown\":true,\"setQuery\":true}"
        << ",\"context\":{\"pluginId\":" << QuoteWide(manifest.id)
        << ",\"pluginDir\":" << QuoteWide(manifest.directory.wstring())
        << ",\"dataDir\":" << QuoteWide(dataDir.wstring())
@@ -507,4 +519,4 @@ inline bool ResponseSizeAllowed(size_t requiredBytes) {
   return requiredBytes > 0 && requiredBytes <= kMaxResponseBytes;
 }
 
-}  // namespace leancast::extensions
+}  // namespace feathercast::extensions

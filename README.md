@@ -1,8 +1,8 @@
-# LeanCast
+﻿# FeatherCast
 
-LeanCast is a lightweight native Windows app launcher. A global shortcut opens a centered search overlay for installed apps and open windows, with real icons, fuzzy search, keyboard-first navigation, and a tray icon.
+FeatherCast is a lightweight native Windows app launcher. A global shortcut opens a centered search overlay for installed apps and open windows, with real icons, fuzzy search, keyboard-first navigation, and a tray icon.
 
-![LeanCast Icon](build/icon.png)
+![FeatherCast Icon](build/icon.png)
 
 ## Features
 
@@ -14,7 +14,7 @@ LeanCast is a lightweight native Windows app launcher. A global shortcut opens a
 - Configurable global shortcut, default `Alt+Space`
 - Compact mode, Windows accent sync, and custom accent color
 - Manual and daily GitHub Release update checks with verified installers
-- Background tray menu: Open LeanCast, Settings, Quit
+- Background tray menu: Open FeatherCast, Settings, Quit
 
 AI chat and AI provider settings were removed in the native remake.
 
@@ -46,13 +46,13 @@ ctest --test-dir build-native -C Release
 cpack --config build-native/CPackConfig.cmake -C Release
 ```
 
-The executable is produced as `build-native/Release/LeanCast.exe` with Visual Studio generators.
+The executable is produced as `build-native/Release/FeatherCast.exe` with Visual Studio generators.
 
 Plugin authors should start with [docs/plugin-development.md](docs/plugin-development.md). Release and updater packaging notes are in [docs/releasing.md](docs/releasing.md).
 
 ## Settings and Cache
 
-Runtime data is stored under `%APPDATA%\LeanCast`:
+Runtime data is stored under `%APPDATA%\FeatherCast`:
 
 - `settings.json` stores launcher preferences, recent usage, appearance settings, and update-check state
 - `icon-cache-native/` stores resolved PNG icons keyed by icon source
@@ -70,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File scripts/gen-icons.ps1
 
 ## Tech
 
-LeanCast is now a Win32 C++23 application rendered with Direct2D/DirectWrite. It uses native Windows APIs for tray integration, shell/app discovery, shortcut parsing, low-level keyboard hooks, window enumeration/focus, and shell icon extraction.
+FeatherCast is now a Win32 C++23 application rendered with Direct2D/DirectWrite. It uses native Windows APIs for tray integration, shell/app discovery, shortcut parsing, low-level keyboard hooks, window enumeration/focus, and shell icon extraction.
 
 ## License
 

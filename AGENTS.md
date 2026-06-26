@@ -1,10 +1,10 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 Guidance for coding agents working in this repository.
 
-## What is LeanCast?
+## What is FeatherCast?
 
-LeanCast is a Windows-only native C++ app launcher. It opens a compact Raycast/Spotlight-style overlay from a global shortcut, searches installed apps and open windows, and launches or focuses the selected result.
+FeatherCast is a Windows-only native C++ app launcher. It opens a compact Raycast/Spotlight-style overlay from a global shortcut, searches installed apps and open windows, and launches or focuses the selected result.
 
 AI chat and all AI provider settings have been removed. Do not reintroduce AI UI, API key storage, or network AI calls unless explicitly requested.
 
@@ -21,7 +21,7 @@ AI chat and all AI provider settings have been removed. Do not reintroduce AI UI
 ```
 CMakeLists.txt              # Native build, tests, CPack packaging
 native/
-  LeanCast.rc.in           # CMake-generated icon and manifest resource template
+  FeatherCast.rc.in           # CMake-generated icon and manifest resource template
   app.manifest             # DPI/common-controls manifest
   src/core.hpp             # Pure fuzzy search core used by app and tests
   src/main.cpp             # Win32 app, UI, discovery, settings, icons, tray
@@ -32,9 +32,9 @@ build/                     # Generated icon assets used by native resources
 
 ## Behavior Notes
 
-- Settings are stored in `%APPDATA%\LeanCast\settings.json`. Only native-supported fields are saved: `shortcut`, `recentApps`, `compactMode`, `syncAccentColor`, `customAccentColor`, and `startOnStartup`.
+- Settings are stored in `%APPDATA%\FeatherCast\settings.json`. Only native-supported fields are saved: `shortcut`, `recentApps`, `compactMode`, `syncAccentColor`, `customAccentColor`, and `startOnStartup`.
 - App discovery scans Start Menu `.lnk` files and AppsFolder shell entries, then de-duplicates by id/name.
-- Icons are lazy-loaded from the Windows Shell and cached as PNG files under `%APPDATA%\LeanCast\icon-cache-native`.
+- Icons are lazy-loaded from the Windows Shell and cached as PNG files under `%APPDATA%\FeatherCast\icon-cache-native`.
 - The low-level keyboard hook handles both global shortcut monitoring and settings shortcut recording.
 - The app is single-instance via a named mutex; a second launch asks the existing window to open search.
 

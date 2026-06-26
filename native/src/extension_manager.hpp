@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "extension_protocol.hpp"
 
@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-namespace leancast::extensions {
+namespace feathercast::extensions {
 
 class ExtensionManager {
  public:
@@ -155,6 +155,7 @@ class ExtensionManager {
   struct Plugin {
     Manifest manifest;
     bool available = true;
+    int failureStrikes = 0;
     HANDLE process = nullptr;
     HANDLE stdinWrite = nullptr;
     HANDLE stdoutRead = nullptr;
@@ -267,7 +268,7 @@ class ExtensionManager {
 
     StopProcess(plugin);
 
-    const auto hostPath = exeDir_ / L"LeanCastPluginHost.exe";
+    const auto hostPath = exeDir_ / L"FeatherCastPluginHost.exe";
     SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE childStdinRead = nullptr;
     HANDLE parentStdinWrite = nullptr;
@@ -309,7 +310,7 @@ class ExtensionManager {
     if (!created) {
       CloseHandleIfSet(parentStdinWrite);
       CloseHandleIfSet(parentStdoutRead);
-      MarkUnavailable(plugin, L"failed to start LeanCastPluginHost.exe");
+      MarkUnavailable(plugin, L"failed to start FeatherCastPluginHost.exe");
       return false;
     }
 
@@ -329,7 +330,7 @@ class ExtensionManager {
     DWORD written = 0;
     if (!WriteFile(plugin.stdinWrite, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) ||
         written != line.size()) {
-      MarkUnavailable(plugin, L"plugin host write failed");
+      RecordRequestFailure(plugin, L"plugin host write failed");
       return false;
     }
 
@@ -337,13 +338,13 @@ class ExtensionManager {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
       if (!ProcessRunning(plugin.process)) {
-        MarkUnavailable(plugin, L"plugin host exited unexpectedly");
+        RecordRequestFailure(plugin, L"plugin host exited unexpectedly");
         return false;
       }
 
       DWORD available = 0;
       if (!PeekNamedPipe(plugin.stdoutRead, nullptr, 0, nullptr, &available, nullptr)) {
-        MarkUnavailable(plugin, L"plugin host read failed");
+        RecordRequestFailure(plugin, L"plugin host read failed");
         return false;
       }
 
@@ -352,17 +353,18 @@ class ExtensionManager {
         const DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(sizeof(chunk)));
         DWORD read = 0;
         if (!ReadFile(plugin.stdoutRead, chunk, toRead, &read, nullptr)) {
-          MarkUnavailable(plugin, L"plugin host read failed");
+          RecordRequestFailure(plugin, L"plugin host read failed");
           return false;
         }
         buffer.append(chunk, chunk + read);
         if (buffer.size() > kMaxResponseBytes) {
-          MarkUnavailable(plugin, L"plugin host response exceeded 1 MiB");
+          RecordRequestFailure(plugin, L"plugin host response exceeded 1 MiB");
           return false;
         }
         if (const size_t newline = buffer.find('\n'); newline != std::string::npos) {
           response = buffer.substr(0, newline);
           if (!response.empty() && response.back() == '\r') response.pop_back();
+          RecordRequestSuccess(plugin);
           return true;
         }
       } else {
@@ -370,13 +372,29 @@ class ExtensionManager {
       }
     }
 
-    MarkUnavailable(plugin, L"plugin host timed out");
+    RecordRequestFailure(plugin, L"plugin host timed out");
     return false;
+  }
+
+  void RecordRequestSuccess(Plugin& plugin) {
+    plugin.failureStrikes = 0;
+  }
+
+  void RecordRequestFailure(Plugin& plugin, const std::wstring& reason) {
+    plugin.failureStrikes += 1;
+    Log(plugin.manifest.id + L": " + reason + L" (strike " +
+        std::to_wstring(plugin.failureStrikes) + L"/3)");
+    StopProcess(plugin);
+    if (plugin.failureStrikes >= 3) {
+      plugin.available = false;
+      Log(plugin.manifest.id + L": disabled after repeated plugin host failures");
+    }
   }
 
   void MarkUnavailable(Plugin& plugin, const std::wstring& reason) {
     Log(plugin.manifest.id + L": " + reason);
     plugin.available = false;
+    plugin.failureStrikes = 3;
     StopProcess(plugin);
   }
 
@@ -424,4 +442,4 @@ class ExtensionManager {
   bool stop_ = false;
 };
 
-}  // namespace leancast::extensions
+}  // namespace feathercast::extensions

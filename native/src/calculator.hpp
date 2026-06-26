@@ -1,8 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cwchar>
 #include <cwctype>
 #include <iomanip>
 #include <optional>
@@ -10,7 +11,7 @@
 #include <string>
 #include <utility>
 
-namespace leancast::calculator {
+namespace feathercast::calculator {
 
 struct Result {
   std::wstring expression;
@@ -50,58 +51,87 @@ class Parser {
 
   bool Parse(double& value) {
     SkipSpaces();
-    if (!ParseExpression(value)) return false;
+    Parsed parsed;
+    if (!ParseExpression(parsed)) return false;
+    value = parsed.value;
     SkipSpaces();
-    return pos_ == text_.size() && sawDigit_ && sawCalculationSyntax_ && std::isfinite(value);
+    return pos_ == text_.size() && sawValue_ && sawCalculationSyntax_ && std::isfinite(value);
   }
 
  private:
-  bool ParseExpression(double& value) {
+  struct Parsed {
+    double value = 0.0;
+    bool percent = false;
+  };
+
+  static constexpr double kPi = 3.14159265358979323846;
+
+  bool ParseExpression(Parsed& value) {
     if (!ParseTerm(value)) return false;
     while (true) {
       SkipSpaces();
       if (Match(L'+')) {
         sawCalculationSyntax_ = true;
-        double rhs = 0.0;
+        Parsed rhs;
         if (!ParseTerm(rhs)) return false;
-        value += rhs;
+        const double base = value.value;
+        value.value += rhs.percent ? base * rhs.value : rhs.value;
+        value.percent = false;
       } else if (Match(L'-')) {
         sawCalculationSyntax_ = true;
-        double rhs = 0.0;
+        Parsed rhs;
         if (!ParseTerm(rhs)) return false;
-        value -= rhs;
+        const double base = value.value;
+        value.value -= rhs.percent ? base * rhs.value : rhs.value;
+        value.percent = false;
       } else {
         return true;
       }
     }
   }
 
-  bool ParseTerm(double& value) {
-    if (!ParseFactor(value)) return false;
+  bool ParseTerm(Parsed& value) {
+    if (!ParsePower(value)) return false;
     while (true) {
       SkipSpaces();
-      if (Match(L'*') || Match(L'x') || Match(L'X')) {
+      if ((!Peek(L"**") && Match(L'*')) || Match(L'x') || Match(L'X')) {
         sawCalculationSyntax_ = true;
-        double rhs = 0.0;
-        if (!ParseFactor(rhs)) return false;
-        value *= rhs;
+        Parsed rhs;
+        if (!ParsePower(rhs)) return false;
+        value.value *= rhs.value;
+        value.percent = false;
       } else if (Match(L'/') || Match(L':')) {
         sawCalculationSyntax_ = true;
-        double rhs = 0.0;
-        if (!ParseFactor(rhs) || std::fabs(rhs) < 0.0000000001) return false;
-        value /= rhs;
+        Parsed rhs;
+        if (!ParsePower(rhs) || std::fabs(rhs.value) < 0.0000000001) return false;
+        value.value /= rhs.value;
+        value.percent = false;
       } else {
         return true;
       }
     }
   }
 
-  bool ParseFactor(double& value) {
+  bool ParsePower(Parsed& value) {
+    if (!ParseFactor(value)) return false;
+    SkipSpaces();
+    if (Match(L"**") || Match(L'^')) {
+      sawCalculationSyntax_ = true;
+      Parsed rhs;
+      if (!ParsePower(rhs)) return false;
+      value.value = std::pow(value.value, rhs.value);
+      value.percent = false;
+      return std::isfinite(value.value);
+    }
+    return true;
+  }
+
+  bool ParseFactor(Parsed& value) {
     SkipSpaces();
     if (Match(L'+')) return ParseFactor(value);
     if (Match(L'-')) {
       if (!ParseFactor(value)) return false;
-      value = -value;
+      value.value = -value.value;
       return true;
     }
 
@@ -110,7 +140,7 @@ class Parser {
       if (!ParseExpression(value)) return false;
       SkipSpaces();
       if (!Match(L')')) return false;
-    } else if (!ParseNumber(value)) {
+    } else if (!ParseFunctionOrConstant(value) && !ParseNumber(value)) {
       return false;
     }
 
@@ -118,11 +148,59 @@ class Parser {
       SkipSpaces();
       if (!Match(L'%')) return true;
       sawCalculationSyntax_ = true;
-      value /= 100.0;
+      value.value /= 100.0;
+      value.percent = true;
     }
   }
 
-  bool ParseNumber(double& value) {
+  bool ParseFunctionOrConstant(Parsed& value) {
+    SkipSpaces();
+    const size_t start = pos_;
+    while (pos_ < text_.size() && std::iswalpha(text_[pos_])) ++pos_;
+    if (start == pos_) return false;
+
+    std::wstring name = text_.substr(start, pos_ - start);
+    std::transform(name.begin(), name.end(), name.begin(), [](wchar_t ch) {
+      return static_cast<wchar_t>(std::towlower(ch));
+    });
+
+    if (name == L"pi") {
+      value = Parsed{kPi, false};
+      sawValue_ = true;
+      return true;
+    }
+    if (name == L"e") {
+      value = Parsed{std::exp(1.0), false};
+      sawValue_ = true;
+      return true;
+    }
+
+    SkipSpaces();
+    if (!Match(L'(')) return false;
+    sawCalculationSyntax_ = true;
+    Parsed argument;
+    if (!ParseExpression(argument)) return false;
+    SkipSpaces();
+    if (!Match(L')')) return false;
+
+    if (name == L"sin" || name == L"cos" || name == L"tan") {
+      const double radians = argument.value * kPi / 180.0;
+      if (name == L"sin") value.value = std::sin(radians);
+      else if (name == L"cos") value.value = std::cos(radians);
+      else value.value = std::tan(radians);
+      value.percent = false;
+      return std::isfinite(value.value);
+    }
+    if (name == L"sqrt") {
+      if (argument.value < 0.0) return false;
+      value = Parsed{std::sqrt(argument.value), false};
+      return true;
+    }
+
+    return false;
+  }
+
+  bool ParseNumber(Parsed& value) {
     SkipSpaces();
     const size_t start = pos_;
     bool hasDigit = false;
@@ -141,12 +219,13 @@ class Parser {
     }
 
     if (!hasDigit) return false;
-    sawDigit_ = true;
+    sawValue_ = true;
     std::wstring number = text_.substr(start, pos_ - start);
     std::replace(number.begin(), number.end(), L',', L'.');
     wchar_t* end = nullptr;
-    value = std::wcstod(number.c_str(), &end);
-    return end && *end == L'\0' && std::isfinite(value);
+    value.value = std::wcstod(number.c_str(), &end);
+    value.percent = false;
+    return end && *end == L'\0' && std::isfinite(value.value);
   }
 
   void SkipSpaces() {
@@ -159,9 +238,20 @@ class Parser {
     return true;
   }
 
+  bool Match(const wchar_t* expected) {
+    if (!Peek(expected)) return false;
+    pos_ += std::wcslen(expected);
+    return true;
+  }
+
+  bool Peek(const wchar_t* expected) const {
+    const size_t len = std::wcslen(expected);
+    return pos_ + len <= text_.size() && text_.compare(pos_, len, expected) == 0;
+  }
+
   std::wstring text_;
   size_t pos_ = 0;
-  bool sawDigit_ = false;
+  bool sawValue_ = false;
   bool sawCalculationSyntax_ = false;
 };
 
@@ -180,4 +270,4 @@ inline std::optional<Result> TryEvaluate(std::wstring input) {
   return Result{input, display, value};
 }
 
-}  // namespace leancast::calculator
+}  // namespace feathercast::calculator

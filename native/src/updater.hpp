@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "extension_protocol.hpp"
 
@@ -16,7 +16,7 @@
 #include <string_view>
 #include <vector>
 
-namespace leancast::updater {
+namespace feathercast::updater {
 
 struct Version {
   std::array<int, 3> parts{0, 0, 0};
@@ -121,22 +121,22 @@ inline std::wstring AssetVersionFromTag(std::wstring tagName) {
 }
 
 inline std::optional<ReleaseInfo> ParseGitHubReleaseJson(const std::string& json) {
-  auto tagName = leancast::extensions::JsonString(json, "tag_name");
+  auto tagName = feathercast::extensions::JsonString(json, "tag_name");
   if (!tagName || tagName->empty()) return std::nullopt;
 
   ReleaseInfo release;
-  release.tagName = leancast::extensions::Utf8ToWide(*tagName);
-  release.draft = leancast::extensions::JsonBool(json, "draft", false);
-  release.prerelease = leancast::extensions::JsonBool(json, "prerelease", false);
-  if (auto name = leancast::extensions::JsonString(json, "name")) release.name = leancast::extensions::Utf8ToWide(*name);
-  if (auto html = leancast::extensions::JsonString(json, "html_url")) release.htmlUrl = leancast::extensions::Utf8ToWide(*html);
+  release.tagName = feathercast::extensions::Utf8ToWide(*tagName);
+  release.draft = feathercast::extensions::JsonBool(json, "draft", false);
+  release.prerelease = feathercast::extensions::JsonBool(json, "prerelease", false);
+  if (auto name = feathercast::extensions::JsonString(json, "name")) release.name = feathercast::extensions::Utf8ToWide(*name);
+  if (auto html = feathercast::extensions::JsonString(json, "html_url")) release.htmlUrl = feathercast::extensions::Utf8ToWide(*html);
 
-  for (const auto& object : leancast::extensions::JsonObjectArray(json, "assets")) {
-    auto name = leancast::extensions::JsonString(object, "name");
-    auto url = leancast::extensions::JsonString(object, "browser_download_url");
+  for (const auto& object : feathercast::extensions::JsonObjectArray(json, "assets")) {
+    auto name = feathercast::extensions::JsonString(object, "name");
+    auto url = feathercast::extensions::JsonString(object, "browser_download_url");
     if (!name || !url || name->empty() || url->empty()) continue;
-    release.assets.push_back({leancast::extensions::Utf8ToWide(*name),
-                              leancast::extensions::Utf8ToWide(*url)});
+    release.assets.push_back({feathercast::extensions::Utf8ToWide(*name),
+                              feathercast::extensions::Utf8ToWide(*url)});
   }
   return release;
 }
@@ -146,7 +146,7 @@ inline bool IsEligibleRelease(const ReleaseInfo& release, const std::wstring& cu
 }
 
 inline std::wstring ExpectedInstallerAssetName(const std::wstring& tagName) {
-  return L"LeanCast-" + AssetVersionFromTag(tagName) + L"-win64.exe";
+  return L"FeatherCast-" + AssetVersionFromTag(tagName) + L"-win64.exe";
 }
 
 inline std::optional<ReleaseAsset> SelectInstallerAsset(const ReleaseInfo& release) {
@@ -159,7 +159,7 @@ inline std::optional<ReleaseAsset> SelectInstallerAsset(const ReleaseInfo& relea
   for (const auto& asset : release.assets) {
     const std::wstring name = LowerWide(asset.name);
     if (EndsWithInsensitive(asset.name, L".exe") &&
-        name.find(L"leancast") != std::wstring::npos &&
+        name.find(L"feathercast") != std::wstring::npos &&
         name.find(version) != std::wstring::npos &&
         name.find(L"win64") != std::wstring::npos) {
       return asset;
@@ -258,4 +258,4 @@ inline bool VerifyFileSha256(const std::filesystem::path& path, std::string_view
   return expected && actual && *expected == *actual;
 }
 
-}  // namespace leancast::updater
+}  // namespace feathercast::updater

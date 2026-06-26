@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "core.hpp"
 
@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace leancast::run_command {
+namespace feathercast::run_command {
 
 enum class Kind {
   None,
@@ -26,12 +26,12 @@ struct Command {
 };
 
 inline std::wstring StripMatchingQuotes(std::wstring value) {
-  value = leancast::core::Trim(std::move(value));
+  value = feathercast::core::Trim(std::move(value));
   if (value.size() >= 2 && ((value.front() == L'"' && value.back() == L'"') ||
                             (value.front() == L'\'' && value.back() == L'\''))) {
     value = value.substr(1, value.size() - 2);
   }
-  return leancast::core::Trim(std::move(value));
+  return feathercast::core::Trim(std::move(value));
 }
 
 inline bool ContainsWhitespace(const std::wstring& value) {
@@ -41,7 +41,7 @@ inline bool ContainsWhitespace(const std::wstring& value) {
 inline bool HasKnownUriScheme(const std::wstring& value) {
   const size_t colon = value.find(L':');
   if (colon == std::wstring::npos || colon == 0) return false;
-  const std::wstring scheme = leancast::core::Lower(value.substr(0, colon));
+  const std::wstring scheme = feathercast::core::Lower(value.substr(0, colon));
   static const std::vector<std::wstring> kSchemes = {
     L"http", L"https", L"file", L"ftp", L"mailto", L"ms-settings", L"shell",
     L"steam", L"vscode", L"obsidian", L"onenote", L"zoommtg",
@@ -76,11 +76,11 @@ inline bool LooksLikeBareUrl(const std::wstring& value) {
   if (at != std::wstring::npos) host = host.substr(at + 1);
   const size_t colon = host.find(L':');
   if (colon != std::wstring::npos) host = host.substr(0, colon);
-  return LooksLikeHost(leancast::core::Lower(host));
+  return LooksLikeHost(feathercast::core::Lower(host));
 }
 
 inline std::optional<Command> Classify(std::wstring query) {
-  query = leancast::core::Trim(std::move(query));
+  query = feathercast::core::Trim(std::move(query));
   if (query.empty() || query.front() != L'>') return std::nullopt;
 
   std::wstring input = StripMatchingQuotes(query.substr(1));
@@ -118,4 +118,4 @@ inline std::optional<Command> Classify(std::wstring query) {
   };
 }
 
-}  // namespace leancast::run_command
+}  // namespace feathercast::run_command

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "sqlite3.h"
 
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace leancast::storage {
+namespace feathercast::storage {
 
 struct FileIndexEntry {
   std::wstring path;
@@ -271,4 +271,4 @@ class Storage {
   sqlite3* db_ = nullptr;
 };
 
-}  // namespace leancast::storage
+}  // namespace feathercast::storage

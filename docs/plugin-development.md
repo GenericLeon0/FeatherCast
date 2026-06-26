@@ -1,13 +1,13 @@
-# LeanCast Plugin Development
+﻿# FeatherCast Plugin Development
 
-LeanCast plugins are native Windows DLLs loaded through `LeanCastPluginHost.exe`. The host process isolates plugin crashes from the launcher process and communicates with each plugin using one-line JSON requests and responses over standard input/output.
+FeatherCast plugins are native Windows DLLs loaded through `FeatherCastPluginHost.exe`. The host process isolates plugin crashes from the launcher process and communicates with each plugin using one-line JSON requests and responses over standard input/output.
 
 ## Install Locations
 
-LeanCast discovers plugins from both of these folders:
+FeatherCast discovers plugins from both of these folders:
 
-- `%APPDATA%\LeanCast\plugins\<plugin-id>\plugin.json`
-- `<LeanCast install directory>\plugins\<plugin-id>\plugin.json`
+- `%APPDATA%\FeatherCast\plugins\<plugin-id>\plugin.json`
+- `<FeatherCast install directory>\plugins\<plugin-id>\plugin.json`
 
 Roaming user plugins win over bundled plugins with the same `id`.
 
@@ -33,32 +33,36 @@ Required fields are `id`, `name`, `version`, and `dll`. The DLL path must remain
 Include `native/src/IExtension.h` and export both functions:
 
 ```cpp
-LEANCAST_EXTENSION_EXPORT uint32_t LeanCastExtensionApiVersion() {
-  return LEANCAST_EXTENSION_API_VERSION;
+FEATHERCAST_EXTENSION_EXPORT uint32_t FeatherCastExtensionApiVersion() {
+  return FEATHERCAST_EXTENSION_API_VERSION;
 }
 
-LEANCAST_EXTENSION_EXPORT uint32_t LeanCastExtensionHandleJson(
+FEATHERCAST_EXTENSION_EXPORT uint32_t FeatherCastExtensionHandleJson(
     const char* requestUtf8,
     char* responseUtf8,
     uint32_t responseCapacity);
 ```
 
-`LeanCastExtensionHandleJson` returns the required response buffer size, including the trailing null byte. If `responseCapacity` is too small, do not write a partial response; return the required size so the host can retry.
+`FeatherCastExtensionHandleJson` returns the required response buffer size, including the trailing null byte. If `responseCapacity` is too small, do not write a partial response; return the required size so the host can retry.
 
 ## Query Request
 
-LeanCast sends a query request when the user types:
+FeatherCast sends a query request when the user types:
 
 ```json
 {
-  "apiVersion": 1,
+  "apiVersion": 2,
   "type": "query",
   "query": "demo",
   "limit": 20,
+  "capabilities": {
+    "detailMarkdown": true,
+    "setQuery": true
+  },
   "context": {
     "pluginId": "sample",
     "pluginDir": "C:\\Path\\To\\Plugin",
-    "dataDir": "C:\\Users\\You\\AppData\\Roaming\\LeanCast"
+    "dataDir": "C:\\Users\\You\\AppData\\Roaming\\FeatherCast"
   }
 }
 ```
@@ -75,6 +79,11 @@ Respond with up to `limit` items:
       "keywords": ["demo", "sample"],
       "score": 42,
       "iconPath": "C:\\Path\\To\\icon.png",
+      "detail": {
+        "type": "markdown",
+        "title": "Demo Detail",
+        "body": "# Heading\n- Bullet\n`inline code`\n```\ncode block\n```"
+      },
       "payload": {"value": "demo"}
     }
   ]
@@ -82,21 +91,22 @@ Respond with up to `limit` items:
 ```
 
 Only `id` and `title` are required for each item. `payload` is passed back unchanged during activation.
+`detail` is optional and currently supports `type: "markdown"` for a native detail pane on the selected plugin result.
 
 ## Activate Request
 
-LeanCast sends activation when the user presses Enter on a plugin result:
+FeatherCast sends activation when the user presses Enter on a plugin result:
 
 ```json
 {
-  "apiVersion": 1,
+  "apiVersion": 2,
   "type": "activate",
   "itemId": "demo",
   "payload": {"value": "demo"},
   "context": {
     "pluginId": "sample",
     "pluginDir": "C:\\Path\\To\\Plugin",
-    "dataDir": "C:\\Users\\You\\AppData\\Roaming\\LeanCast"
+    "dataDir": "C:\\Users\\You\\AppData\\Roaming\\FeatherCast"
   }
 }
 ```
@@ -107,9 +117,12 @@ Supported host actions:
 {"handled": true, "closeOverlay": true, "action": {"type": "openUrl", "value": "https://example.com"}}
 {"handled": true, "closeOverlay": true, "action": {"type": "openPath", "value": "C:\\Path\\To\\File.txt"}}
 {"handled": true, "closeOverlay": true, "action": {"type": "copyText", "value": "Copied text"}}
+{"handled": true, "closeOverlay": false, "action": {"type": "setQuery", "value": "next search"}}
 ```
 
 Use `{"handled": true}` when the plugin performed all work itself.
+
+v1 plugins are still accepted. The host keeps the native ABI shape unchanged and sends v1 requests to v1 plugins.
 
 ## Limits And Failure Behavior
 
@@ -117,16 +130,16 @@ Use `{"handled": true}` when the plugin performed all work itself.
 - Activation calls time out after about 2 seconds.
 - A response must be no larger than 1 MiB.
 - Plugin exceptions and access violations are caught by the host and returned as errors.
-- If a plugin process exits, times out, or returns malformed data, LeanCast marks it unavailable until extensions are reloaded.
-- Logs are written to `%APPDATA%\LeanCast\extension-log.txt`.
+- If a plugin process exits, times out, or has host I/O failures, FeatherCast restarts the plugin host and records a strike. Three consecutive strikes mark the plugin unavailable until extensions are reloaded. A successful request resets the strike count.
+- Logs are written to `%APPDATA%\FeatherCast\extension-log.txt`.
 
 ## Testing
 
 Build the host and run it directly with your plugin DLL:
 
 ```powershell
-cmake --build build-native --config Release --target LeanCastPluginHost
-build-native\Release\LeanCastPluginHost.exe C:\Path\To\SamplePlugin.dll
+cmake --build build-native --config Release --target FeatherCastPluginHost
+build-native\Release\FeatherCastPluginHost.exe C:\Path\To\SamplePlugin.dll
 ```
 
-Then type one JSON request per line and read one JSON response per line. LeanCast's own host tests in `native/tests/plugin_host_tests.cpp` are useful examples for automating this.
+Then type one JSON request per line and read one JSON response per line. FeatherCast's own host tests in `native/tests/plugin_host_tests.cpp` are useful examples for automating this.

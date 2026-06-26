@@ -1,4 +1,4 @@
-# Generates the LeanCast icon (build/icon.ico, build/icon.png, build/tray.png)
+﻿# Generates the FeatherCast icon (build/icon.ico, build/icon.png, build/tray.png)
 # from the checked-in source artwork.
 Add-Type -AssemblyName System.Drawing
 

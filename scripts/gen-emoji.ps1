@@ -1,4 +1,4 @@
-# Generates native/src/emoji.hpp from the Unicode emoji-test.txt data file.
+﻿# Generates native/src/emoji.hpp from the Unicode emoji-test.txt data file.
 # Includes every fully-qualified emoji except skin-tone variants. The emitted
 # header is committed so the native build stays offline (mirrors gen-icons.ps1).
 param(
@@ -73,15 +73,15 @@ $header = @"
 #include <vector>
 #include <mutex>
 
-namespace leancast::emoji {
+namespace feathercast::emoji {
 
-inline std::vector<leancast::symbols::Symbol>* g_EmojiList = nullptr;
-inline std::vector<leancast::core::SearchItem>* g_EmojiSearchItems = nullptr;
+inline std::vector<feathercast::symbols::Symbol>* g_EmojiList = nullptr;
+inline std::vector<feathercast::core::SearchItem>* g_EmojiSearchItems = nullptr;
 inline std::mutex g_EmojiMutex;
 
-inline const std::vector<leancast::symbols::Symbol>& AllEmojiUnlocked();
+inline const std::vector<feathercast::symbols::Symbol>& AllEmojiUnlocked();
 
-inline const std::vector<leancast::symbols::Symbol>& AllEmoji() {
+inline const std::vector<feathercast::symbols::Symbol>& AllEmoji() {
   std::lock_guard<std::mutex> lock(g_EmojiMutex);
   return AllEmojiUnlocked();
 }
@@ -98,21 +98,21 @@ inline void FreeEmojiMemory() {
   }
 }
 
-inline const std::vector<leancast::symbols::Symbol>& AllEmojiUnlocked() {
+inline const std::vector<feathercast::symbols::Symbol>& AllEmojiUnlocked() {
   if (!g_EmojiList) {
-    g_EmojiList = new std::vector<leancast::symbols::Symbol>{
+    g_EmojiList = new std::vector<feathercast::symbols::Symbol>{
 $($entries -join "`n")
   };
   }
   return *g_EmojiList;
 }
 
-inline std::vector<leancast::symbols::Symbol> SearchEmoji(std::wstring query, size_t limit = 300) {
-  query = leancast::core::Trim(std::move(query));
+inline std::vector<feathercast::symbols::Symbol> SearchEmoji(std::wstring query, size_t limit = 300) {
+  query = feathercast::core::Trim(std::move(query));
 
   std::lock_guard<std::mutex> lock(g_EmojiMutex);
   const auto& all = AllEmojiUnlocked();
-  std::vector<leancast::symbols::Symbol> out;
+  std::vector<feathercast::symbols::Symbol> out;
   if (query.empty()) {
     for (const auto& emoji : all) {
       out.push_back(emoji);
@@ -122,10 +122,10 @@ inline std::vector<leancast::symbols::Symbol> SearchEmoji(std::wstring query, si
   }
 
   if (!g_EmojiSearchItems) {
-    g_EmojiSearchItems = new std::vector<leancast::core::SearchItem>();
+    g_EmojiSearchItems = new std::vector<feathercast::core::SearchItem>();
     g_EmojiSearchItems->reserve(all.size());
     for (size_t i = 0; i < all.size(); ++i) {
-      leancast::core::SearchItem item;
+      feathercast::core::SearchItem item;
       item.id = std::to_wstring(i);
       item.kind = L"emoji";
       item.source = L"emoji";
@@ -135,7 +135,7 @@ inline std::vector<leancast::symbols::Symbol> SearchEmoji(std::wstring query, si
     }
   }
 
-  const auto order = leancast::core::Search(query, *g_EmojiSearchItems);
+  const auto order = feathercast::core::Search(query, *g_EmojiSearchItems);
   for (const auto index : order) {
     out.push_back(all[index]);
     if (out.size() >= limit) break;
@@ -143,7 +143,7 @@ inline std::vector<leancast::symbols::Symbol> SearchEmoji(std::wstring query, si
   return out;
 }
 
-}  // namespace leancast::emoji
+}  // namespace feathercast::emoji
 "@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

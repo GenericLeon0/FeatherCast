@@ -10,7 +10,7 @@
 #include <sstream>
 #include <string>
 
-namespace leancast::theme {
+namespace feathercast::theme {
 
 struct Color {
   float r = 0.0f;
@@ -20,13 +20,18 @@ struct Color {
 };
 
 struct Theme {
-  std::wstring fontFamily = L"Segoe UI";
-  Color overlayBackground{0.13f, 0.13f, 0.15f, 0.94f};
-  Color settingsBackground{0.13f, 0.13f, 0.15f, 0.96f};
+  // Obsidian font stack: Segoe UI Variable (Win11 optical scaling) with fallbacks.
+  std::wstring fontFamily = L"Segoe UI Variable Text, Segoe UI Variable, Inter, Segoe UI";
+  // Obsidian dark panel at ~85 % opacity over real DirectComposition transparency.
+  Color overlayBackground{0.063f, 0.063f, 0.071f, 0.85f};
+  Color settingsBackground{0.063f, 0.063f, 0.071f, 0.85f};
   Color border{1.0f, 1.0f, 1.0f, 0.08f};
-  Color divider{1.0f, 1.0f, 1.0f, 0.06f};
-  Color surface{0.09f, 0.09f, 0.11f, 1.0f};
+  Color divider{1.0f, 1.0f, 1.0f, 0.08f};
+  // surface: #18181B – modern Tailwind Zinc-900 slate grey.
+  Color surface{0.094f, 0.094f, 0.106f, 1.0f};
   Color surfaceHover{1.0f, 1.0f, 1.0f, 0.12f};
+  // selectedBase: dark opaque base that the Windows accent is tinted into for a readable,
+  // accent-colored selection pill.
   Color selectedBase{0.11f, 0.11f, 0.13f, 1.0f};
   Color iconTile{0.23f, 0.23f, 0.28f, 1.0f};
   Color textPrimary{0.95f, 0.95f, 0.96f, 1.0f};
@@ -35,9 +40,10 @@ struct Theme {
   Color sectionText{0.62f, 0.64f, 0.74f, 1.0f};
   Color danger{1.0f, 0.36f, 0.36f, 1.0f};
   Color accentFallback{0.36f, 0.42f, 1.0f, 1.0f};
-  float overlayRadius = 14.0f;
-  float settingsRadius = 16.0f;
-  float rowRadius = 8.0f;
+  float overlayRadius = 10.0f;
+  float settingsRadius = 10.0f;
+  // rowRadius: 6.0f keeps selected rows subtly rounded inside the 10px outer panel.
+  float rowRadius = 6.0f;
   float controlRadius = 8.0f;
 };
 
@@ -71,23 +77,23 @@ inline std::optional<Color> ParseHexColor(const std::wstring& value, float fallb
 }
 
 inline void ApplyColor(const std::string& json, const char* key, Color& target) {
-  if (const auto raw = leancast::extensions::JsonString(json, key)) {
-    if (const auto parsed = ParseHexColor(leancast::extensions::Utf8ToWide(*raw), target.a)) {
+  if (const auto raw = feathercast::extensions::JsonString(json, key)) {
+    if (const auto parsed = ParseHexColor(feathercast::extensions::Utf8ToWide(*raw), target.a)) {
       target = *parsed;
     }
   }
 }
 
 inline void ApplyFloat(const std::string& json, const char* key, float& target, float minValue, float maxValue) {
-  if (const auto raw = leancast::extensions::JsonNumber(json, key)) {
+  if (const auto raw = feathercast::extensions::JsonNumber(json, key)) {
     target = std::clamp(static_cast<float>(*raw), minValue, maxValue);
   }
 }
 
 inline Theme ParseThemeJson(const std::string& json, const Theme& defaults = Theme{}) {
   Theme theme = defaults;
-  if (const auto font = leancast::extensions::JsonString(json, "fontFamily")) {
-    const std::wstring parsed = leancast::extensions::Utf8ToWide(*font);
+  if (const auto font = feathercast::extensions::JsonString(json, "fontFamily")) {
+    const std::wstring parsed = feathercast::extensions::Utf8ToWide(*font);
     if (!parsed.empty()) theme.fontFamily = parsed;
   }
 
@@ -129,12 +135,12 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
   if (!file) return false;
   file <<
       "{\n"
-      "  \"fontFamily\": \"Segoe UI\",\n"
-      "  \"overlayBackground\": \"#212126F0\",\n"
-      "  \"settingsBackground\": \"#212126F5\",\n"
+      "  \"fontFamily\": \"Segoe UI Variable Text, Segoe UI Variable, Inter, Segoe UI\",\n"
+      "  \"overlayBackground\": \"#101012D9\",\n"
+      "  \"settingsBackground\": \"#101012D9\",\n"
       "  \"border\": \"#FFFFFF14\",\n"
-      "  \"divider\": \"#FFFFFF0F\",\n"
-      "  \"surface\": \"#17171C\",\n"
+      "  \"divider\": \"#FFFFFF14\",\n"
+      "  \"surface\": \"#18181B\",\n"
       "  \"surfaceHover\": \"#FFFFFF1F\",\n"
       "  \"selectedBase\": \"#1C1C20\",\n"
       "  \"iconTile\": \"#3B3B47\",\n"
@@ -144,12 +150,12 @@ inline bool WriteDefaultTheme(const std::filesystem::path& path) {
       "  \"sectionText\": \"#9EA3BD\",\n"
       "  \"danger\": \"#FF5C5C\",\n"
       "  \"accentFallback\": \"#5B6CFF\",\n"
-      "  \"overlayRadius\": 14,\n"
-      "  \"settingsRadius\": 16,\n"
-      "  \"rowRadius\": 8,\n"
+      "  \"overlayRadius\": 10,\n"
+      "  \"settingsRadius\": 10,\n"
+      "  \"rowRadius\": 6,\n"
       "  \"controlRadius\": 8\n"
       "}\n";
   return true;
 }
 
-}  // namespace leancast::theme
+}  // namespace feathercast::theme

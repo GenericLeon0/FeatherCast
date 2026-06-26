@@ -1,12 +1,13 @@
-#pragma once
+﻿#pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <cwctype>
 #include <set>
 #include <string>
 #include <vector>
 
-namespace leancast::core {
+namespace feathercast::core {
 
 struct SearchItem {
   std::wstring id;
@@ -72,6 +73,42 @@ inline bool BoundaryBefore(const std::wstring& text, size_t index) {
   return std::iswspace(ch) || ch == L'.' || ch == L'_' || ch == L'-' || ch == L'\\' || ch == L'/';
 }
 
+inline int DamerauLevenshteinDistance(const std::wstring& a, const std::wstring& b, int maxDistance) {
+  const int m = static_cast<int>(a.size());
+  const int n = static_cast<int>(b.size());
+  if (std::abs(m - n) > maxDistance) return maxDistance + 1;
+
+  std::vector<int> d(static_cast<size_t>((m + 1) * (n + 1)), 0);
+  auto at = [&](int row, int col) -> int& {
+    return d[static_cast<size_t>(row * (n + 1) + col)];
+  };
+
+  for (int i = 0; i <= m; ++i) at(i, 0) = i;
+  for (int j = 0; j <= n; ++j) at(0, j) = j;
+
+  for (int i = 1; i <= m; ++i) {
+    int rowBest = maxDistance + 1;
+    for (int j = 1; j <= n; ++j) {
+      const int cost = a[static_cast<size_t>(i - 1)] == b[static_cast<size_t>(j - 1)] ? 0 : 1;
+      int value = std::min({
+        at(i - 1, j) + 1,
+        at(i, j - 1) + 1,
+        at(i - 1, j - 1) + cost,
+      });
+      if (i > 1 && j > 1 &&
+          a[static_cast<size_t>(i - 1)] == b[static_cast<size_t>(j - 2)] &&
+          a[static_cast<size_t>(i - 2)] == b[static_cast<size_t>(j - 1)]) {
+        value = std::min(value, at(i - 2, j - 2) + 1);
+      }
+      at(i, j) = value;
+      rowBest = std::min(rowBest, value);
+    }
+    if (rowBest > maxDistance && i > maxDistance + 1) return maxDistance + 1;
+  }
+
+  return at(m, n);
+}
+
 inline double ScoreText(const std::wstring& query, const std::wstring& target) {
   const std::wstring q = Normalize(query);
   const std::wstring t = Normalize(target);
@@ -88,6 +125,24 @@ inline double ScoreText(const std::wstring& query, const std::wstring& target) {
   const size_t substring = t.find(q);
   if (substring != std::wstring::npos) {
     return (BoundaryBefore(t, substring) ? 2400 : 1800) - static_cast<double>(substring);
+  }
+
+  if (q.size() > 4) {
+    const int maxDistance = q.size() >= 8 ? 2 : 1;
+    int bestDistance = maxDistance + 1;
+    int bestLengthDelta = maxDistance + 1;
+    for (const auto& token : Tokens(t)) {
+      const int lengthDelta = std::abs(static_cast<int>(token.size()) - static_cast<int>(q.size()));
+      if (lengthDelta > maxDistance) continue;
+      const int distance = DamerauLevenshteinDistance(q, token, maxDistance);
+      if (distance < bestDistance || (distance == bestDistance && lengthDelta < bestLengthDelta)) {
+        bestDistance = distance;
+        bestLengthDelta = lengthDelta;
+      }
+    }
+    if (bestDistance <= maxDistance) {
+      return 1550.0 - static_cast<double>(bestDistance * 220 + bestLengthDelta * 15);
+    }
   }
 
   size_t qi = 0;
@@ -152,7 +207,7 @@ inline double ScoreItem(const std::wstring& normalizedQuery, const std::vector<s
 
   const std::wstring name = Normalize(item.name);
   if (name == normalizedQuery) total += 2500;
-  else if (name.rfind(normalizedQuery, 0) == 0) total += 1200;
+  else if (name.rfind(normalizedQuery, 0) == 0) total += 600;
 
   if (recentIds.contains(item.id) || recentIds.contains(item.path)) total += 260;
   if (item.pinned) total += 1000;
@@ -204,4 +259,4 @@ inline std::vector<size_t> Search(const std::wstring& query, const std::vector<S
   return out;
 }
 
-}  // namespace leancast::core
+}  // namespace feathercast::core

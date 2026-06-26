@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "core.hpp"
 
@@ -7,7 +7,7 @@
 #include <vector>
 #include <mutex>
 
-namespace leancast::symbols {
+namespace feathercast::symbols {
 
 struct Symbol {
   std::wstring value;
@@ -78,7 +78,7 @@ inline const std::vector<Symbol>& AllSymbols() {
   return kSymbols;
 }
 
-inline std::vector<leancast::core::SearchItem>* g_SymbolsSearchItems = nullptr;
+inline std::vector<feathercast::core::SearchItem>* g_SymbolsSearchItems = nullptr;
 inline std::mutex g_SymbolsMutex;
 
 inline void FreeSymbolsMemory() {
@@ -90,10 +90,10 @@ inline void FreeSymbolsMemory() {
 }
 
 inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) {
-  query = leancast::core::Trim(std::move(query));
+  query = feathercast::core::Trim(std::move(query));
   if (!query.empty() && query.front() == L':') {
     query.erase(query.begin());
-    query = leancast::core::Trim(std::move(query));
+    query = feathercast::core::Trim(std::move(query));
   }
 
   const auto& all = AllSymbols();
@@ -108,10 +108,10 @@ inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) 
 
   std::lock_guard<std::mutex> lock(g_SymbolsMutex);
   if (!g_SymbolsSearchItems) {
-    g_SymbolsSearchItems = new std::vector<leancast::core::SearchItem>();
+    g_SymbolsSearchItems = new std::vector<feathercast::core::SearchItem>();
     g_SymbolsSearchItems->reserve(all.size());
     for (size_t i = 0; i < all.size(); ++i) {
-      leancast::core::SearchItem item;
+      feathercast::core::SearchItem item;
       item.id = std::to_wstring(i);
       item.kind = L"symbol";
       item.source = L"symbol";
@@ -122,7 +122,7 @@ inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) 
     }
   }
 
-  const auto order = leancast::core::Search(query, *g_SymbolsSearchItems);
+  const auto order = feathercast::core::Search(query, *g_SymbolsSearchItems);
   for (const auto index : order) {
     out.push_back(all[index]);
     if (out.size() >= limit) break;
@@ -130,4 +130,4 @@ inline std::vector<Symbol> SearchSymbols(std::wstring query, size_t limit = 32) 
   return out;
 }
 
-}  // namespace leancast::symbols
+}  // namespace feathercast::symbols

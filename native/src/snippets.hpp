@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "extension_protocol.hpp"
 
@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace leancast::snippets {
+namespace feathercast::snippets {
 
 struct Snippet {
   std::wstring keyword;
@@ -25,20 +25,20 @@ inline std::wstring Trim(std::wstring value) {
 
 inline std::vector<Snippet> ParseSnippetsJson(const std::string& json) {
   std::vector<Snippet> out;
-  for (const auto& object : leancast::extensions::JsonObjectArray(json, "snippets")) {
-    auto keyword = leancast::extensions::JsonString(object, "keyword");
-    auto name = leancast::extensions::JsonString(object, "name");
-    auto text = leancast::extensions::JsonString(object, "text");
+  for (const auto& object : feathercast::extensions::JsonObjectArray(json, "snippets")) {
+    auto keyword = feathercast::extensions::JsonString(object, "keyword");
+    auto name = feathercast::extensions::JsonString(object, "name");
+    auto text = feathercast::extensions::JsonString(object, "text");
     if (!keyword || !name || !text) continue;
 
     Snippet snippet;
-    snippet.keyword = Trim(leancast::extensions::Utf8ToWide(*keyword));
-    snippet.name = Trim(leancast::extensions::Utf8ToWide(*name));
-    snippet.text = leancast::extensions::Utf8ToWide(*text);
+    snippet.keyword = Trim(feathercast::extensions::Utf8ToWide(*keyword));
+    snippet.name = Trim(feathercast::extensions::Utf8ToWide(*name));
+    snippet.text = feathercast::extensions::Utf8ToWide(*text);
     if (snippet.keyword.empty() || snippet.name.empty() || Trim(snippet.text).empty()) continue;
     out.push_back(std::move(snippet));
   }
   return out;
 }
 
-}  // namespace leancast::snippets
+}  // namespace feathercast::snippets

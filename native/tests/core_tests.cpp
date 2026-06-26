@@ -1,4 +1,4 @@
-#include "calculator.hpp"
+﻿#include "calculator.hpp"
 #include "converter.hpp"
 #include "core.hpp"
 #include "emoji.hpp"
@@ -18,34 +18,34 @@
 #include <map>
 #include <set>
 
-using leancast::core::ScoreItem;
-using leancast::core::ScoreText;
-using leancast::core::Search;
-using leancast::core::SearchItem;
-using leancast::calculator::TryEvaluate;
-using leancast::converter::TryConvert;
-using leancast::extensions::DiscoverManifests;
-using leancast::extensions::HostActionType;
-using leancast::extensions::LoadManifest;
-using leancast::extensions::ParseActivationResponse;
-using leancast::extensions::ParseManifestJson;
-using leancast::extensions::ParseQueryResponse;
-using leancast::extensions::ResponseSizeAllowed;
-using leancast::snippets::ParseSnippetsJson;
-using leancast::shortcut::ParseShortcut;
-using leancast::shortcut::PressedModifiers;
-using leancast::shortcut::ShortcutRecorder;
-using leancast::shortcut::ShortcutRuntime;
-using leancast::shortcut::ShouldHandleInLowLevelHook;
-using leancast::shortcut::ToHotKeySpec;
-using leancast::updater::CompareVersionStrings;
-using leancast::updater::ExtractSha256Hex;
-using leancast::updater::IsEligibleRelease;
-using leancast::updater::IsNewerVersion;
-using leancast::updater::ParseGitHubReleaseJson;
-using leancast::updater::SelectInstallerAsset;
-using leancast::updater::SelectSha256Asset;
-using leancast::updater::VerifyFileSha256;
+using feathercast::core::ScoreItem;
+using feathercast::core::ScoreText;
+using feathercast::core::Search;
+using feathercast::core::SearchItem;
+using feathercast::calculator::TryEvaluate;
+using feathercast::converter::TryConvert;
+using feathercast::extensions::DiscoverManifests;
+using feathercast::extensions::HostActionType;
+using feathercast::extensions::LoadManifest;
+using feathercast::extensions::ParseActivationResponse;
+using feathercast::extensions::ParseManifestJson;
+using feathercast::extensions::ParseQueryResponse;
+using feathercast::extensions::ResponseSizeAllowed;
+using feathercast::snippets::ParseSnippetsJson;
+using feathercast::shortcut::ParseShortcut;
+using feathercast::shortcut::PressedModifiers;
+using feathercast::shortcut::ShortcutRecorder;
+using feathercast::shortcut::ShortcutRuntime;
+using feathercast::shortcut::ShouldHandleInLowLevelHook;
+using feathercast::shortcut::ToHotKeySpec;
+using feathercast::updater::CompareVersionStrings;
+using feathercast::updater::ExtractSha256Hex;
+using feathercast::updater::IsEligibleRelease;
+using feathercast::updater::IsNewerVersion;
+using feathercast::updater::ParseGitHubReleaseJson;
+using feathercast::updater::SelectInstallerAsset;
+using feathercast::updater::SelectSha256Asset;
+using feathercast::updater::VerifyFileSha256;
 
 namespace {
 
@@ -53,27 +53,27 @@ PressedModifiers Mods(bool ctrl = false, bool alt = false, bool shift = false, b
   return {ctrl, alt, shift, win};
 }
 
-void AssertPassOnly(const leancast::shortcut::HookResult& result) {
+void AssertPassOnly(const feathercast::shortcut::HookResult& result) {
   assert(!result.consume);
   assert(!result.toggle);
   assert(!result.suppressWinStart);
 }
 
-void AssertRecordingPending(const leancast::shortcut::RecordingResult& result) {
+void AssertRecordingPending(const feathercast::shortcut::RecordingResult& result) {
   assert(result.consume);
   assert(!result.done);
   assert(!result.canceled);
   assert(result.shortcut.empty());
 }
 
-void AssertRecordingCanceled(const leancast::shortcut::RecordingResult& result) {
+void AssertRecordingCanceled(const feathercast::shortcut::RecordingResult& result) {
   assert(result.consume);
   assert(!result.done);
   assert(result.canceled);
   assert(result.shortcut.empty());
 }
 
-void AssertRecorded(const leancast::shortcut::RecordingResult& result, const std::wstring& shortcut) {
+void AssertRecorded(const feathercast::shortcut::RecordingResult& result, const std::wstring& shortcut) {
   assert(result.consume);
   assert(result.done);
   assert(!result.canceled);
@@ -110,6 +110,33 @@ int main() {
     const auto percent = TryEvaluate(L"50%");
     assert(percent && percent->display == L"0.5");
 
+    const auto addPercent = TryEvaluate(L"100 + 10%");
+    assert(addPercent && addPercent->display == L"110");
+
+    const auto subtractPercent = TryEvaluate(L"100 - 10%");
+    assert(subtractPercent && subtractPercent->display == L"90");
+
+    const auto multiplyPercent = TryEvaluate(L"100 * 10%");
+    assert(multiplyPercent && multiplyPercent->display == L"10");
+
+    const auto sine = TryEvaluate(L"sin(90)");
+    assert(sine && std::fabs(sine->value - 1.0) < 0.000001);
+
+    const auto cosine = TryEvaluate(L"cos(60)");
+    assert(cosine && std::fabs(cosine->value - 0.5) < 0.000001);
+
+    const auto tangent = TryEvaluate(L"tan(45)");
+    assert(tangent && std::fabs(tangent->value - 1.0) < 0.000001);
+
+    const auto root = TryEvaluate(L"sqrt(16)");
+    assert(root && root->display == L"4");
+
+    const auto power = TryEvaluate(L"2^3");
+    assert(power && power->display == L"8");
+
+    const auto powerRightAssoc = TryEvaluate(L"2**3**2");
+    assert(powerRightAssoc && powerRightAssoc->display == L"512");
+
     assert(!TryEvaluate(L"9+"));
     assert(!TryEvaluate(L"notepad"));
   }
@@ -133,6 +160,15 @@ int main() {
 
     const auto arrow = TryConvert(L"5 km -> m");
     assert(arrow && std::fabs(arrow->value - 5000.0) < 0.001);
+
+    const auto dataRate = TryConvert(L"100 mbps to gbps");
+    assert(dataRate && std::fabs(dataRate->value - 0.1) < 0.0001);
+
+    const auto powerUnit = TryConvert(L"1 kw to hp");
+    assert(powerUnit && std::fabs(powerUnit->value - 1.34102) < 0.001);
+
+    const auto energy = TryConvert(L"1 kwh to j");
+    assert(energy && std::fabs(energy->value - 3600000.0) < 0.001);
 
     // Cross-category and non-conversions are rejected so the calculator wins.
     assert(!TryConvert(L"10 km to kg"));
@@ -188,17 +224,17 @@ int main() {
     assert(!IsNewerVersion(L"0.3.0", L"v0.2.9"));
 
     const auto release = ParseGitHubReleaseJson(
-        "{\"tag_name\":\"v0.3.0\",\"name\":\"LeanCast 0.3.0\",\"html_url\":\"https://github.com/GenericLeon0/LeanCast/releases/tag/v0.3.0\","
+        "{\"tag_name\":\"v0.3.0\",\"name\":\"FeatherCast 0.3.0\",\"html_url\":\"https://github.com/GenericLeon0/FeatherCast/releases/tag/v0.3.0\","
         "\"draft\":false,\"prerelease\":false,\"assets\":["
-        "{\"name\":\"LeanCast-0.3.0-win64.exe\",\"browser_download_url\":\"https://example.test/LeanCast-0.3.0-win64.exe\"},"
-        "{\"name\":\"LeanCast-0.3.0-win64.exe.sha256\",\"browser_download_url\":\"https://example.test/LeanCast-0.3.0-win64.exe.sha256\"}"
+        "{\"name\":\"FeatherCast-0.3.0-win64.exe\",\"browser_download_url\":\"https://example.test/FeatherCast-0.3.0-win64.exe\"},"
+        "{\"name\":\"FeatherCast-0.3.0-win64.exe.sha256\",\"browser_download_url\":\"https://example.test/FeatherCast-0.3.0-win64.exe.sha256\"}"
         "]}");
     assert(release);
     assert(IsEligibleRelease(*release, L"0.2.0"));
     const auto installer = SelectInstallerAsset(*release);
-    assert(installer && installer->name == L"LeanCast-0.3.0-win64.exe");
+    assert(installer && installer->name == L"FeatherCast-0.3.0-win64.exe");
     const auto hash = SelectSha256Asset(*release, *installer);
-    assert(hash && hash->name == L"LeanCast-0.3.0-win64.exe.sha256");
+    assert(hash && hash->name == L"FeatherCast-0.3.0-win64.exe.sha256");
 
     const auto prerelease = ParseGitHubReleaseJson(
         "{\"tag_name\":\"v0.4.0\",\"draft\":false,\"prerelease\":true,\"assets\":[]}");
@@ -208,7 +244,7 @@ int main() {
         "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  file.txt");
     assert(extracted && *extracted == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 
-    const auto tempRoot = std::filesystem::temp_directory_path() / L"LeanCastUpdaterCoreTests";
+    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastUpdaterCoreTests";
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
     WriteUtf8(tempRoot / L"hash.txt", "abc");
@@ -220,7 +256,7 @@ int main() {
   }
 
   {
-    const auto tempRoot = std::filesystem::temp_directory_path() / L"LeanCastExtensionCoreTests";
+    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastExtensionCoreTests";
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
 
@@ -232,7 +268,7 @@ int main() {
     assert(manifest.manifest->id == L"sample");
     assert(manifest.manifest->name == L"Sample");
     assert(manifest.manifest->enabled);
-    assert(leancast::extensions::PathInsideDirectory(manifest.manifest->dllPath, pluginDir));
+    assert(feathercast::extensions::PathInsideDirectory(manifest.manifest->dllPath, pluginDir));
 
     const auto missing = ParseManifestJson("{\"id\":\"bad\",\"name\":\"Bad\",\"dll\":\"bad.dll\"}",
                                            pluginDir / L"missing.json");
@@ -254,9 +290,9 @@ int main() {
     assert(discovered.manifests.front().name == L"Sample");
 
     assert(ResponseSizeAllowed(1));
-    assert(ResponseSizeAllowed(leancast::extensions::kMaxResponseBytes));
+    assert(ResponseSizeAllowed(feathercast::extensions::kMaxResponseBytes));
     assert(!ResponseSizeAllowed(0));
-    assert(!ResponseSizeAllowed(leancast::extensions::kMaxResponseBytes + 1));
+    assert(!ResponseSizeAllowed(feathercast::extensions::kMaxResponseBytes + 1));
 
     const auto query = ParseQueryResponse(
         "{\"items\":[{\"id\":\"one\",\"title\":\"One\",\"subtitle\":\"From plugin\","
@@ -271,6 +307,14 @@ int main() {
     assert(query->items.front().payloadJson.find("\"answer\"") != std::string::npos);
     assert(!ParseQueryResponse("{}"));
 
+    const auto detailQuery = ParseQueryResponse(
+        "{\"items\":[{\"id\":\"detail\",\"title\":\"Detail\",\"detail\":{\"type\":\"markdown\","
+        "\"title\":\"Info\",\"body\":\"# Heading\\n- Item\"}}]}");
+    assert(detailQuery && detailQuery->items.size() == 1);
+    assert(detailQuery->items.front().detailType == L"markdown");
+    assert(detailQuery->items.front().detailTitle == L"Info");
+    assert(detailQuery->items.front().detailBody.find(L"Heading") != std::wstring::npos);
+
     const auto activation = ParseActivationResponse(
         "{\"handled\":true,\"closeOverlay\":false,\"action\":{\"type\":\"copyText\",\"value\":\"copied\"}}");
     assert(activation);
@@ -278,6 +322,14 @@ int main() {
     assert(!activation->closeOverlay);
     assert(activation->action == HostActionType::CopyText);
     assert(activation->value == L"copied");
+
+    const auto setQuery = ParseActivationResponse(
+        "{\"handled\":true,\"closeOverlay\":false,\"action\":{\"type\":\"setQuery\",\"value\":\"follow up\"}}");
+    assert(setQuery);
+    assert(setQuery->handled);
+    assert(!setQuery->closeOverlay);
+    assert(setQuery->action == HostActionType::SetQuery);
+    assert(setQuery->value == L"follow up");
 
     std::filesystem::remove_all(tempRoot, ec);
   }
@@ -297,14 +349,14 @@ int main() {
   }
 
   {
-    const auto tempRoot = std::filesystem::temp_directory_path() / L"LeanCastPhase5StorageTests";
+    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastPhase5StorageTests";
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
 
-    leancast::storage::Storage storage;
-    assert(storage.Open(tempRoot / L"leancast.db"));
+    feathercast::storage::Storage storage;
+    assert(storage.Open(tempRoot / L"feathercast.db"));
 
-    std::vector<leancast::storage::FileIndexEntry> files = {
+    std::vector<feathercast::storage::FileIndexEntry> files = {
       {L"C:\\Users\\Leon\\Documents\\Notes", L"Notes", true, L"C:\\Users\\Leon\\Documents\\Notes", 10, 0, 100},
       {L"C:\\Users\\Leon\\Downloads\\setup.exe", L"setup.exe", false, L"C:\\Users\\Leon\\Downloads\\setup.exe", 11, 42, 100},
     };
@@ -330,7 +382,7 @@ int main() {
   }
 
   {
-    const auto parsed = leancast::theme::ParseThemeJson(
+    const auto parsed = feathercast::theme::ParseThemeJson(
         "{\"fontFamily\":\"Cascadia Mono\","
         "\"overlayBackground\":\"#11223380\","
         "\"textPrimary\":\"not-a-color\","
@@ -339,73 +391,73 @@ int main() {
     assert(parsed.fontFamily == L"Cascadia Mono");
     assert(std::fabs(parsed.overlayBackground.r - (0x11 / 255.0f)) < 0.001);
     assert(std::fabs(parsed.overlayBackground.a - (0x80 / 255.0f)) < 0.001);
-    assert(std::fabs(parsed.textPrimary.r - leancast::theme::Theme{}.textPrimary.r) < 0.001);
+    assert(std::fabs(parsed.textPrimary.r - feathercast::theme::Theme{}.textPrimary.r) < 0.001);
     assert(parsed.rowRadius == 12.0f);
     assert(parsed.controlRadius == 20.0f);
 
-    const auto color = leancast::theme::ParseHexColor(L"#ABCDEF");
+    const auto color = feathercast::theme::ParseHexColor(L"#ABCDEF");
     assert(color);
     assert(std::fabs(color->g - (0xCD / 255.0f)) < 0.001);
-    assert(!leancast::theme::ParseHexColor(L"#NOPE"));
+    assert(!feathercast::theme::ParseHexColor(L"#NOPE"));
   }
 
   {
-    const auto url = leancast::run_command::Classify(L">example.com/path");
+    const auto url = feathercast::run_command::Classify(L">example.com/path");
     assert(url);
-    assert(url->kind == leancast::run_command::Kind::OpenTarget);
+    assert(url->kind == feathercast::run_command::Kind::OpenTarget);
     assert(url->target == L"https://example.com/path");
 
-    const auto scheme = leancast::run_command::Classify(L">ms-settings:display");
+    const auto scheme = feathercast::run_command::Classify(L">ms-settings:display");
     assert(scheme);
-    assert(scheme->kind == leancast::run_command::Kind::OpenTarget);
+    assert(scheme->kind == feathercast::run_command::Kind::OpenTarget);
     assert(scheme->target == L"ms-settings:display");
 
-    const auto pathRoot = std::filesystem::temp_directory_path() / L"LeanCastRunCommandTests";
+    const auto pathRoot = std::filesystem::temp_directory_path() / L"FeatherCastRunCommandTests";
     std::filesystem::create_directories(pathRoot);
-    const auto pathCommand = leancast::run_command::Classify(L">\"" + pathRoot.wstring() + L"\"");
+    const auto pathCommand = feathercast::run_command::Classify(L">\"" + pathRoot.wstring() + L"\"");
     assert(pathCommand);
-    assert(pathCommand->kind == leancast::run_command::Kind::OpenTarget);
+    assert(pathCommand->kind == feathercast::run_command::Kind::OpenTarget);
     assert(pathCommand->target == pathRoot.wstring());
     std::error_code ec;
     std::filesystem::remove_all(pathRoot, ec);
 
-    const auto shell = leancast::run_command::Classify(L">echo hello");
+    const auto shell = feathercast::run_command::Classify(L">echo hello");
     assert(shell);
-    assert(shell->kind == leancast::run_command::Kind::ShellCommand);
+    assert(shell->kind == feathercast::run_command::Kind::ShellCommand);
     assert(shell->input == L"echo hello");
   }
 
   {
-    const auto arrows = leancast::symbols::SearchSymbols(L":arrow", 5);
+    const auto arrows = feathercast::symbols::SearchSymbols(L":arrow", 5);
     assert(!arrows.empty());
     assert(arrows.front().value == L"\u2192" || arrows.front().label.find(L"Arrow") != std::wstring::npos);
 
-    const auto checks = leancast::symbols::SearchSymbols(L":check", 5);
+    const auto checks = feathercast::symbols::SearchSymbols(L":check", 5);
     assert(!checks.empty());
     assert(checks.front().label.find(L"Check") != std::wstring::npos);
 
-    const auto smiles = leancast::symbols::SearchSymbols(L":smile", 5);
+    const auto smiles = feathercast::symbols::SearchSymbols(L":smile", 5);
     assert(!smiles.empty());
     assert(smiles.front().label.find(L"Face") != std::wstring::npos);
   }
 
   {
     // The generated emoji table must be present and searchable.
-    assert(!leancast::emoji::AllEmoji().empty());
-    for (const auto& emoji : leancast::emoji::AllEmoji()) {
+    assert(!feathercast::emoji::AllEmoji().empty());
+    for (const auto& emoji : feathercast::emoji::AllEmoji()) {
       assert(!emoji.value.empty());
       assert(!emoji.label.empty());
     }
 
-    const auto empty = leancast::emoji::SearchEmoji(L"", 10);
+    const auto empty = feathercast::emoji::SearchEmoji(L"", 10);
     assert(empty.size() == 10);
 
-    const auto smile = leancast::emoji::SearchEmoji(L"smile", 5);
+    const auto smile = feathercast::emoji::SearchEmoji(L"smile", 5);
     assert(!smile.empty());
     assert(smile.front().label.find(L"smil") != std::wstring::npos ||
            smile.front().label.find(L"grin") != std::wstring::npos);
 
-    const auto fire = leancast::emoji::SearchEmoji(L"fire", 5);
+    const auto fire = feathercast::emoji::SearchEmoji(L"fire", 5);
     assert(!fire.empty());
   }
 
@@ -451,6 +503,7 @@ int main() {
 
   const auto cpp = Search(L"studio", items);
   assert(!cpp.empty() && cpp.front() == 2);
+  assert(ScoreText(L"termainl", L"Terminal") > 0);
 
   const auto snippetHit = Search(L"sig", items);
   assert(!snippetHit.empty() && snippetHit.front() == 3);
@@ -477,6 +530,20 @@ int main() {
   usedCode.usageCount = 5;
   usedCode.lastUsed = 1000;
   assert(ScoreItem(L"code", usedCode, {}) > ScoreItem(L"code", plainCode, {}));
+
+  SearchItem codeBlocks;
+  codeBlocks.id = L"codeblocks";
+  codeBlocks.kind = L"app";
+  codeBlocks.name = L"CodeBlocks";
+
+  SearchItem visualStudioCode;
+  visualStudioCode.id = L"vscode";
+  visualStudioCode.kind = L"app";
+  visualStudioCode.name = L"Visual Studio Code";
+  visualStudioCode.keywords = {L"code"};
+  visualStudioCode.usageCount = 20;
+  visualStudioCode.lastUsed = 1000;
+  assert(ScoreItem(L"code", visualStudioCode, {L"vscode"}) > ScoreItem(L"code", codeBlocks, {}));
 
   {
     ShortcutRecorder recorder;

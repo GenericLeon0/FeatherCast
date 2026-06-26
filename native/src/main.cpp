@@ -19,9 +19,14 @@
 #include <commdlg.h>
 #include <d2d1.h>
 #include <d2d1_1.h>
+#include <d3d11.h>
+#include <dcomp.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <dxgi1_2.h>
+#include <endpointvolume.h>
 #include <knownfolders.h>
+#include <mmdeviceapi.h>
 #include <powrprof.h>
 #include <propidl.h>
 #include <propkey.h>
@@ -61,23 +66,23 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
-using leancast::shortcut::GenericModifier;
-using leancast::shortcut::IsModifier;
-using leancast::shortcut::ModifierPressed;
-using leancast::shortcut::ParseShortcut;
-using leancast::shortcut::PressedModifiers;
-using leancast::shortcut::ShortcutRecorder;
-using leancast::shortcut::ShortcutRuntime;
-using leancast::shortcut::ShortcutSpec;
-using leancast::shortcut::ShouldHandleInLowLevelHook;
-using leancast::shortcut::ToHotKeySpec;
+using feathercast::shortcut::GenericModifier;
+using feathercast::shortcut::IsModifier;
+using feathercast::shortcut::ModifierPressed;
+using feathercast::shortcut::ParseShortcut;
+using feathercast::shortcut::PressedModifiers;
+using feathercast::shortcut::ShortcutRecorder;
+using feathercast::shortcut::ShortcutRuntime;
+using feathercast::shortcut::ShortcutSpec;
+using feathercast::shortcut::ShouldHandleInLowLevelHook;
+using feathercast::shortcut::ToHotKeySpec;
 
 namespace {
 
 constexpr int IDI_APP_ICON = 101;
-constexpr wchar_t kWindowClass[] = L"LeanCastNativeWindow";
-constexpr wchar_t kSettingsWindowClass[] = L"LeanCastSettingsWindow";
-constexpr wchar_t kMutexName[] = L"LeanCastNativeSingleInstance";
+constexpr wchar_t kWindowClass[] = L"FeatherCastNativeWindow";
+constexpr wchar_t kSettingsWindowClass[] = L"FeatherCastSettingsWindow";
+constexpr wchar_t kMutexName[] = L"FeatherCastNativeSingleInstance";
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_SHOW_SEARCH = WM_APP + 2;
 constexpr UINT WM_ICON_READY = WM_APP + 3;
@@ -86,8 +91,10 @@ constexpr UINT WM_SEARCH_READY = WM_APP + 5;
 constexpr UINT WM_SHORTCUT_TOGGLE = WM_APP + 6;
 constexpr UINT WM_UPDATE_READY = WM_APP + 7;
 constexpr UINT WM_TRACK_RECENT = WM_APP + 8;
+constexpr UINT WM_ANIMATION_FRAME = WM_APP + 9;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr UINT TIMER_MEM_TRIM = 3;
+constexpr UINT TIMER_SELECTION_ANIM = 4;
 
 constexpr int WIN_WIDTH = 720;
 constexpr int WIN_HEIGHT = 470;
@@ -204,6 +211,7 @@ enum class CommandKind {
   ReloadExtensions,
   LockPC,
   SleepPC,
+  MuteAudio,
   ShutDown,
   RestartPC,
   EmptyRecycleBin,
@@ -360,11 +368,11 @@ struct DisplayItem {
   bool isSymbol = false;
   AppEntry app;
   WindowEntry window;
-  leancast::extensions::QueryResultItem extension;
-  leancast::snippets::Snippet snippet;
+  feathercast::extensions::QueryResultItem extension;
+  feathercast::snippets::Snippet snippet;
   ClipboardEntry clipboard;
-  leancast::run_command::Command runCommand;
-  leancast::symbols::Symbol symbol;
+  feathercast::run_command::Command runCommand;
+  feathercast::symbols::Symbol symbol;
   CommandKind command = CommandKind::Settings;
   ActionKind action = ActionKind::None;
   bool actionTargetIsWindow = false;
@@ -435,7 +443,7 @@ struct Section {
 struct SearchSnapshot {
   // Non-empty search path (pool is parallel to searchItems).
   std::vector<DisplayItem> pool;
-  std::vector<leancast::core::SearchItem> searchItems;
+  std::vector<feathercast::core::SearchItem> searchItems;
 
   // Empty-query path (pre-bucketed; needs settings_).
   std::vector<DisplayItem> pinned;
@@ -448,7 +456,7 @@ struct SearchSnapshot {
   std::vector<DisplayItem> clipboardItems;
 
   // Clipboard browse-view path (parallel to clipboardItems).
-  std::vector<leancast::core::SearchItem> clipboardSearchItems;
+  std::vector<feathercast::core::SearchItem> clipboardSearchItems;
 };
 
 // Self-contained snapshot of everything the search engine needs to produce a
@@ -477,7 +485,7 @@ struct QueryRequest {
 
   // Action-mode path (target-specific; built per request).
   std::vector<DisplayItem> actions;
-  std::vector<leancast::core::SearchItem> actionSearchItems;
+  std::vector<feathercast::core::SearchItem> actionSearchItems;
 };
 
 struct ResultsCollection {
@@ -503,11 +511,11 @@ std::string WideToUtf8(const std::wstring& value) {
 }
 
 std::wstring Lower(std::wstring value) {
-  return leancast::core::Lower(std::move(value));
+  return feathercast::core::Lower(std::move(value));
 }
 
 std::wstring Trim(std::wstring value) {
-  return leancast::core::Trim(std::move(value));
+  return feathercast::core::Trim(std::move(value));
 }
 
 // The user's locale currency as an ISO-4217 code (e.g. "EUR"), used as the
@@ -635,7 +643,7 @@ std::vector<std::wstring> AppKeys(const AppEntry& app) {
   return keys;
 }
 
-AppEntry FileIndexApp(const leancast::storage::FileIndexEntry& entry) {
+AppEntry FileIndexApp(const feathercast::storage::FileIndexEntry& entry) {
   AppEntry app;
   app.id = L"file:" + entry.path;
   app.name = entry.name;
@@ -651,7 +659,7 @@ AppEntry FileIndexApp(const leancast::storage::FileIndexEntry& entry) {
   return app;
 }
 
-leancast::storage::FileIndexEntry StorageFileEntry(const AppEntry& app) {
+feathercast::storage::FileIndexEntry StorageFileEntry(const AppEntry& app) {
   return {
     app.path,
     app.name,
@@ -731,7 +739,7 @@ DisplayItem ActionDisplay(ActionKind action, std::wstring name, std::wstring det
   return item;
 }
 
-DisplayItem CalculatorDisplay(const leancast::calculator::Result& result) {
+DisplayItem CalculatorDisplay(const feathercast::calculator::Result& result) {
   DisplayItem item;
   item.isCalculator = true;
   item.calculationExpression = result.expression;
@@ -787,7 +795,7 @@ DisplayItem WebSearchDisplay(const std::wstring& keyword, const std::wstring& en
   return item;
 }
 
-DisplayItem ExtensionDisplay(const leancast::extensions::QueryResultItem& result) {
+DisplayItem ExtensionDisplay(const feathercast::extensions::QueryResultItem& result) {
   DisplayItem item;
   item.isExtension = true;
   item.extension = result;
@@ -809,7 +817,7 @@ std::wstring SingleLinePreview(std::wstring text, size_t maxChars = 96) {
   return text.substr(0, maxChars - 3) + L"...";
 }
 
-DisplayItem SnippetDisplay(const leancast::snippets::Snippet& snippet) {
+DisplayItem SnippetDisplay(const feathercast::snippets::Snippet& snippet) {
   DisplayItem item;
   item.isSnippet = true;
   item.snippet = snippet;
@@ -827,7 +835,7 @@ DisplayItem ClipboardDisplay(const ClipboardEntry& entry) {
   return item;
 }
 
-DisplayItem RunCommandDisplay(const leancast::run_command::Command& command) {
+DisplayItem RunCommandDisplay(const feathercast::run_command::Command& command) {
   DisplayItem item;
   item.isRunCommand = true;
   item.runCommand = command;
@@ -836,7 +844,7 @@ DisplayItem RunCommandDisplay(const leancast::run_command::Command& command) {
   return item;
 }
 
-DisplayItem SymbolDisplay(const leancast::symbols::Symbol& symbol) {
+DisplayItem SymbolDisplay(const feathercast::symbols::Symbol& symbol) {
   DisplayItem item;
   item.isSymbol = true;
   item.symbol = symbol;
@@ -958,7 +966,7 @@ std::filesystem::path UserDataPath() {
     GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
     root = buf;
   }
-  root /= L"LeanCast";
+  root /= L"FeatherCast";
   std::error_code ec;
   std::filesystem::create_directories(root, ec);
   return root;
@@ -971,7 +979,7 @@ std::wstring ToHex(unsigned value) {
   return buf;
 }
 
-// TEMP DEBUG: append a line to %APPDATA%\LeanCast\launch-debug.log to diagnose
+// TEMP DEBUG: append a line to %APPDATA%\FeatherCast\launch-debug.log to diagnose
 // why some apps fail to launch. Remove once the launch bug is understood.
 void DebugLaunchLog(const std::wstring& line) {
   std::wofstream f(UserDataPath() / L"launch-debug.log", std::ios::app);
@@ -990,7 +998,7 @@ std::filesystem::path LocalDataPath() {
     GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
     root = buf;
   }
-  root /= L"LeanCast";
+  root /= L"FeatherCast";
   std::error_code ec;
   std::filesystem::create_directories(root, ec);
   return root;
@@ -1384,19 +1392,19 @@ std::filesystem::path SnippetsPath() {
 }
 
 std::filesystem::path DatabasePath() {
-  return UserDataPath() / L"leancast.db";
+  return UserDataPath() / L"feathercast.db";
 }
 
 std::filesystem::path ThemePath() {
   return UserDataPath() / L"theme.json";
 }
 
-std::vector<leancast::snippets::Snippet> LoadSnippets() {
+std::vector<feathercast::snippets::Snippet> LoadSnippets() {
   std::ifstream file(SnippetsPath(), std::ios::binary);
   if (!file) return {};
   std::ostringstream buffer;
   buffer << file.rdbuf();
-  return leancast::snippets::ParseSnippetsJson(buffer.str());
+  return feathercast::snippets::ParseSnippetsJson(buffer.str());
 }
 
 void EnsureSnippetsFile() {
@@ -1452,7 +1460,7 @@ void SaveCurrencyCache(const CurrencyRates& rates) {
 // Performs a simple HTTPS GET and returns the response body, or nullopt on error.
 std::optional<std::string> HttpsGet(const std::wstring& host, const std::wstring& path) {
   std::optional<std::string> result;
-  HINTERNET session = WinHttpOpen(L"LeanCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+  HINTERNET session = WinHttpOpen(L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) return result;
   ScopeExit closeSession([&] { WinHttpCloseHandle(session); });
@@ -1543,7 +1551,7 @@ std::optional<std::string> HttpsGetUrl(const std::wstring& url, size_t maxBytes 
   const auto parts = ParseHttpsUrl(url);
   if (!parts) return std::nullopt;
 
-  HINTERNET session = WinHttpOpen(L"LeanCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+  HINTERNET session = WinHttpOpen(L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) return std::nullopt;
   ScopeExit closeSession([&] { WinHttpCloseHandle(session); });
@@ -1596,7 +1604,7 @@ bool HttpsDownloadToFile(const std::wstring& url, const std::filesystem::path& d
   temp += L".tmp";
   std::filesystem::remove(temp, ec);
 
-  HINTERNET session = WinHttpOpen(L"LeanCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+  HINTERNET session = WinHttpOpen(L"FeatherCast/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) return false;
   ScopeExit closeSession([&] { WinHttpCloseHandle(session); });
@@ -1673,6 +1681,29 @@ bool EnableShutdownPrivilege() {
   return GetLastError() == ERROR_SUCCESS;
 }
 
+bool ToggleDefaultAudioMute() {
+  ComPtr<IMMDeviceEnumerator> enumerator;
+  if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                              IID_PPV_ARGS(enumerator.GetAddressOf())))) {
+    return false;
+  }
+
+  ComPtr<IMMDevice> device;
+  if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.GetAddressOf()))) {
+    return false;
+  }
+
+  ComPtr<IAudioEndpointVolume> volume;
+  if (FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(volume.GetAddressOf())))) {
+    return false;
+  }
+
+  BOOL muted = FALSE;
+  if (FAILED(volume->GetMute(&muted))) return false;
+  return SUCCEEDED(volume->SetMute(!muted, nullptr));
+}
+
 void SetStartOnStartup(bool enable) {
   HKEY hKey = nullptr;
   LSTATUS status = RegOpenKeyExW(
@@ -1689,14 +1720,14 @@ void SetStartOnStartup(bool enable) {
       std::wstring pathStr = L"\"" + std::wstring(exePath) + L"\"";
       RegSetValueExW(
           hKey,
-          L"LeanCast",
+          L"FeatherCast",
           0,
           REG_SZ,
           reinterpret_cast<const BYTE*>(pathStr.c_str()),
           static_cast<DWORD>((pathStr.length() + 1) * sizeof(wchar_t))
       );
     } else {
-      RegDeleteValueW(hKey, L"LeanCast");
+      RegDeleteValueW(hKey, L"FeatherCast");
     }
     RegCloseKey(hKey);
   }
@@ -1803,11 +1834,89 @@ D2D1_COLOR_F D2DColor(COLORREF color, float alpha = 1.0f) {
   return D2D1::ColorF(GetRValue(color) / 255.0f, GetGValue(color) / 255.0f, GetBValue(color) / 255.0f, alpha);
 }
 
-D2D1_COLOR_F D2DColor(const leancast::theme::Color& color) {
+D2D1_COLOR_F D2DColor(const feathercast::theme::Color& color) {
   return D2D1::ColorF(color.r, color.g, color.b, color.a);
 }
 
-COLORREF ColorRefFromTheme(const leancast::theme::Color& color) {
+// Forces the DWM dark-mode rendering path (DWMWA_USE_IMMERSIVE_DARK_MODE = 20) so the
+// window's DWM-managed chrome (border, rounded corners) uses the dark variant.
+// No-op pre-Win10 2004.
+inline void ApplyDarkMode(HWND hwnd) {
+  constexpr DWORD DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+  BOOL enabled = TRUE;
+  DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enabled, sizeof(enabled));
+}
+
+// Disables DWM's own rounded corners so the Direct2D panel is the only visible shape.
+inline void DisableDwmRoundedCorners(HWND hwnd) {
+  constexpr DWORD DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+  DWORD preference = 1;  // DWMWCP_DONOTROUND
+  DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
+}
+
+// Suppresses DWM's outer border; the app draws its own subtle Direct2D border.
+inline void DisableDwmBorder(HWND hwnd) {
+  constexpr DWORD DWMWA_BORDER_COLOR = 34;
+  constexpr COLORREF kDwmColorNone = 0xFFFFFFFE;
+  COLORREF color = kDwmColorNone;
+  DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &color, sizeof(color));
+}
+
+// Windows 11 22H2+ (build 22621+) DWM system backdrop materials
+// (DWMWA_SYSTEMBACKDROP_TYPE = 38). This is the current, documented way to get Mica/Acrylic
+// frosted glass. The window's composition buffer must be fully transparent (Direct2D cleared
+// to alpha 0, no opaque fill) for the material to show; otherwise the window renders black.
+enum class DwmBackdropType : DWORD {
+  Auto = 0,
+  None = 1,
+  Mica = 2,     // DWMSBT_MAINWINDOW – long-lived windows
+  Acrylic = 3,  // DWMSBT_TRANSIENTWINDOW – transient popovers/overlays
+  Tabbed = 4,
+};
+
+inline void ApplyModernBackdrop(HWND hwnd, DwmBackdropType type) {
+  constexpr DWORD DWMWA_SYSTEMBACKDROP_TYPE = 38;
+  DWORD value = static_cast<DWORD>(type);
+  DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &value, sizeof(value));
+}
+
+// Undocumented (but stable since Win10 1803) SetWindowCompositionAttribute accent
+// policy. FeatherCast explicitly disables this material path so Windows' global
+// transparency setting cannot turn the popup background into an opaque Acrylic/Mica fill.
+enum class AccentState : DWORD {
+  Disabled = 0,
+  EnableAcrylicBlurBehind = 4,
+};
+
+struct AccentPolicy {
+  AccentState state;
+  DWORD flags;
+  DWORD gradientColor;  // AABBGGRR when an accent material is enabled
+  DWORD animationId;
+};
+
+struct WindowCompositionAttribData {
+  DWORD attrib;  // WCA_ACCENT_POLICY = 19
+  PVOID data;
+  SIZE_T size;
+};
+
+inline void ApplyAccentPolicy(HWND hwnd, AccentState state, DWORD gradientColor = 0) {
+  using PfnSetWindowCompositionAttribute = BOOL(WINAPI*)(HWND, WindowCompositionAttribData*);
+  static PfnSetWindowCompositionAttribute setAttr = []() -> PfnSetWindowCompositionAttribute {
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+      return reinterpret_cast<PfnSetWindowCompositionAttribute>(
+          GetProcAddress(user32, "SetWindowCompositionAttribute"));
+    }
+    return nullptr;
+  }();
+  if (!setAttr) return;
+  AccentPolicy policy{state, 0, gradientColor, 0};
+  WindowCompositionAttribData data{19 /*WCA_ACCENT_POLICY*/, &policy, sizeof(policy)};
+  setAttr(hwnd, &data);
+}
+
+COLORREF ColorRefFromTheme(const feathercast::theme::Color& color) {
   const auto toByte = [](float value) {
     return static_cast<BYTE>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
   };
@@ -1963,7 +2072,7 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
   entry.iconKey = entry.exe;
 
   const std::wstring proc = Lower(entry.processName);
-  if (proc == L"leancast" || entry.name.find(L"LeanCast") != std::wstring::npos) return TRUE;
+  if (proc == L"feathercast" || entry.name.find(L"FeatherCast") != std::wstring::npos) return TRUE;
   ctx->windows.push_back(std::move(entry));
   return TRUE;
 }
@@ -1997,28 +2106,29 @@ struct UpdateTaskResult {
   bool manual = false;
   UpdateTaskKind kind = UpdateTaskKind::Check;
   UpdateTaskStatus status = UpdateTaskStatus::Error;
-  leancast::updater::ReleaseInfo release;
+  feathercast::updater::ReleaseInfo release;
   std::filesystem::path installerPath;
   std::wstring message;
 };
 
-class LeanCastApp;
-LeanCastApp* g_app = nullptr;
+class FeatherCastApp;
+FeatherCastApp* g_app = nullptr;
 
-class LeanCastApp {
+class FeatherCastApp {
  public:
-  explicit LeanCastApp(HINSTANCE instance, std::wstring cmdLine)
+  explicit FeatherCastApp(HINSTANCE instance, std::wstring cmdLine)
       : instance_(instance), cmdLine_(std::move(cmdLine)) {
+    QueryPerformanceFrequency(&qpcFrequency_);
     settings_ = LoadSettings();
     shortcut_ = ParseShortcut(settings_.shortcut);
-    theme_ = leancast::theme::LoadTheme(ThemePath());
+    theme_ = feathercast::theme::LoadTheme(ThemePath());
     snippets_ = LoadSnippets();
     systemFolders_ = SystemFolderEntries();
     LoadPersistentState();
     SetStartOnStartup(settings_.startOnStartup);
   }
 
-  ~LeanCastApp() {
+  ~FeatherCastApp() {
     stopThreads_ = true;
     extensions_.Shutdown();
     searchCv_.notify_all();
@@ -2114,13 +2224,13 @@ class LeanCastApp {
 
  private:
   static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    LeanCastApp* app = nullptr;
+    FeatherCastApp* app = nullptr;
     if (msg == WM_NCCREATE) {
       auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-      app = reinterpret_cast<LeanCastApp*>(cs->lpCreateParams);
+      app = reinterpret_cast<FeatherCastApp*>(cs->lpCreateParams);
       SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
     } else {
-      app = reinterpret_cast<LeanCastApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+      app = reinterpret_cast<FeatherCastApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
     return app ? app->WndProc(hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
   }
@@ -2150,15 +2260,23 @@ class LeanCastApp {
               InvalidateRect(hwnd_, nullptr, FALSE);
             }
           }
-        } else if (wParam == 2) {
-          if (visible_ && animating_) InvalidateRect(hwnd_, nullptr, FALSE);
-          else KillTimer(hwnd_, 2);
         } else if (wParam == TIMER_MEM_TRIM) {
           KillTimer(hwnd_, TIMER_MEM_TRIM);
           SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+        } else if (wParam == TIMER_SELECTION_ANIM) {
+          OnSelectionAnimationTimer();
         }
         return 0;
       case WM_CREATE:
+        return 0;
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_DWMCOMPOSITIONCHANGED:
+      case WM_THEMECHANGED:
+      case WM_SETTINGCHANGE:
+      case WM_DISPLAYCHANGE:
+        ApplyGlass(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       case WM_CLIPBOARDUPDATE:
         OnClipboardUpdate();
@@ -2186,17 +2304,15 @@ class LeanCastApp {
         Paint();
         return 0;
       case WM_SIZE:
-        if (renderTarget_) {
-          renderTarget_->Resize(D2D1::SizeU(LOWORD(lParam), HIWORD(lParam)));
-        }
+        ResizeGlassSurface(overlaySurface_, hwnd_, LOWORD(lParam), HIWORD(lParam));
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
       case WM_DPICHANGED: {
         auto prc = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        if (renderTarget_) {
+        if (overlaySurface_.dc) {
           float dpi = static_cast<float>(LOWORD(wParam));
-          renderTarget_->SetDpi(dpi, dpi);
+          overlaySurface_.dc->SetDpi(dpi, dpi);
         }
         ApplyRoundedRegion(prc->right - prc->left, prc->bottom - prc->top);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -2277,6 +2393,9 @@ class LeanCastApp {
         }
         return 0;
       }
+      case WM_ANIMATION_FRAME:
+        OnAnimationFrame();
+        return 0;
       case WM_UPDATE_READY:
         OnUpdateReady();
         return 0;
@@ -2288,25 +2407,30 @@ class LeanCastApp {
     switch (msg) {
       case WM_DESTROY:
         return 0;
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_DWMCOMPOSITIONCHANGED:
+      case WM_THEMECHANGED:
+      case WM_SETTINGCHANGE:
+      case WM_DISPLAYCHANGE:
+        ApplyGlass(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
       case WM_PAINT:
         PaintSettings();
         return 0;
       case WM_SIZE:
-        if (settingsRenderTarget_) {
-          settingsRenderTarget_->Resize(D2D1::SizeU(LOWORD(lParam), HIWORD(lParam)));
-        }
+        ResizeGlassSurface(settingsSurface_, settingsHwnd_, LOWORD(lParam), HIWORD(lParam));
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       case WM_DPICHANGED: {
         auto prc = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        if (settingsRenderTarget_) {
+        if (settingsSurface_.dc) {
           float dpi = static_cast<float>(LOWORD(wParam));
-          settingsRenderTarget_->SetDpi(dpi, dpi);
+          settingsSurface_.dc->SetDpi(dpi, dpi);
         }
-        const float scale = static_cast<float>(LOWORD(wParam)) / 96.0f;
-        const int settingsRound = static_cast<int>(theme_.settingsRadius * scale);
-        SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, prc->right - prc->left + 1, prc->bottom - prc->top + 1, settingsRound, settingsRound), TRUE);
+        // The visible corners are drawn by Direct2D; no window region is used.
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -2354,9 +2478,9 @@ class LeanCastApp {
   }
 
   void InitializeFactories() {
-    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf());
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwriteFactory_.GetAddressOf()));
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wicFactory_));
+    // The Direct3D/Direct2D/DirectComposition device stack is created lazily on first paint.
   }
 
   void RegisterWindowClass() {
@@ -2375,12 +2499,25 @@ class LeanCastApp {
     RegisterClassExW(&wc);
   }
 
+  // (Re)applies the transparent window treatment. The visible background is drawn into
+  // a premultiplied DirectComposition swap chain; DWM Acrylic/Mica materials are disabled
+  // so the popup stays see-through even when Windows transparency effects are off.
+  void ApplyGlass(HWND hwnd) {
+    ApplyDarkMode(hwnd);
+    MARGINS margins{0, 0, 0, 0};
+    DwmExtendFrameIntoClientArea(hwnd, &margins);
+    ApplyModernBackdrop(hwnd, DwmBackdropType::None);
+    ApplyAccentPolicy(hwnd, AccentState::Disabled);
+    DisableDwmRoundedCorners(hwnd);
+    DisableDwmBorder(hwnd);
+  }
+
   void CreateMainWindow() {
     const int width = OverlayWidth();
     hwnd_ = CreateWindowExW(
-      WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
       kWindowClass,
-      L"LeanCast",
+      L"FeatherCast",
       WS_POPUP,
       -32000,
       -32000,
@@ -2392,18 +2529,16 @@ class LeanCastApp {
       this);
 
     SetWindowPos(hwnd_, HWND_TOPMOST, -32000, -32000, width, WIN_HEIGHT, SWP_NOACTIVATE | SWP_HIDEWINDOW);
-    ApplyRoundedRegion(width, WIN_HEIGHT);
-
-    MARGINS margins = {-1, -1, -1, -1};
-    DwmExtendFrameIntoClientArea(hwnd_, &margins);
+    // Transparent popup: DirectComposition supplies per-pixel alpha; DWM materials stay off.
+    ApplyGlass(hwnd_);
   }
 
   void CreateSettingsWindow() {
     const int height = SettingsContentHeight();
     settingsHwnd_ = CreateWindowExW(
-      WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
       kSettingsWindowClass,
-      L"LeanCast Settings",
+      L"FeatherCast Settings",
       WS_POPUP,
       -32000,
       -32000,
@@ -2414,37 +2549,139 @@ class LeanCastApp {
       instance_,
       this);
 
-    const int settingsRound = static_cast<int>(theme_.settingsRadius);
-    SetWindowRgn(settingsHwnd_, CreateRoundRectRgn(0, 0, SETTINGS_WIDTH + 1, height + 1, settingsRound, settingsRound), TRUE);
-
-    MARGINS margins = {-1, -1, -1, -1};
-    DwmExtendFrameIntoClientArea(settingsHwnd_, &margins);
+    // Settings uses the same transparent DirectComposition background as the launcher.
+    ApplyGlass(settingsHwnd_);
   }
 
-  void CreateDeviceResources() {
-    if (renderTarget_ || !d2dFactory_) return;
-    RECT rc{};
-    GetClientRect(hwnd_, &rc);
-    const float dpi = GetWindowScale(hwnd_) * 96.0f;
-    d2dFactory_->CreateHwndRenderTarget(
-      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi),
-      D2D1::HwndRenderTargetProperties(hwnd_, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
-      renderTarget_.GetAddressOf());
+  // Per-window composition render surface: a DXGI swap chain bound to a Direct2D device
+  // context and shown through a DirectComposition visual. Renders with per-pixel alpha so
+  // desktop content behind the popup shows through transparent pixels.
+  struct GlassSurface {
+    ComPtr<IDXGISwapChain1> swapChain;
+    ComPtr<IDCompositionTarget> target;
+    ComPtr<IDCompositionVisual> visual;
+    ComPtr<ID2D1DeviceContext> dc;
+    ComPtr<ID2D1Bitmap1> bitmap;
+    void Reset() {
+      if (dc) dc->SetTarget(nullptr);
+      bitmap.Reset();
+      visual.Reset();
+      target.Reset();
+      swapChain.Reset();
+      dc.Reset();
+    }
+  };
 
-    EnsureTextFormats();
+  // Builds the shared Direct3D 11 / Direct2D / DirectComposition device stack. Direct2D
+  // renders into a DirectComposition swap chain with premultiplied alpha instead of an
+  // opaque HWND surface, so transparent pixels let desktop content show through.
+  bool EnsureGlassDevice() {
+    if (d2dDevice_) return true;
+
+    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                                   d3dDevice_.GetAddressOf(), nullptr, nullptr);
+    if (FAILED(hr)) {
+      // Fall back to WARP so the app still renders on machines without a usable GPU path.
+      hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
+                             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                             d3dDevice_.GetAddressOf(), nullptr, nullptr);
+    }
+    if (FAILED(hr)) return false;
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    if (FAILED(d3dDevice_.As(&dxgiDevice))) return false;
+    if (FAILED(D2D1CreateDevice(dxgiDevice.Get(), nullptr, d2dDevice_.GetAddressOf()))) return false;
+
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))) return false;
+    if (FAILED(adapter->GetParent(IID_PPV_ARGS(dxgiFactory_.GetAddressOf())))) return false;
+    if (FAILED(DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(dcompDevice_.GetAddressOf())))) return false;
+    return true;
   }
 
-  void CreateSettingsDeviceResources() {
-    if (settingsRenderTarget_ || !d2dFactory_) return;
-    RECT rc{};
-    GetClientRect(settingsHwnd_, &rc);
-    const float dpi = GetWindowScale(settingsHwnd_) * 96.0f;
-    d2dFactory_->CreateHwndRenderTarget(
-      D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi),
-      D2D1::HwndRenderTargetProperties(settingsHwnd_, D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
-      settingsRenderTarget_.GetAddressOf());
+  // Tears down the whole device stack (used on device-lost). It is rebuilt lazily.
+  void DiscardGlassDevice() {
+    overlaySurface_.Reset();
+    settingsSurface_.Reset();
+    dcompDevice_.Reset();
+    dxgiFactory_.Reset();
+    d2dDevice_.Reset();
+    d3dDevice_.Reset();
+    ClearIconBitmaps();
+    brushCache_.clear();
+  }
 
+  // (Re)binds the swap chain's back buffer as the Direct2D device context's target.
+  bool BindSurfaceTarget(GlassSurface& surface, float dpi) {
+    ComPtr<IDXGISurface> dxgiSurface;
+    if (FAILED(surface.swapChain->GetBuffer(0, IID_PPV_ARGS(dxgiSurface.GetAddressOf())))) return false;
+    const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+    surface.bitmap.Reset();
+    if (FAILED(surface.dc->CreateBitmapFromDxgiSurface(dxgiSurface.Get(), &props, surface.bitmap.GetAddressOf()))) return false;
+    surface.dc->SetTarget(surface.bitmap.Get());
+    surface.dc->SetDpi(dpi, dpi);
+    return true;
+  }
+
+  // Creates the composition swap chain, Direct2D context and DComp visual for a window.
+  bool CreateGlassSurface(GlassSurface& surface, HWND hwnd) {
+    if (surface.dc) return true;
+    if (!EnsureGlassDevice()) return false;
+
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const UINT width = std::max<UINT>(1, rc.right - rc.left);
+    const UINT height = std::max<UINT>(1, rc.bottom - rc.top);
+    const float dpi = GetWindowScale(hwnd) * 96.0f;
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    if (FAILED(dxgiFactory_->CreateSwapChainForComposition(d3dDevice_.Get(), &desc, nullptr,
+                                                           surface.swapChain.GetAddressOf()))) {
+      surface.Reset();
+      return false;
+    }
+    if (FAILED(d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, surface.dc.GetAddressOf())) ||
+        FAILED(dcompDevice_->CreateTargetForHwnd(hwnd, TRUE, surface.target.GetAddressOf())) ||
+        FAILED(dcompDevice_->CreateVisual(surface.visual.GetAddressOf()))) {
+      surface.Reset();
+      return false;
+    }
+    surface.visual->SetContent(surface.swapChain.Get());
+    surface.target->SetRoot(surface.visual.Get());
+    dcompDevice_->Commit();
+
+    if (!BindSurfaceTarget(surface, dpi)) {
+      surface.Reset();
+      return false;
+    }
     EnsureTextFormats();
+    return true;
+  }
+
+  // Resizes a surface's swap chain to match the window's new physical client size.
+  void ResizeGlassSurface(GlassSurface& surface, HWND hwnd, UINT width, UINT height) {
+    if (!surface.swapChain || !surface.dc) return;
+    width = std::max<UINT>(1, width);
+    height = std::max<UINT>(1, height);
+    surface.dc->SetTarget(nullptr);
+    surface.bitmap.Reset();
+    if (FAILED(surface.swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) return;
+    BindSurfaceTarget(surface, GetWindowScale(hwnd) * 96.0f);
   }
 
   void ResetTextFormats() {
@@ -2464,10 +2701,13 @@ class LeanCastApp {
 
   void EnsureTextFormats() {
     if (!dwriteFactory_ || inputFormat_) return;
-    CreateTextFormat(19.0f, DWRITE_FONT_WEIGHT_NORMAL, inputFormat_);
-    CreateTextFormat(15.0f, DWRITE_FONT_WEIGHT_NORMAL, rowFormat_);
+    // 18px Regular: elegant search-bar input (was 19px).
+    CreateTextFormat(18.0f, DWRITE_FONT_WEIGHT_NORMAL, inputFormat_);
+    // 14px Medium: stronger name/title separation from subtitle (was 15px Normal).
+    CreateTextFormat(14.0f, DWRITE_FONT_WEIGHT_MEDIUM, rowFormat_);
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, subFormat_);
-    CreateTextFormat(11.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, sectionFormat_);
+    // 10px Semi-Bold: section labels in all-caps feel (was 11px).
+    CreateTextFormat(10.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, sectionFormat_);
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, footerFormat_);
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, footerRightFormat_);
     if (footerRightFormat_) {
@@ -2511,7 +2751,7 @@ class LeanCastApp {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
-    wcscpy_s(nid.szTip, L"LeanCast");
+    wcscpy_s(nid.szTip, L"FeatherCast");
     Shell_NotifyIconW(NIM_ADD, &nid);
     nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &nid);
@@ -2585,7 +2825,7 @@ class LeanCastApp {
   }
 
   void ReloadTheme() {
-    theme_ = leancast::theme::LoadTheme(ThemePath());
+    theme_ = feathercast::theme::LoadTheme(ThemePath());
     ResetTextFormats();
     InvalidateRect(hwnd_, nullptr, FALSE);
     if (settingsHwnd_) InvalidateRect(settingsHwnd_, nullptr, FALSE);
@@ -2687,7 +2927,7 @@ class LeanCastApp {
       ScanFolder(root, 0, indexedAt, files, seen, stopToken);
     }
     if (stopToken.stop_requested() || stopThreads_) return;
-    std::vector<leancast::storage::FileIndexEntry> storageEntries;
+    std::vector<feathercast::storage::FileIndexEntry> storageEntries;
     storageEntries.reserve(files.size());
     for (const auto& file : files) storageEntries.push_back(StorageFileEntry(file));
     {
@@ -2754,7 +2994,7 @@ class LeanCastApp {
     CleanupFinishedUpdateThread();
     if (updateWorkerRunning_) {
       if (manual) {
-        MessageBoxW(hwnd_, L"An update check is already running.", L"LeanCast Updates",
+        MessageBoxW(hwnd_, L"An update check is already running.", L"FeatherCast Updates",
                     MB_OK | MB_ICONINFORMATION);
       }
       return;
@@ -2771,7 +3011,7 @@ class LeanCastApp {
       result.manual = manual;
       result.kind = UpdateTaskKind::Check;
 
-      const auto body = HttpsGet(L"api.github.com", L"/repos/GenericLeon0/LeanCast/releases/latest");
+      const auto body = HttpsGet(L"api.github.com", L"/repos/GenericLeon0/FeatherCast/releases/latest");
       if (stopToken.stop_requested() || stopThreads_) {
         updateWorkerRunning_ = false;
         return;
@@ -2783,17 +3023,17 @@ class LeanCastApp {
         return;
       }
 
-      auto release = leancast::updater::ParseGitHubReleaseJson(*body);
+      auto release = feathercast::updater::ParseGitHubReleaseJson(*body);
       if (!release) {
         result.status = UpdateTaskStatus::Error;
-        result.message = L"GitHub returned update metadata LeanCast could not parse.";
+        result.message = L"GitHub returned update metadata FeatherCast could not parse.";
         FinishUpdateTask(std::move(result));
         return;
       }
 
-      if (!leancast::updater::IsEligibleRelease(*release, kLeanCastVersion)) {
+      if (!feathercast::updater::IsEligibleRelease(*release, kFeatherCastVersion)) {
         result.status = UpdateTaskStatus::NoUpdate;
-        result.message = L"LeanCast is up to date.";
+        result.message = L"FeatherCast is up to date.";
         FinishUpdateTask(std::move(result));
         return;
       }
@@ -2805,8 +3045,8 @@ class LeanCastApp {
         return;
       }
 
-      const auto installer = leancast::updater::SelectInstallerAsset(*release);
-      const auto hash = installer ? leancast::updater::SelectSha256Asset(*release, *installer) : std::nullopt;
+      const auto installer = feathercast::updater::SelectInstallerAsset(*release);
+      const auto hash = installer ? feathercast::updater::SelectSha256Asset(*release, *installer) : std::nullopt;
       if (!installer || !hash) {
         result.status = UpdateTaskStatus::Error;
         result.message = L"Latest release is missing the required installer or SHA-256 asset.";
@@ -2822,10 +3062,10 @@ class LeanCastApp {
     });
   }
 
-  void StartUpdateDownload(leancast::updater::ReleaseInfo release, bool manual) {
+  void StartUpdateDownload(feathercast::updater::ReleaseInfo release, bool manual) {
     CleanupFinishedUpdateThread();
     if (updateWorkerRunning_) {
-      MessageBoxW(hwnd_, L"Another update task is already running.", L"LeanCast Updates",
+      MessageBoxW(hwnd_, L"Another update task is already running.", L"FeatherCast Updates",
                   MB_OK | MB_ICONINFORMATION);
       return;
     }
@@ -2838,8 +3078,8 @@ class LeanCastApp {
       result.kind = UpdateTaskKind::DownloadInstall;
       result.release = release;
 
-      const auto installer = leancast::updater::SelectInstallerAsset(release);
-      const auto hash = installer ? leancast::updater::SelectSha256Asset(release, *installer) : std::nullopt;
+      const auto installer = feathercast::updater::SelectInstallerAsset(release);
+      const auto hash = installer ? feathercast::updater::SelectSha256Asset(release, *installer) : std::nullopt;
       if (!installer || !hash) {
         result.status = UpdateTaskStatus::Error;
         result.message = L"Update release is missing the required installer or SHA-256 asset.";
@@ -2852,7 +3092,7 @@ class LeanCastApp {
         updateWorkerRunning_ = false;
         return;
       }
-      if (!hashText || !leancast::updater::ExtractSha256Hex(*hashText)) {
+      if (!hashText || !feathercast::updater::ExtractSha256Hex(*hashText)) {
         result.status = UpdateTaskStatus::Error;
         result.message = L"Unable to download or parse the update SHA-256 file.";
         FinishUpdateTask(std::move(result));
@@ -2860,7 +3100,7 @@ class LeanCastApp {
       }
 
       std::wstring fileName = std::filesystem::path(installer->name).filename().wstring();
-      if (fileName.empty()) fileName = leancast::updater::ExpectedInstallerAssetName(release.tagName);
+      if (fileName.empty()) fileName = feathercast::updater::ExpectedInstallerAssetName(release.tagName);
       const auto installerPath = UpdatesPath() / fileName;
       if (!HttpsDownloadToFile(installer->browserDownloadUrl, installerPath, stopToken)) {
         if (stopToken.stop_requested() || stopThreads_) {
@@ -2873,7 +3113,7 @@ class LeanCastApp {
         return;
       }
 
-      if (!leancast::updater::VerifyFileSha256(installerPath, *hashText)) {
+      if (!feathercast::updater::VerifyFileSha256(installerPath, *hashText)) {
         std::error_code ec;
         std::filesystem::remove(installerPath, ec);
         result.status = UpdateTaskStatus::Error;
@@ -2905,23 +3145,23 @@ class LeanCastApp {
     if (result->kind == UpdateTaskKind::Check) {
       if (result->status == UpdateTaskStatus::NoUpdate) {
         if (result->manual) {
-          const std::wstring message = L"LeanCast " + std::wstring(kLeanCastVersion) + L" is up to date.";
-          MessageBoxW(hwnd_, message.c_str(), L"LeanCast Updates", MB_OK | MB_ICONINFORMATION);
+          const std::wstring message = L"FeatherCast " + std::wstring(kFeatherCastVersion) + L" is up to date.";
+          MessageBoxW(hwnd_, message.c_str(), L"FeatherCast Updates", MB_OK | MB_ICONINFORMATION);
         }
         return;
       }
       if (result->status == UpdateTaskStatus::Error) {
         if (result->manual) {
-          MessageBoxW(hwnd_, result->message.c_str(), L"LeanCast Updates", MB_OK | MB_ICONWARNING);
+          MessageBoxW(hwnd_, result->message.c_str(), L"FeatherCast Updates", MB_OK | MB_ICONWARNING);
         }
         return;
       }
       if (result->status == UpdateTaskStatus::Available) {
-        const std::wstring releaseVersion = leancast::updater::AssetVersionFromTag(result->release.tagName);
+        const std::wstring releaseVersion = feathercast::updater::AssetVersionFromTag(result->release.tagName);
         const std::wstring message =
-            L"LeanCast " + releaseVersion + L" is available.\n\nCurrent version: " +
-            std::wstring(kLeanCastVersion) + L"\n\nDownload, verify, and install it now?";
-        const int choice = MessageBoxW(hwnd_, message.c_str(), L"LeanCast Updates",
+            L"FeatherCast " + releaseVersion + L" is available.\n\nCurrent version: " +
+            std::wstring(kFeatherCastVersion) + L"\n\nDownload, verify, and install it now?";
+        const int choice = MessageBoxW(hwnd_, message.c_str(), L"FeatherCast Updates",
                                        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1);
         if (choice == IDYES) {
           settings_.dismissedUpdateVersion.clear();
@@ -2937,17 +3177,17 @@ class LeanCastApp {
 
     if (result->kind == UpdateTaskKind::DownloadInstall) {
       if (result->status == UpdateTaskStatus::ReadyToInstall) {
-        const std::wstring releaseVersion = leancast::updater::AssetVersionFromTag(result->release.tagName);
+        const std::wstring releaseVersion = feathercast::updater::AssetVersionFromTag(result->release.tagName);
         const std::wstring message =
-            L"The LeanCast " + releaseVersion +
-            L" installer was downloaded and verified.\n\nInstall it now? LeanCast will close.";
-        const int choice = MessageBoxW(hwnd_, message.c_str(), L"LeanCast Updates",
+            L"The FeatherCast " + releaseVersion +
+            L" installer was downloaded and verified.\n\nInstall it now? FeatherCast will close.";
+        const int choice = MessageBoxW(hwnd_, message.c_str(), L"FeatherCast Updates",
                                        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1);
         if (choice != IDYES) return;
 
         HINSTANCE launched = ShellExecuteW(nullptr, L"open", result->installerPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         if (reinterpret_cast<INT_PTR>(launched) <= 32) {
-          MessageBoxW(hwnd_, L"LeanCast could not start the verified installer.", L"LeanCast Updates",
+          MessageBoxW(hwnd_, L"FeatherCast could not start the verified installer.", L"FeatherCast Updates",
                       MB_OK | MB_ICONWARNING);
           return;
         }
@@ -2955,7 +3195,7 @@ class LeanCastApp {
         return;
       }
 
-      MessageBoxW(hwnd_, result->message.c_str(), L"LeanCast Updates", MB_OK | MB_ICONWARNING);
+      MessageBoxW(hwnd_, result->message.c_str(), L"FeatherCast Updates", MB_OK | MB_ICONWARNING);
     }
   }
 
@@ -3085,7 +3325,7 @@ class LeanCastApp {
             // activation, which reliably brings the window to the foreground
             // instead of occasionally opening an Explorer folder.
             entry.targetPath = terminalAlias;
-            entry.adminSupported = !terminalAlias.empty();
+            entry.adminSupported = true;  // all AppsFolder entries support Ctrl+Shift+Enter elevation
             if (terminal) entry.systemEssential = true;
             out.push_back(std::move(entry));
           }
@@ -3127,15 +3367,15 @@ class LeanCastApp {
     return {
       CommandDisplay(CommandKind::ClipboardHistory, L"Clipboard History", L"Browse and paste copied items", {L"clipboard", L"history", L"paste", L"copy"}),
       CommandDisplay(CommandKind::EmojiPicker, L"Search Emoji", L"Browse and paste emoji", {L"emoji", L"emoticon", L"smiley", L"symbol", L"face"}),
-      CommandDisplay(CommandKind::Settings, L"Settings", L"Open LeanCast settings", {L"preferences", L"options", L"shortcut"}),
-      CommandDisplay(CommandKind::Quit, L"Quit LeanCast", L"Exit the background launcher", {L"exit", L"close"}),
-      CommandDisplay(CommandKind::Restart, L"Restart LeanCast", L"Restart the native app", {L"reload"}),
+      CommandDisplay(CommandKind::Settings, L"Settings", L"Open FeatherCast settings", {L"preferences", L"options", L"shortcut"}),
+      CommandDisplay(CommandKind::Quit, L"Quit FeatherCast", L"Exit the background launcher", {L"exit", L"close"}),
+      CommandDisplay(CommandKind::Restart, L"Restart FeatherCast", L"Restart the native app", {L"reload"}),
       CommandDisplay(CommandKind::RefreshApps, L"Refresh App Index", L"Rescan Start Menu and Store apps", {L"rescan", L"reload apps"}),
       CommandDisplay(CommandKind::ClearIconCache, L"Clear Icon Cache", L"Delete cached shell icons", {L"icons", L"cache"}),
       CommandDisplay(CommandKind::ClearRecents, L"Clear Recents", L"Forget recently used apps", {L"history", L"recent apps"}),
-      CommandDisplay(CommandKind::OpenDataFolder, L"Open App Data Folder", L"Open the LeanCast data directory", {L"settings json", L"logs", L"cache folder"}),
+      CommandDisplay(CommandKind::OpenDataFolder, L"Open App Data Folder", L"Open the FeatherCast data directory", {L"settings json", L"logs", L"cache folder"}),
       CommandDisplay(CommandKind::ReloadExtensions, L"Reload Extensions", L"Reload plugin manifests and helper processes", {L"plugins", L"extensions", L"dll"}),
-      CommandDisplay(CommandKind::CheckForUpdates, L"Check for Updates", L"Find and install the latest LeanCast release", {L"update", L"upgrade", L"release"}),
+      CommandDisplay(CommandKind::CheckForUpdates, L"Check for Updates", L"Find and install the latest FeatherCast release", {L"update", L"upgrade", L"release"}),
       CommandDisplay(CommandKind::ClearClipboardHistory, L"Clear Clipboard History", L"Forget saved clipboard entries", {L"clipboard", L"history", L"clear"}),
       CommandDisplay(CommandKind::OpenSnippetsFile, L"Open Snippets File", L"Edit reusable text snippets", {L"snippet", L"snippets json", L"text expansion"}),
       CommandDisplay(CommandKind::ReloadSnippets, L"Reload Snippets", L"Reload snippets.json from disk", {L"snippet", L"reload", L"text expansion"}),
@@ -3143,6 +3383,7 @@ class LeanCastApp {
       CommandDisplay(CommandKind::ReloadTheme, L"Reload Theme", L"Reload theme.json styling", {L"theme", L"appearance", L"reload", L"style"}),
       CommandDisplay(CommandKind::LockPC, L"Lock PC", L"Lock this computer", {L"lock", L"workstation", L"secure"}),
       CommandDisplay(CommandKind::SleepPC, L"Sleep PC", L"Put this computer to sleep", {L"sleep", L"suspend", L"standby"}),
+      CommandDisplay(CommandKind::MuteAudio, L"Mute Audio", L"Toggle system audio mute", {L"mute", L"sound", L"volume", L"audio"}),
       CommandDisplay(CommandKind::ShutDown, L"Shut Down PC", L"Power off this computer", {L"shutdown", L"power off", L"turn off"}),
       CommandDisplay(CommandKind::RestartPC, L"Restart PC", L"Reboot this computer", {L"reboot", L"restart computer"}),
       CommandDisplay(CommandKind::EmptyRecycleBin, L"Empty Recycle Bin", L"Permanently delete recycle bin contents", {L"trash", L"empty bin", L"recycle"}),
@@ -3371,14 +3612,14 @@ class LeanCastApp {
       if (req.empty) {
         addSection(L"Clipboard History", take(req.snapshot->clipboardItems));
       } else {
-        auto order = leancast::core::Search(req.query, req.snapshot->clipboardSearchItems);
+        auto order = feathercast::core::Search(req.query, req.snapshot->clipboardSearchItems);
         std::vector<DisplayItem> hits;
         for (const auto index : order) hits.push_back(req.snapshot->clipboardItems[index]);
         addSection(L"Clipboard History", take(hits));
       }
     } else if (req.browseView == BrowseView::Emoji) {
       std::vector<DisplayItem> emojiItems;
-      for (const auto& emoji : leancast::emoji::SearchEmoji(req.query, 300)) {
+      for (const auto& emoji : feathercast::emoji::SearchEmoji(req.query, 300)) {
         emojiItems.push_back(SymbolDisplay(emoji));
       }
       addSection(L"Emoji", take(emojiItems));
@@ -3386,7 +3627,7 @@ class LeanCastApp {
       if (req.empty) {
         addSection(L"Actions", take(req.actions));
       } else {
-        auto order = leancast::core::Search(req.query, req.actionSearchItems);
+        auto order = feathercast::core::Search(req.query, req.actionSearchItems);
         std::vector<DisplayItem> hits;
         for (const auto index : order) hits.push_back(req.actions[index]);
         addSection(L"Actions", take(hits));
@@ -3403,13 +3644,13 @@ class LeanCastApp {
     } else {
       const std::wstring trimmed = Trim(req.query);
       if (StartsWith(trimmed, L">")) {
-        if (const auto command = leancast::run_command::Classify(trimmed)) {
-          addSection(command->kind == leancast::run_command::Kind::OpenTarget ? L"Open" : L"Run",
+        if (const auto command = feathercast::run_command::Classify(trimmed)) {
+          addSection(command->kind == feathercast::run_command::Kind::OpenTarget ? L"Open" : L"Run",
                      take({RunCommandDisplay(*command)}, 1));
         }
       } else if (StartsWith(trimmed, L":")) {
         std::vector<DisplayItem> symbolItems;
-        for (const auto& symbol : leancast::symbols::SearchSymbols(trimmed, 40)) {
+        for (const auto& symbol : feathercast::symbols::SearchSymbols(trimmed, 40)) {
           symbolItems.push_back(SymbolDisplay(symbol));
         }
         addSection(L"Symbols", take(symbolItems, 40));
@@ -3428,17 +3669,17 @@ class LeanCastApp {
         }
       }
 
-      if (const auto calculation = leancast::calculator::TryEvaluate(req.query)) {
+      if (const auto calculation = feathercast::calculator::TryEvaluate(req.query)) {
         addSection(L"Calculator", take({CalculatorDisplay(*calculation)}, 1));
       }
 
-      if (const auto conversion = leancast::converter::TryConvert(req.query, req.currencyRates, req.defaultCurrency)) {
+      if (const auto conversion = feathercast::converter::TryConvert(req.query, req.currencyRates, req.defaultCurrency)) {
         addSection(L"Conversion", take({ConversionDisplay(conversion->expression, conversion->display)}, 1));
       }
 
       addSection(L"Extensions", take(req.extensionItems, 20));
 
-      auto order = leancast::core::Search(req.query, req.snapshot->searchItems, req.recentIds);
+      auto order = feathercast::core::Search(req.query, req.snapshot->searchItems, req.recentIds);
       const size_t limit = static_cast<size_t>(req.limit);
       if (order.size() > limit) order.resize(limit);
 
@@ -3504,6 +3745,7 @@ class LeanCastApp {
     flatItems_ = std::move(result.flatItems);
     if (selected_ >= static_cast<int>(flatItems_.size())) selected_ = std::max<int>(0, static_cast<int>(flatItems_.size()) - 1);
     ApplyWindowSize();
+    SyncSelectionAnimationToTarget();
   }
 
   // Hand the newest request to the worker, coalescing any unstarted request.
@@ -3538,8 +3780,8 @@ class LeanCastApp {
     });
   }
 
-  leancast::core::SearchItem ToSearchItem(const DisplayItem& item) {
-    leancast::core::SearchItem out;
+  feathercast::core::SearchItem ToSearchItem(const DisplayItem& item) {
+    feathercast::core::SearchItem out;
     if (item.isCalculator) {
       out.id = item.Key();
       out.kind = L"calculator";
@@ -3667,8 +3909,8 @@ class LeanCastApp {
       SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
     } else {
       // Immediately free heavyweight Direct2D resources and in-memory caches
-      renderTarget_.Reset();
-      settingsRenderTarget_.Reset();
+      overlaySurface_.Reset();
+      settingsSurface_.Reset();
       ClearIconBitmaps();
       brushCache_.clear();
 
@@ -3691,8 +3933,8 @@ class LeanCastApp {
       extensions_.OnBackground();
 
       // 4. Free lazy-loaded emoji and symbols memory lists & caches
-      leancast::emoji::FreeEmojiMemory();
-      leancast::symbols::FreeSymbolsMemory();
+      feathercast::emoji::FreeEmojiMemory();
+      feathercast::symbols::FreeSymbolsMemory();
 
       // Minimize CRT heap fragmentation and decommit unused pages back to the OS
       _heapmin();
@@ -3730,8 +3972,11 @@ class LeanCastApp {
     ClearQuery();
     selected_ = 0;
     scroll_ = 0;
+    SyncSelectionAnimationToTarget();
     RequestSearch();
     PositionWindow();
+    // Reassert the transparent window treatment each reveal.
+    ApplyGlass(hwnd_);
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
 
@@ -3762,16 +4007,20 @@ class LeanCastApp {
     UpdateBackgroundState();
     animating_ = settings_.animationsEnabled;
     if (animating_) {
-      animStart_ = GetTickCount64();
-      SetTimer(hwnd_, 2, 16, nullptr);  // fast repaint timer for the reveal animation
+      animStartQpc_ = NowQpc();
+      lastAnimationFrameQpc_ = animStartQpc_;
+      RequestAnimationFrame();
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
   void HideOverlay(bool restoreFocus) {
     KillTimer(hwnd_, 1);
-    KillTimer(hwnd_, 2);
     animating_ = false;
+    animatingSelection_ = false;
+    animationFrameQueued_ = false;
+    visualSelectedY_ = -1.0f;
+    StopSelectionAnimationTimer();
     visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
     overlayMonitor_ = nullptr;
@@ -3822,8 +4071,8 @@ class LeanCastApp {
     const int yPos = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - clamped) / 2;
 
     SetWindowPos(settingsHwnd_, HWND_TOPMOST, x, yPos, width, clamped, SWP_NOACTIVATE);
-    const int settingsRound = static_cast<int>(theme_.settingsRadius * scale);
-    SetWindowRgn(settingsHwnd_, CreateRoundRectRgn(0, 0, width + 1, clamped + 1, settingsRound, settingsRound), TRUE);
+    // Reassert the transparent window treatment now that the window is sized.
+    ApplyGlass(settingsHwnd_);
     ShowWindow(settingsHwnd_, SW_SHOW);
     SetForegroundWindow(settingsHwnd_);
     SetActiveWindow(settingsHwnd_);
@@ -3847,6 +4096,7 @@ class LeanCastApp {
     ClearQuery();
     selected_ = 0;
     scroll_ = 0;
+    SyncSelectionAnimationToTarget();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
@@ -3856,6 +4106,7 @@ class LeanCastApp {
     ClearQuery();
     selected_ = 0;
     scroll_ = 0;
+    SyncSelectionAnimationToTarget();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
@@ -3867,6 +4118,7 @@ class LeanCastApp {
     ClearQuery();
     selected_ = 0;
     scroll_ = 0;
+    SyncSelectionAnimationToTarget();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
@@ -3876,6 +4128,7 @@ class LeanCastApp {
     ClearQuery();
     selected_ = 0;
     scroll_ = 0;
+    SyncSelectionAnimationToTarget();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
@@ -3891,6 +4144,18 @@ class LeanCastApp {
   void ClearQuery() {
     query_.clear();
     caret_ = 0;
+  }
+
+  void SetQueryText(std::wstring value) {
+    query_ = std::move(value);
+    caret_ = query_.size();
+    actionMode_ = false;
+    browseView_ = BrowseView::None;
+    selected_ = 0;
+    scroll_ = 0;
+    SyncSelectionAnimationToTarget();
+    RequestSearch();
+    InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
   void ClampCaret() {
@@ -3982,11 +4247,18 @@ class LeanCastApp {
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
   }
 
+  static constexpr float kResultsTop = 60.0f;
+  static constexpr float kSectionHeaderHeight = 26.0f;
+  static constexpr float kResultRowHeight = 50.0f;
+  static constexpr float kResultRowGap = 2.0f;
+  static constexpr float kResultRowStride = kResultRowHeight + kResultRowGap;
+
   int ResultsContentHeight() const {
     int height = 0;
     for (const auto& section : sections_) {
-      height += 26;
-      height += static_cast<int>(section.items.size()) * 48;
+      height += static_cast<int>(kSectionHeaderHeight);
+      // 52px per row: 50px row height + 2px gap (up from 48px = 46px + 2px gap).
+      height += static_cast<int>(section.items.size() * kResultRowStride);
     }
     return height;
   }
@@ -4013,20 +4285,203 @@ class LeanCastApp {
     }
   }
 
+  LONGLONG NowQpc() const {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+  }
+
+  double QpcElapsedMs(LONGLONG startQpc) const {
+    if (!qpcFrequency_.QuadPart || !startQpc) return 0.0;
+    return static_cast<double>(NowQpc() - startQpc) * 1000.0 / static_cast<double>(qpcFrequency_.QuadPart);
+  }
+
+  enum class SelectionMotion {
+    Keyboard,
+    Hover,
+  };
+
+  static constexpr double kSelectionHoverSettleSeconds = 0.055;
+  static constexpr double kSelectionKeyboardSettleSeconds = 0.090;
+
+  double ConsumeAnimationDeltaSeconds() {
+    if (!qpcFrequency_.QuadPart) return 0.0;
+    const LONGLONG now = NowQpc();
+    if (!lastAnimationFrameQpc_) {
+      lastAnimationFrameQpc_ = now;
+      return 0.0;
+    }
+    const double dt = static_cast<double>(now - lastAnimationFrameQpc_) / static_cast<double>(qpcFrequency_.QuadPart);
+    lastAnimationFrameQpc_ = now;
+    return std::clamp(dt, 0.0, 0.05);
+  }
+
+  double ConsumeSelectionDeltaSeconds() {
+    if (!qpcFrequency_.QuadPart) return 0.0;
+    const LONGLONG now = NowQpc();
+    if (!lastSelectionFrameQpc_) {
+      lastSelectionFrameQpc_ = now;
+      return 0.0;
+    }
+    const double dt = static_cast<double>(now - lastSelectionFrameQpc_) / static_cast<double>(qpcFrequency_.QuadPart);
+    lastSelectionFrameQpc_ = now;
+    return std::clamp(dt, 0.0, 0.05);
+  }
+
+  std::optional<float> SelectedRowTop() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(flatItems_.size())) return std::nullopt;
+    float y = kResultsTop - static_cast<float>(scroll_);
+    int row = 0;
+    for (const auto& section : sections_) {
+      y += kSectionHeaderHeight;
+      for (size_t i = 0; i < section.items.size(); ++i) {
+        if (row == selected_) return y;
+        y += kResultRowStride;
+        ++row;
+      }
+    }
+    return std::nullopt;
+  }
+
+  void SyncSelectionAnimationToTarget() {
+    const auto targetY = SelectedRowTop();
+    visualSelectedY_ = targetY.value_or(-1.0f);
+    animatingSelection_ = false;
+    StopSelectionAnimationTimer();
+  }
+
+  void StartSelectionAnimationFrom(std::optional<float> previousY, int previousScroll, SelectionMotion motion) {
+    const auto targetY = SelectedRowTop();
+    if (!settings_.animationsEnabled || !previousY || !targetY) {
+      SyncSelectionAnimationToTarget();
+      if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+      return;
+    }
+    selectionSettleSeconds_ = motion == SelectionMotion::Hover ? kSelectionHoverSettleSeconds : kSelectionKeyboardSettleSeconds;
+    if (!animatingSelection_ || visualSelectedY_ < 0.0f) {
+      visualSelectedY_ = *previousY - static_cast<float>(scroll_ - previousScroll);
+      lastSelectionFrameQpc_ = NowQpc();
+    }
+    animatingSelection_ = true;
+    StartSelectionAnimationTimer();
+  }
+
+  void SelectResult(int next, bool animate, bool ensureVisible, SelectionMotion motion = SelectionMotion::Keyboard) {
+    if (flatItems_.empty()) {
+      selected_ = 0;
+      SyncSelectionAnimationToTarget();
+      if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+      return;
+    }
+
+    next = std::clamp(next, 0, static_cast<int>(flatItems_.size()) - 1);
+    if (next == selected_) {
+      if (ensureVisible) {
+        EnsureSelectedVisible();
+        SyncSelectionAnimationToTarget();
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+      }
+      return;
+    }
+
+    const auto previousY = SelectedRowTop();
+    const int previousScroll = scroll_;
+    selected_ = next;
+    if (ensureVisible) EnsureSelectedVisible();
+    if (animate) {
+      StartSelectionAnimationFrom(previousY, previousScroll, motion);
+    } else {
+      SyncSelectionAnimationToTarget();
+      if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+  }
+
+  void UpdateSelectionAnimation(double deltaTime) {
+    const auto targetY = SelectedRowTop();
+    if (!settings_.animationsEnabled || !targetY) {
+      SyncSelectionAnimationToTarget();
+      return;
+    }
+    if (visualSelectedY_ < 0.0f) {
+      visualSelectedY_ = *targetY;
+      animatingSelection_ = false;
+      return;
+    }
+
+    const float dy = *targetY - visualSelectedY_;
+    if (std::abs(dy) > 0.5f) {
+      const double settle = std::max(selectionSettleSeconds_, 0.001);
+      const float blend = static_cast<float>(1.0 - std::pow(0.001, deltaTime / settle));
+      visualSelectedY_ += dy * blend;
+      animatingSelection_ = true;
+    } else {
+      visualSelectedY_ = *targetY;
+      animatingSelection_ = false;
+    }
+  }
+
+  bool HasRevealAnimation() const {
+    return visible_ && settings_.animationsEnabled && animating_;
+  }
+
+  void RequestAnimationFrame() {
+    if (!hwnd_ || animationFrameQueued_ || !HasRevealAnimation()) return;
+    animationFrameQueued_ = PostMessageW(hwnd_, WM_ANIMATION_FRAME, 0, 0) != FALSE;
+  }
+
+  void OnAnimationFrame() {
+    animationFrameQueued_ = false;
+    if (!HasRevealAnimation()) return;
+
+    const double deltaTime = ConsumeAnimationDeltaSeconds();
+    if (animatingSelection_) UpdateSelectionAnimation(deltaTime);
+
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+
+    if (HasRevealAnimation()) {
+      DwmFlush();
+      RequestAnimationFrame();
+    } else if (animatingSelection_) {
+      StartSelectionAnimationTimer();
+    }
+  }
+
+  void StartSelectionAnimationTimer() {
+    if (!hwnd_ || selectionTimerActive_ || !visible_ || !settings_.animationsEnabled || !animatingSelection_) return;
+    selectionTimerActive_ = SetTimer(hwnd_, TIMER_SELECTION_ANIM, 8, nullptr) != 0;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void StopSelectionAnimationTimer() {
+    if (!selectionTimerActive_ || !hwnd_) {
+      selectionTimerActive_ = false;
+      lastSelectionFrameQpc_ = 0;
+      return;
+    }
+    KillTimer(hwnd_, TIMER_SELECTION_ANIM);
+    selectionTimerActive_ = false;
+    lastSelectionFrameQpc_ = 0;
+  }
+
+  void OnSelectionAnimationTimer() {
+    if (!visible_ || !settings_.animationsEnabled || !animatingSelection_) {
+      StopSelectionAnimationTimer();
+      return;
+    }
+
+    UpdateSelectionAnimation(ConsumeSelectionDeltaSeconds());
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    if (!animatingSelection_) StopSelectionAnimationTimer();
+  }
+
   int OverlayWidth() const {
     return std::clamp(settings_.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
   }
 
-  void ApplyRoundedRegion(int width, int height) {
-    BOOL compositionEnabled = FALSE;
-    if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
-      SetWindowRgn(hwnd_, nullptr, TRUE);
-      return;
-    }
-    const float scale = GetWindowScale(hwnd_);
-    const int round = static_cast<int>(theme_.overlayRadius * scale);
-    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, round, round);
-    SetWindowRgn(hwnd_, region, TRUE);
+  // Visible corners are drawn by Direct2D. This only ensures no stale Win32 region is
+  // left on the window, because a region would fight DirectComposition alpha.
+  void ApplyRoundedRegion(int /*width*/, int /*height*/) {
+    SetWindowRgn(hwnd_, nullptr, TRUE);
   }
 
   COLORREF ActiveAccent() const {
@@ -4042,25 +4497,25 @@ class LeanCastApp {
   void Paint() {
     PAINTSTRUCT ps{};
     BeginPaint(hwnd_, &ps);
-    CreateDeviceResources();
-    if (renderTarget_) {
-      SetActiveTarget(renderTarget_.Get());
-      renderTarget_->BeginDraw();
-      renderTarget_->Clear(D2D1::ColorF(0.0f, 0.0f));
+    if (CreateGlassSurface(overlaySurface_, hwnd_)) {
+      ID2D1DeviceContext* dc = overlaySurface_.dc.Get();
+      SetActiveTarget(dc);
+      dc->BeginDraw();
+      dc->Clear(D2D1::ColorF(0.0f, 0.0f));  // fully transparent: desktop content shows through
       hits_.clear();
 
       // Whole-panel open animation: scale up + rise + fade as one unit. The
       // transparent (DWM-composited) corners let the scale read cleanly.
       const PanelAnim pa = ComputePanelAnim();
-      const bool animatingPanel = pa.opacity < 1.0f;
+      const bool animatingPanel = pa.opacity < 1.0f || pa.scale != 1.0f || pa.dy != 0.0f;
       if (animatingPanel) {
         RECT rc{};
         GetClientRect(hwnd_, &rc);
         const float pivotX = (rc.right - rc.left) * 0.5f;
-        renderTarget_->SetTransform(
+        dc->SetTransform(
             D2D1::Matrix3x2F::Scale(pa.scale, pa.scale, D2D1::Point2F(pivotX, 0.0f)) *
             D2D1::Matrix3x2F::Translation(0.0f, pa.dy));
-        renderTarget_->PushLayer(
+        dc->PushLayer(
             D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
                                   D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                   D2D1::IdentityMatrix(), pa.opacity),
@@ -4070,17 +4525,17 @@ class LeanCastApp {
       DrawSearch();
 
       if (animatingPanel) {
-        renderTarget_->PopLayer();
-        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        dc->PopLayer();
+        dc->SetTransform(D2D1::Matrix3x2F::Identity());
       }
-      const HRESULT hr = renderTarget_->EndDraw();
-      if (hr == D2DERR_RECREATE_TARGET) {
-        renderTarget_.Reset();
-        ClearIconBitmaps();
-        brushCache_.clear();
-      }
+      const HRESULT hr = dc->EndDraw();
       activeRT_ = nullptr;
       activeDC_.Reset();
+      if (hr == D2DERR_RECREATE_TARGET) {
+        DiscardGlassDevice();
+      } else {
+        overlaySurface_.swapChain->Present(1, 0);
+      }
     }
     EndPaint(hwnd_, &ps);
   }
@@ -4088,20 +4543,21 @@ class LeanCastApp {
   void PaintSettings() {
     PAINTSTRUCT ps{};
     BeginPaint(settingsHwnd_, &ps);
-    CreateSettingsDeviceResources();
-    if (settingsRenderTarget_) {
-      SetActiveTarget(settingsRenderTarget_.Get());
-      settingsRenderTarget_->BeginDraw();
-      settingsRenderTarget_->Clear(D2D1::ColorF(0.0f, 0.0f));
+    if (CreateGlassSurface(settingsSurface_, settingsHwnd_)) {
+      ID2D1DeviceContext* dc = settingsSurface_.dc.Get();
+      SetActiveTarget(dc);
+      dc->BeginDraw();
+      dc->Clear(D2D1::ColorF(0.0f, 0.0f));
       hits_.clear();
       DrawSettings();
-      const HRESULT hr = settingsRenderTarget_->EndDraw();
-      if (hr == D2DERR_RECREATE_TARGET) {
-        brushCache_.erase(settingsRenderTarget_.Get());
-        settingsRenderTarget_.Reset();
-      }
+      const HRESULT hr = dc->EndDraw();
       activeRT_ = nullptr;
       activeDC_.Reset();
+      if (hr == D2DERR_RECREATE_TARGET) {
+        DiscardGlassDevice();
+      } else {
+        settingsSurface_.swapChain->Present(1, 0);
+      }
     }
     EndPaint(settingsHwnd_, &ps);
   }
@@ -4134,6 +4590,21 @@ class LeanCastApp {
   void StrokeRound(RectF rect, float radius, D2D1_COLOR_F color, float width = 1.0f) {
     auto brush = Brush(color);
     activeRT_->DrawRoundedRectangle(D2D1::RoundedRect(ToD2D(rect), radius, radius), brush.Get(), width);
+  }
+
+  enum class ObsidianBackgroundKind {
+    Overlay,
+    Settings,
+  };
+
+  void DrawObsidianBackground(float width, float height, float radius, ObsidianBackgroundKind kind) {
+    const RectF panel{0.5f, 0.5f, width - 0.5f, height - 0.5f};
+    const bool settings = kind == ObsidianBackgroundKind::Settings;
+    feathercast::theme::Color background = settings ? theme_.settingsBackground : theme_.overlayBackground;
+    background.a = std::min(background.a, 0.85f);
+
+    FillRound(panel, radius, D2DColor(background));
+    StrokeRound(panel, radius, D2DColor(theme_.border), 1.0f);
   }
 
   // Set the render target for the current frame, and grab its ID2D1DeviceContext
@@ -4213,10 +4684,8 @@ class LeanCastApp {
     const float width = static_cast<float>(rc.right - rc.left) / scale;
     const float height = static_cast<float>(rc.bottom - rc.top) / scale;
     const COLORREF accent = ActiveAccent();
-    const COLORREF bg = ColorRefFromTheme(theme_.selectedBase);
 
-    FillRound({0, 0, width, height}, theme_.overlayRadius, D2DColor(theme_.overlayBackground));
-    StrokeRound({0.5f, 0.5f, width - 0.5f, height - 0.5f}, theme_.overlayRadius, D2DColor(theme_.border));
+    DrawObsidianBackground(width, height, theme_.overlayRadius, ObsidianBackgroundKind::Overlay);
 
     DrawSearchIcon(18, 20, D2DColor(theme_.textMuted));
     const std::wstring input = query_.empty() ? SearchPlaceholder() : query_;
@@ -4256,31 +4725,37 @@ class LeanCastApp {
 
     const bool showFooter = !settings_.compactMode;
     const float footerHeight = showFooter ? 40.0f : 0.0f;
-    const float resultsTop = 60.0f;
+    const float resultsTop = kResultsTop;
     const float resultsBottom = height - footerHeight;
+    const DisplayItem* detailItem = SelectedMarkdownDetailItem();
+    const float detailWidth = detailItem ? MarkdownDetailWidth(width) : 0.0f;
+    if (detailWidth <= 0.0f) detailItem = nullptr;
+    const float resultsRight = detailItem ? width - detailWidth - 8.0f : width;
     const float viewHeight = resultsBottom - resultsTop;
     const int contentHeight = ResultsContentHeight();
     scroll_ = std::clamp(scroll_, 0, std::max(0, contentHeight - static_cast<int>(viewHeight)));
 
     float y = resultsTop - static_cast<float>(scroll_);
     int rowIndex = 0;
-    activeRT_->PushAxisAlignedClip(D2D1::RectF(0, resultsTop, width, resultsBottom), D2D1_ANTIALIAS_MODE_ALIASED);
+    activeRT_->PushAxisAlignedClip(D2D1::RectF(0, resultsTop, resultsRight, resultsBottom), D2D1_ANTIALIAS_MODE_ALIASED);
+    DrawSelectionPill(resultsRight);
     for (const auto& section : sections_) {
-      if (y + 26 >= resultsTop && y <= resultsBottom) {
-        DrawTextBlock(section.title, {12, y + 8, width - 12, y + 24}, sectionFormat_.Get(), D2DColor(theme_.sectionText));
+      if (y + kSectionHeaderHeight >= resultsTop && y <= resultsBottom) {
+        DrawTextBlock(section.title, {12, y + 8, resultsRight - 12, y + 24}, sectionFormat_.Get(), D2DColor(theme_.sectionText));
       }
-      y += 26;
+      y += kSectionHeaderHeight;
       for (const auto& item : section.items) {
-        RectF rowRect{8, y, width - 8, y + 46};
+        // 50px row height (was 46px): subtitle no longer clips at the bottom edge.
+        RectF rowRect{8, y, resultsRight - 8, y + kResultRowHeight};
         if (rowRect.bottom >= resultsTop && rowRect.top <= resultsBottom) {
           const RowAnim anim = ComputeRowAnim(rowIndex);
-          const bool revealing = anim.opacity < 1.0f || anim.dx != 0.0f;
+          const bool revealing = anim.opacity < 1.0f || anim.dy != 0.0f;
           if (revealing) {
             // Compose the row slide onto the current transform (the panel
             // pop), so both animations layer instead of overwriting each other.
             D2D1_MATRIX_3X2_F base;
             activeRT_->GetTransform(&base);
-            activeRT_->SetTransform(D2D1::Matrix3x2F::Translation(-anim.dx, 0.0f) * base);
+            activeRT_->SetTransform(D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
             activeRT_->PushLayer(
                 D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
                                       D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -4293,15 +4768,19 @@ class LeanCastApp {
             DrawResultRow(item, rowRect, rowIndex);
           }
         }
-        y += 48;
+        // 52px stride = 50px row + 2px gap (was 48 = 46 + 2).
+        y += kResultRowStride;
         ++rowIndex;
       }
     }
     activeRT_->PopAxisAlignedClip();
 
-    if (animating_ && static_cast<double>(GetTickCount64() - animStart_) >= AnimFinishMs()) {
+    if (detailItem) {
+      DrawMarkdownDetail(*detailItem, {resultsRight + 4.0f, resultsTop + 8.0f, width - 8.0f, resultsBottom - 8.0f});
+    }
+
+    if (animating_ && QpcElapsedMs(animStartQpc_) >= AnimFinishMs()) {
       animating_ = false;
-      KillTimer(hwnd_, 2);
     }
 
     if (sections_.empty()) {
@@ -4311,42 +4790,49 @@ class LeanCastApp {
     if (showFooter) {
       auto border = Brush(D2DColor(theme_.divider));
       activeRT_->DrawLine(D2D1::Point2F(0, height - 40.0f), D2D1::Point2F(width, height - 40.0f), border.Get(), 1.0f);
-      DrawTextBlock(L"LeanCast", {16, height - 28.0f, 160, height - 12.0f}, footerFormat_.Get(), D2DColor(theme_.textPrimary));
+      DrawTextBlock(L"FeatherCast", {16, height - 28.0f, 160, height - 12.0f}, footerFormat_.Get(), D2DColor(theme_.textPrimary));
       DrawTextBlock(L"Up/Down Navigate | Enter Open | Tab Actions | Esc Close", {200, height - 28.0f, width - 16.0f, height - 12.0f}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
     }
   }
 
   // Open-search reveal animation tuning. Two motions layer together: the whole
   // panel eases in as one unit (a quick fade + subtle scale-up + upward slide),
-  // while result rows additionally stagger in from the left, top-first. Capped
-  // stagger keeps the whole reveal short regardless of row count.
-  static constexpr double kAnimDurationMs = 150.0;
+  // while result rows additionally stagger upward, top-first. Capped stagger
+  // keeps the whole reveal short regardless of row count.
+  static constexpr double kAnimDurationMs = 200.0;
   static constexpr float kAnimStartScale = 0.97f;
   static constexpr float kAnimSlidePx = 10.0f;
-  static constexpr double kRowDurationMs = 170.0;
-  static constexpr double kRowStaggerMs = 28.0;
-  static constexpr float kRowSlidePx = 26.0f;
-  static constexpr int kRowMaxStaggerRows = 9;
+  static constexpr double kAnimBackOvershoot = 1.2;
+  static constexpr double kRowDurationMs = 120.0;
+  static constexpr double kRowStaggerMs = 18.0;
+  static constexpr float kRowSlidePx = 8.0f;
+  static constexpr int kRowMaxStaggerRows = 7;
 
   struct PanelAnim { float opacity; float scale; float dy; };
 
   PanelAnim ComputePanelAnim() const {
     if (!animating_) return {1.0f, 1.0f, 0.0f};
-    double t = static_cast<double>(GetTickCount64() - animStart_) / kAnimDurationMs;
+    double t = QpcElapsedMs(animStartQpc_) / kAnimDurationMs;
     t = std::clamp(t, 0.0, 1.0);
-    const double eased = 1.0 - std::pow(1.0 - t, 3.0);  // ease-out cubic
+    const double eased = ComputeEaseOutBack(t);
+    const double opacity = std::clamp(eased, 0.0, 1.0);
     return {
-        static_cast<float>(eased),
+        static_cast<float>(opacity),
         static_cast<float>(kAnimStartScale + (1.0f - kAnimStartScale) * eased),
         static_cast<float>((1.0 - eased) * kAnimSlidePx),
     };
   }
 
-  struct RowAnim { float opacity; float dx; };
+  static double ComputeEaseOutBack(double t) {
+    t = t - 1.0;
+    return 1.0 + (kAnimBackOvershoot + 1.0) * std::pow(t, 3.0) + kAnimBackOvershoot * std::pow(t, 2.0);
+  }
+
+  struct RowAnim { float opacity; float dy; };
 
   RowAnim ComputeRowAnim(int rowIndex) const {
     if (!animating_) return {1.0f, 0.0f};
-    const double elapsed = static_cast<double>(GetTickCount64() - animStart_);
+    const double elapsed = QpcElapsedMs(animStartQpc_);
     const double delay = std::min(rowIndex, kRowMaxStaggerRows) * kRowStaggerMs;
     double t = (elapsed - delay) / kRowDurationMs;
     t = std::clamp(t, 0.0, 1.0);
@@ -4358,10 +4844,93 @@ class LeanCastApp {
     return std::max(kAnimDurationMs, kRowMaxStaggerRows * kRowStaggerMs + kRowDurationMs);
   }
 
-  void DrawResultRow(const DisplayItem& item, RectF rowRect, int rowIndex) {
+  void DrawSelectionPill(float width) {
+    const auto targetY = SelectedRowTop();
+    if (!targetY) return;
+    if (!settings_.animationsEnabled || visualSelectedY_ < 0.0f) {
+      visualSelectedY_ = *targetY;
+      animatingSelection_ = false;
+    }
+
     const COLORREF accent = ActiveAccent();
+    RectF rect{8.0f, visualSelectedY_, width - 8.0f, visualSelectedY_ + kResultRowHeight};
+    FillRound(rect, theme_.rowRadius, Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.20f, 1.0f));
+  }
+
+  const DisplayItem* SelectedMarkdownDetailItem() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(flatItems_.size())) return nullptr;
+    const auto& item = flatItems_[static_cast<size_t>(selected_)];
+    if (!item.isExtension || item.extension.detailBody.empty()) return nullptr;
+    return Lower(item.extension.detailType) == L"markdown" ? &item : nullptr;
+  }
+
+  float MarkdownDetailWidth(float width) const {
+    if (!SelectedMarkdownDetailItem() || width < 680.0f) return 0.0f;
+    return std::clamp(width * 0.38f, 240.0f, 320.0f);
+  }
+
+  static std::wstring StripInlineCodeMarkers(std::wstring text) {
+    text.erase(std::remove(text.begin(), text.end(), L'`'), text.end());
+    return text;
+  }
+
+  void DrawMarkdownDetail(const DisplayItem& item, RectF rect) {
+    FillRound(rect, theme_.rowRadius, D2DColor(theme_.surface));
+    StrokeRound(rect, theme_.rowRadius, D2DColor(theme_.border));
+
+    const float left = rect.left + 12.0f;
+    const float right = rect.right - 12.0f;
+    float y = rect.top + 12.0f;
+    const std::wstring title = item.extension.detailTitle.empty() ? item.Name() : item.extension.detailTitle;
+    DrawTextBlock(title, {left, y, right, y + 24.0f}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
+    y += 30.0f;
+
+    std::wistringstream lines(item.extension.detailBody);
+    std::wstring line;
+    bool codeBlock = false;
+    while (std::getline(lines, line) && y < rect.bottom - 12.0f) {
+      if (!line.empty() && line.back() == L'\r') line.pop_back();
+      std::wstring trimmed = Trim(line);
+      if (StartsWith(trimmed, L"```")) {
+        codeBlock = !codeBlock;
+        y += codeBlock ? 4.0f : 6.0f;
+        continue;
+      }
+      if (trimmed.empty()) {
+        y += 8.0f;
+        continue;
+      }
+
+      if (codeBlock) {
+        FillRound({left - 4.0f, y - 1.0f, right + 4.0f, y + 20.0f}, 4.0f, D2DColor(theme_.iconTile));
+        DrawTextBlock(trimmed, {left, y + 1.0f, right, y + 19.0f}, subFormat_.Get(), D2DColor(theme_.textPrimary));
+        y += 23.0f;
+        continue;
+      }
+
+      IDWriteTextFormat* format = subFormat_.Get();
+      D2D1_COLOR_F color = D2DColor(theme_.textMuted);
+      float lineHeight = 19.0f;
+      if (StartsWith(trimmed, L"#")) {
+        size_t pos = 0;
+        while (pos < trimmed.size() && trimmed[pos] == L'#') ++pos;
+        trimmed = Trim(trimmed.substr(pos));
+        format = rowFormat_.Get();
+        color = D2DColor(theme_.textPrimary);
+        lineHeight = 23.0f;
+      } else if (StartsWith(trimmed, L"- ") || StartsWith(trimmed, L"* ")) {
+        trimmed = L"- " + Trim(trimmed.substr(2));
+        color = D2DColor(theme_.textPrimary);
+      } else {
+        trimmed = StripInlineCodeMarkers(std::move(trimmed));
+      }
+      DrawTextBlock(trimmed, {left, y, right, y + lineHeight}, format, color);
+      y += lineHeight;
+    }
+  }
+
+  void DrawResultRow(const DisplayItem& item, RectF rowRect, int rowIndex) {
     const bool selected = rowIndex == selected_;
-    if (selected) FillRound(rowRect, theme_.rowRadius, Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.22f, 1.0f));
     hits_.push_back({rowRect, HitType::Result, rowIndex});
 
     if (item.isSymbol) {
@@ -4370,13 +4939,15 @@ class LeanCastApp {
       // value string (not a single UTF-16 unit) keeps surrogate-pair emoji intact.
       const float box = 34.0f;
       const float bx = rowRect.left + 10;
-      const float by = rowRect.top + (46.0f - box) / 2.0f;
+      // Centre the tile within the new 50px row height.
+      const float by = rowRect.top + (kResultRowHeight - box) / 2.0f;
       FillRound({bx, by, bx + box, by + box}, 8, D2DColor(theme_.iconTile));
       DrawTextBlock(item.symbol.value, {bx, by, bx + box, by + box}, emojiFormat_.Get(), D2DColor(theme_.textPrimary));
-      DrawTextBlock(item.Name(), {rowRect.left + 56, rowRect.top + 7, rowRect.right - 180, rowRect.top + 27}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
-      DrawTextBlock(SourceLabel(item), {rowRect.left + 56, rowRect.top + 28, rowRect.right - 180, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
-      if (selected) {
-        DrawTextBlock(ActionHint(item), {rowRect.right - 330, rowRect.top + 15, rowRect.right - 10, rowRect.bottom}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+      // Unified text start at +52px (was +56 for emoji path) to eliminate jitter.
+      DrawTextBlock(item.Name(), {rowRect.left + 52, rowRect.top + 8, rowRect.right - 180, rowRect.top + 28}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
+      DrawTextBlock(SourceLabel(item), {rowRect.left + 52, rowRect.top + 29, rowRect.right - 180, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
+      if (selected && rowRect.right - rowRect.left > 520.0f) {
+        DrawTextBlock(ActionHint(item), {rowRect.right - 330, rowRect.top + 16, rowRect.right - 10, rowRect.bottom}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
       }
       return;
     }
@@ -4392,10 +4963,11 @@ class LeanCastApp {
       DrawTextBlock(letter, {iconX, iconY + 1, iconX + 24, iconY + 24}, centerFormat_.Get(), D2DColor(theme_.textMuted));
     }
 
-    DrawTextBlock(item.Name(), {rowRect.left + 50, rowRect.top + 7, rowRect.right - 180, rowRect.top + 27}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
-    DrawTextBlock(SourceLabel(item), {rowRect.left + 50, rowRect.top + 28, rowRect.right - 180, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
-    if (selected) {
-      DrawTextBlock(ActionHint(item), {rowRect.right - 330, rowRect.top + 15, rowRect.right - 10, rowRect.bottom}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+    // Unified text start at +52px (was +50 for icon path) to eliminate horizontal jitter.
+    DrawTextBlock(item.Name(), {rowRect.left + 52, rowRect.top + 8, rowRect.right - 180, rowRect.top + 28}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
+    DrawTextBlock(SourceLabel(item), {rowRect.left + 52, rowRect.top + 29, rowRect.right - 180, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
+    if (selected && rowRect.right - rowRect.left > 520.0f) {
+      DrawTextBlock(ActionHint(item), {rowRect.right - 330, rowRect.top + 16, rowRect.right - 10, rowRect.bottom}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
     }
   }
 
@@ -4423,12 +4995,12 @@ class LeanCastApp {
     if (item.isWebSearch) return L"Enter Open";
     if (item.isExtension) return L"Enter Run";
     if (item.isSnippet || item.isClipboard) return L"Enter Paste";
-    if (item.isRunCommand) return item.runCommand.kind == leancast::run_command::Kind::OpenTarget ? L"Enter Open" : L"Enter Run";
+    if (item.isRunCommand) return item.runCommand.kind == feathercast::run_command::Kind::OpenTarget ? L"Enter Open" : L"Enter Run";
     if (item.isSymbol) return L"Enter Paste";
     if (item.isCommand) return L"Enter Run";
     if (item.isAction) return L"Enter Apply";
     if (item.isWindow) return L"Enter Switch";
-    return item.app.adminSupported ? L"Enter Open | Ctrl+K Actions | Ctrl+Shift Admin" : L"Enter Open | Ctrl+K Actions";
+    return L"Enter Open | Ctrl+Shift Admin | Ctrl+K Actions";
   }
 
   static constexpr float kSettTop = 72.0f;
@@ -4497,8 +5069,7 @@ class LeanCastApp {
     const float height = static_cast<float>(rc.bottom - rc.top) / scale;
     const COLORREF accent = ActiveAccent();
 
-    FillRound({0, 0, width, height}, theme_.settingsRadius, D2DColor(theme_.settingsBackground));
-    StrokeRound({0.5f, 0.5f, width - 0.5f, height - 0.5f}, theme_.settingsRadius, D2DColor(theme_.border));
+    DrawObsidianBackground(width, height, theme_.settingsRadius, ObsidianBackgroundKind::Settings);
 
     // Title bar (draggable region).
     DrawTextBlock(L"Settings", {24, 16, width - 60, 46}, titleFormat_.Get(), SettWhite());
@@ -4530,7 +5101,7 @@ class LeanCastApp {
     {
       const float rowH = kSettShortcut;
       const std::wstring current = settings_.shortcut.empty() || settings_.shortcut == L"none" ? L"None" : settings_.shortcut;
-      DrawTextBlock(L"Open LeanCast", {24, y + 12, width - 24, y + 32}, labelFormat_.Get(), SettWhite());
+      DrawTextBlock(L"Open FeatherCast", {24, y + 12, width - 24, y + 32}, labelFormat_.Get(), SettWhite());
       DrawTextBlock(L"Current: " + current + L". At least one modifier required.", {24, y + 33, width - 24, y + 51}, bodyFormat_.Get(), SettGray());
       const float btnTop = y + 56;
       RectF record{24, btnTop, width - 130, btnTop + 38};
@@ -4556,7 +5127,7 @@ class LeanCastApp {
 
     // ---- General ----
     y = DrawSettingsSection(y, L"GENERAL", width);
-    DrawSettingRowLabel(y, kSettRow, L"Start on Startup", L"Launch LeanCast when you log into Windows.", width - 90);
+    DrawSettingRowLabel(y, kSettRow, L"Start on Startup", L"Launch FeatherCast when you log into Windows.", width - 90);
     DrawSwitch(y, kSettRow, settings_.startOnStartup, HitType::StartupToggle, width);
     y += kSettRow;
     DrawSettingRowLabel(y, kSettRow, L"Automatic Update Checks", L"Check GitHub Releases once per day.", width - 90);
@@ -4659,7 +5230,7 @@ class LeanCastApp {
   }
 
   ComPtr<ID2D1Bitmap> IconBitmap(const std::wstring& key) {
-    if (key.empty() || !renderTarget_) return nullptr;
+    if (key.empty() || !overlaySurface_.dc) return nullptr;
     if (auto cached = CachedIconBitmap(key)) return cached;
 
     const auto png = IconCachePath(key);
@@ -4720,7 +5291,7 @@ class LeanCastApp {
   }
 
   ComPtr<ID2D1Bitmap> LoadBitmapFromFile(const std::filesystem::path& path) {
-    if (!wicFactory_ || !renderTarget_) return nullptr;
+    if (!wicFactory_ || !overlaySurface_.dc) return nullptr;
     ComPtr<IWICBitmapDecoder> decoder;
     if (FAILED(wicFactory_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf()))) return nullptr;
     ComPtr<IWICBitmapFrameDecode> frame;
@@ -4729,7 +5300,7 @@ class LeanCastApp {
     if (FAILED(wicFactory_->CreateFormatConverter(converter.GetAddressOf()))) return nullptr;
     if (FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeMedianCut))) return nullptr;
     ComPtr<ID2D1Bitmap> bitmap;
-    renderTarget_->CreateBitmapFromWicBitmap(converter.Get(), nullptr, bitmap.GetAddressOf());
+    overlaySurface_.dc->CreateBitmapFromWicBitmap(converter.Get(), nullptr, bitmap.GetAddressOf());
     return bitmap;
   }
 
@@ -4852,37 +5423,27 @@ class LeanCastApp {
     }
 
     if (vk == VK_DOWN) {
-      if (!flatItems_.empty()) selected_ = std::min<int>(selected_ + 1, static_cast<int>(flatItems_.size()) - 1);
-      EnsureSelectedVisible();
-      InvalidateRect(hwnd_, nullptr, FALSE);
+      SelectResult(selected_ + 1, true, true);
     } else if (vk == VK_UP) {
-      selected_ = std::max(0, selected_ - 1);
-      EnsureSelectedVisible();
-      InvalidateRect(hwnd_, nullptr, FALSE);
+      SelectResult(selected_ - 1, true, true);
     } else if (vk == VK_HOME) {
       if (!query_.empty()) {
         caret_ = 0;
+        InvalidateRect(hwnd_, nullptr, FALSE);
       } else {
-        selected_ = 0;
-        EnsureSelectedVisible();
+        SelectResult(0, true, true);
       }
-      InvalidateRect(hwnd_, nullptr, FALSE);
     } else if (vk == VK_END) {
       if (!query_.empty()) {
         caret_ = query_.size();
+        InvalidateRect(hwnd_, nullptr, FALSE);
       } else {
-        if (!flatItems_.empty()) selected_ = static_cast<int>(flatItems_.size()) - 1;
-        EnsureSelectedVisible();
+        SelectResult(static_cast<int>(flatItems_.size()) - 1, true, true);
       }
-      InvalidateRect(hwnd_, nullptr, FALSE);
     } else if (vk == VK_PRIOR) {
-      selected_ = std::max(0, selected_ - 8);
-      EnsureSelectedVisible();
-      InvalidateRect(hwnd_, nullptr, FALSE);
+      SelectResult(selected_ - 8, true, true);
     } else if (vk == VK_NEXT) {
-      if (!flatItems_.empty()) selected_ = std::min<int>(selected_ + 8, static_cast<int>(flatItems_.size()) - 1);
-      EnsureSelectedVisible();
-      InvalidateRect(hwnd_, nullptr, FALSE);
+      SelectResult(selected_ + 8, true, true);
     } else if (vk == VK_RIGHT) {
       if (caret_ < query_.size()) {
         ++caret_;
@@ -4918,6 +5479,7 @@ class LeanCastApp {
         }
         selected_ = 0;
         scroll_ = 0;
+        SyncSelectionAnimationToTarget();
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
       }
@@ -4931,6 +5493,7 @@ class LeanCastApp {
         }
         selected_ = 0;
         scroll_ = 0;
+        SyncSelectionAnimationToTarget();
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
       }
@@ -4945,6 +5508,7 @@ class LeanCastApp {
       ++caret_;
       selected_ = 0;
       scroll_ = 0;
+      SyncSelectionAnimationToTarget();
       RequestSearch();
       InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -4954,21 +5518,21 @@ class LeanCastApp {
     int y = 0;
     int row = 0;
     for (const auto& section : sections_) {
-      y += 26;
+      y += static_cast<int>(kSectionHeaderHeight);
       for (size_t i = 0; i < section.items.size(); ++i) {
         if (row == selected_) {
           const int rowTop = y;
-          const int rowBottom = y + 48;
+          const int rowBottom = y + static_cast<int>(kResultRowHeight);
           RECT rc{};
           GetClientRect(hwnd_, &rc);
           const float scale = GetWindowScale(hwnd_);
-          const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - 60 - (settings_.compactMode ? 0 : 36);
+          const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - static_cast<int>(kResultsTop) - (settings_.compactMode ? 0 : 36);
           if (rowTop - scroll_ < 0) scroll_ = rowTop;
           else if (rowBottom - scroll_ > visible) scroll_ = rowBottom - visible;
           scroll_ = std::max(0, scroll_);
           return;
         }
-        y += 48;
+        y += static_cast<int>(kResultRowStride);
         ++row;
       }
     }
@@ -5005,8 +5569,7 @@ class LeanCastApp {
 
     for (const auto& hit : hits_) {
       if (hit.type == HitType::Result && PointInRect(hit.rect, x, y) && hit.index != selected_) {
-        selected_ = hit.index;
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        SelectResult(hit.index, true, false, SelectionMotion::Hover);
         return;
       }
     }
@@ -5082,8 +5645,7 @@ class LeanCastApp {
     height = std::min(height, static_cast<int>((mi.rcWork.bottom - mi.rcWork.top - 40) / scale));
     const int physicalHeight = static_cast<int>(height * scale);
     SetWindowPos(settingsHwnd_, HWND_TOPMOST, rc.left, rc.top, width, physicalHeight, SWP_NOACTIVATE);
-    const int settingsRound = static_cast<int>(theme_.settingsRadius * scale);
-    SetWindowRgn(settingsHwnd_, CreateRoundRectRgn(0, 0, width + 1, physicalHeight + 1, settingsRound, settingsRound), TRUE);
+    // Visible corners are drawn by Direct2D; no window region, so DirectComposition alpha stays intact.
   }
 
   void HandleSettingsHit(HitType type) {
@@ -5189,12 +5751,14 @@ class LeanCastApp {
 
   void OnMouseWheel(int delta) {
     if (view_ != View::Search || sections_.empty()) return;
+    const int previousScroll = scroll_;
     scroll_ -= delta / WHEEL_DELTA * 72;
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     const float scale = GetWindowScale(hwnd_);
-    const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - 60 - (settings_.compactMode ? 0 : 36);
+    const int visible = static_cast<int>((rc.bottom - rc.top) / scale) - static_cast<int>(kResultsTop) - (settings_.compactMode ? 0 : 36);
     scroll_ = std::clamp(scroll_, 0, std::max(0, ResultsContentHeight() - visible));
+    if (scroll_ != previousScroll) SyncSelectionAnimationToTarget();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
@@ -5245,16 +5809,19 @@ class LeanCastApp {
 
     if (response->closeOverlay) HideOverlay(false);
     switch (response->action) {
-      case leancast::extensions::HostActionType::OpenUrl:
-      case leancast::extensions::HostActionType::OpenPath:
+      case feathercast::extensions::HostActionType::OpenUrl:
+      case feathercast::extensions::HostActionType::OpenPath:
         if (!response->value.empty()) {
           ShellExecuteW(nullptr, L"open", response->value.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
         return;
-      case leancast::extensions::HostActionType::CopyText:
+      case feathercast::extensions::HostActionType::CopyText:
         CopyTextToClipboard(response->value);
         return;
-      case leancast::extensions::HostActionType::None:
+      case feathercast::extensions::HostActionType::SetQuery:
+        SetQueryText(response->value);
+        return;
+      case feathercast::extensions::HostActionType::None:
         return;
     }
   }
@@ -5293,9 +5860,9 @@ class LeanCastApp {
       HideOverlay(false);
       std::jthread([runCommand = item.runCommand]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        if (runCommand.kind == leancast::run_command::Kind::OpenTarget) {
+        if (runCommand.kind == feathercast::run_command::Kind::OpenTarget) {
           ShellExecuteW(nullptr, L"open", runCommand.target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        } else if (runCommand.kind == leancast::run_command::Kind::ShellCommand) {
+        } else if (runCommand.kind == feathercast::run_command::Kind::ShellCommand) {
           const std::wstring args = L"/d /k " + runCommand.input;
           ShellExecuteW(nullptr, L"open", L"cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
         }
@@ -5380,6 +5947,7 @@ class LeanCastApp {
         ClearQuery();
         selected_ = 0;
         scroll_ = 0;
+        SyncSelectionAnimationToTarget();
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -5436,7 +6004,7 @@ class LeanCastApp {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::OpenThemeFile:
-        leancast::theme::WriteDefaultTheme(ThemePath());
+        feathercast::theme::WriteDefaultTheme(ThemePath());
         std::jthread([path = ThemePath()]() {
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -5456,6 +6024,10 @@ class LeanCastApp {
       case CommandKind::SleepPC:
         HideOverlay(false);
         SetSuspendState(FALSE, FALSE, FALSE);
+        return;
+      case CommandKind::MuteAudio:
+        ToggleDefaultAudioMute();
+        HideOverlay(false);
         return;
       case CommandKind::ShutDown:
         HideOverlay(false);
@@ -5735,16 +6307,32 @@ class LeanCastApp {
     }
 
     if (app.launchType == LaunchType::AppsFolder) {
-      // Elevated launches need a real executable; use the execution alias when
-      // we captured one during discovery.
-      if (asAdmin && !app.targetPath.empty()) {
-        SHELLEXECUTEINFOW sei{};
-        sei.cbSize = sizeof(sei);
-        sei.fMask = SEE_MASK_NOASYNC;
-        sei.lpVerb = L"runas";
-        sei.lpFile = app.targetPath.c_str();
-        sei.nShow = SW_SHOWNORMAL;
-        if (ShellExecuteExW(&sei)) return true;
+      if (asAdmin) {
+        // Prefer the execution alias (e.g. wt.exe) when we have one — it is a
+        // real executable that the runas verb understands natively.
+        if (!app.targetPath.empty()) {
+          SHELLEXECUTEINFOW sei{};
+          sei.cbSize = sizeof(sei);
+          sei.fMask = SEE_MASK_NOASYNC;
+          sei.lpVerb = L"runas";
+          sei.lpFile = app.targetPath.c_str();
+          sei.nShow = SW_SHOWNORMAL;
+          if (ShellExecuteExW(&sei)) return true;
+        }
+        // Fallback for packaged/Store apps without a known alias: open the
+        // shell:AppsFolder item with the runas verb so the user gets a UAC
+        // prompt regardless of the app's packaging model.
+        const std::wstring adminTarget = L"shell:AppsFolder\\" + app.launchTarget;
+        SHELLEXECUTEINFOW seiShell{};
+        seiShell.cbSize = sizeof(seiShell);
+        seiShell.fMask = SEE_MASK_NOASYNC;
+        seiShell.lpVerb = L"runas";
+        seiShell.lpFile = adminTarget.c_str();
+        seiShell.nShow = SW_SHOWNORMAL;
+        DebugLaunchLog(L"  AppsFolder admin fallback target='" + adminTarget + L"'");
+        if (ShellExecuteExW(&seiShell)) return true;
+        // If runas on the shell item fails (e.g. MSIX app that can't elevate),
+        // fall through to the normal activation path below so the app still opens.
       }
 
       // Prefer the activation manager: it launches packaged apps (Terminal,
@@ -5824,7 +6412,7 @@ class LeanCastApp {
       POINT pt{};
       GetCursorPos(&pt);
       HMENU menu = CreatePopupMenu();
-      AppendMenuW(menu, MF_STRING, 1, L"Open LeanCast");
+      AppendMenuW(menu, MF_STRING, 1, L"Open FeatherCast");
       AppendMenuW(menu, MF_STRING, 2, L"Settings");
       AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
       AppendMenuW(menu, MF_STRING, 3, L"Quit");
@@ -5851,8 +6439,16 @@ class LeanCastApp {
   HWND lastActiveWindow_ = nullptr;
   bool visible_ = false;
   bool suppressHide_ = false;
-  ULONGLONG animStart_ = 0;
+  LARGE_INTEGER qpcFrequency_{};
+  LONGLONG animStartQpc_ = 0;
+  LONGLONG lastAnimationFrameQpc_ = 0;
+  LONGLONG lastSelectionFrameQpc_ = 0;
   bool animating_ = false;
+  bool animationFrameQueued_ = false;
+  float visualSelectedY_ = -1.0f;
+  bool animatingSelection_ = false;
+  double selectionSettleSeconds_ = 0.090;
+  bool selectionTimerActive_ = false;
   View view_ = View::Search;
   HMONITOR overlayMonitor_ = nullptr;
   std::wstring query_;
@@ -5891,13 +6487,13 @@ class LeanCastApp {
   std::vector<std::jthread> iconThreads_;
   std::mutex dataMutex_;
   std::mutex storageMutex_;
-  leancast::storage::Storage storage_;
-  leancast::theme::Theme theme_;
+  feathercast::storage::Storage storage_;
+  feathercast::theme::Theme theme_;
   std::vector<AppEntry> apps_;
   std::vector<WindowEntry> windows_;
   std::vector<AppEntry> fileIndex_;
   std::vector<AppEntry> systemFolders_;
-  std::vector<leancast::snippets::Snippet> snippets_;
+  std::vector<feathercast::snippets::Snippet> snippets_;
   std::vector<ClipboardEntry> clipboardHistory_;
   unsigned long long clipboardSerial_ = 0;
   std::optional<std::wstring> internalClipboardText_;
@@ -5908,7 +6504,7 @@ class LeanCastApp {
   std::atomic<bool> updateWorkerRunning_ = false;
   std::mutex updateMutex_;
   std::optional<UpdateTaskResult> latestUpdateResult_;
-  leancast::extensions::ExtensionManager extensions_;
+  feathercast::extensions::ExtensionManager extensions_;
   std::vector<Section> sections_;
   std::vector<DisplayItem> flatItems_;
   std::vector<HitTarget> hits_;
@@ -5926,11 +6522,17 @@ class LeanCastApp {
   std::unordered_map<std::wstring, IconCacheEntry> iconBitmaps_;
   static constexpr size_t kIconCacheCap = 256;
 
-  ComPtr<ID2D1Factory> d2dFactory_;
   ComPtr<IDWriteFactory> dwriteFactory_;
   ComPtr<IWICImagingFactory> wicFactory_;
-  ComPtr<ID2D1HwndRenderTarget> renderTarget_;
-  ComPtr<ID2D1HwndRenderTarget> settingsRenderTarget_;
+
+  // Shared Direct3D 11 / Direct2D / DirectComposition device stack (see EnsureGlassDevice).
+  ComPtr<ID3D11Device> d3dDevice_;
+  ComPtr<ID2D1Device> d2dDevice_;
+  ComPtr<IDXGIFactory2> dxgiFactory_;
+  ComPtr<IDCompositionDevice> dcompDevice_;
+
+  GlassSurface overlaySurface_;
+  GlassSurface settingsSurface_;
   std::wstring caretMeasureText_ = L"\x01";  // sentinel that never equals a real measured prefix
   float caretMeasureWidth_ = -1.0f;
   float caretOffset_ = 0.0f;
@@ -5958,12 +6560,12 @@ class LeanCastApp {
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
   UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
   if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-    HWND existing = FindWindowW(kWindowClass, L"LeanCast");
+    HWND existing = FindWindowW(kWindowClass, L"FeatherCast");
     if (existing) PostMessageW(existing, WM_SHOW_SEARCH, 0, 0);
     return 0;
   }
 
   std::wstring cmdLineStr = cmdLine ? cmdLine : L"";
-  LeanCastApp app(instance, cmdLineStr);
+  FeatherCastApp app(instance, cmdLineStr);
   return app.Run();
 }

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
-inline constexpr char kLeanCastVersionUtf8[] = "@PROJECT_VERSION@";
-inline constexpr wchar_t kLeanCastVersion[] = L"@PROJECT_VERSION@";
+inline constexpr char kFeatherCastVersionUtf8[] = "@PROJECT_VERSION@";
+inline constexpr wchar_t kFeatherCastVersion[] = L"@PROJECT_VERSION@";

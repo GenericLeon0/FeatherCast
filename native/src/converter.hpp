@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // Pure unit and currency conversion engine, mirroring calculator.hpp so it can
 // be unit-tested and run on the search worker thread. Currency conversions are
@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace leancast::converter {
+namespace feathercast::converter {
 
 struct Result {
   std::wstring expression;
@@ -103,6 +103,11 @@ inline const std::map<std::wstring, Unit>& UnitTable() {
     add({L"kib"}, L"data", 1024.0);
     add({L"mib"}, L"data", 1048576.0);
     add({L"gib"}, L"data", 1073741824.0);
+    // Data rate (base: bit per second)
+    add({L"bps"}, L"data-rate", 1.0);
+    add({L"kbps"}, L"data-rate", 1000.0);
+    add({L"mbps"}, L"data-rate", 1000000.0);
+    add({L"gbps"}, L"data-rate", 1000000000.0);
     // Time (base: second)
     add({L"s", L"sec", L"secs", L"second", L"seconds"}, L"time", 1.0);
     add({L"ms", L"millisecond", L"milliseconds"}, L"time", 0.001);
@@ -133,6 +138,15 @@ inline const std::map<std::wstring, Unit>& UnitTable() {
     // Angle (base: degree)
     add({L"deg", L"degree", L"degrees"}, L"angle", 1.0);
     add({L"rad", L"radian", L"radians"}, L"angle", 57.2957795130823);
+    // Power (base: watt)
+    add({L"w", L"watt", L"watts"}, L"power", 1.0);
+    add({L"kw", L"kilowatt", L"kilowatts"}, L"power", 1000.0);
+    add({L"hp", L"horsepower"}, L"power", 745.699872);
+    // Energy (base: joule)
+    add({L"j", L"joule", L"joules"}, L"energy", 1.0);
+    add({L"kj", L"kilojoule", L"kilojoules"}, L"energy", 1000.0);
+    add({L"wh", L"watt-hour", L"watt-hours", L"watthour", L"watthours"}, L"energy", 3600.0);
+    add({L"kwh", L"kilowatt-hour", L"kilowatt-hours", L"kilowatthour", L"kilowatthours"}, L"energy", 3600000.0);
     return t;
   }();
   return table;
@@ -327,4 +341,4 @@ inline std::optional<Result> TryConvert(std::wstring input, const std::map<std::
   return Result{original, display, converted};
 }
 
-}  // namespace leancast::converter
+}  // namespace feathercast::converter
