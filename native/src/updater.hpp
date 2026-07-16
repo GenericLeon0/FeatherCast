@@ -3,6 +3,8 @@
 #include "extension_protocol.hpp"
 
 #include <windows.h>
+#include <softpub.h>
+#include <wintrust.h>
 #include <wincrypt.h>
 
 #include <algorithm>
@@ -84,7 +86,10 @@ inline std::optional<Version> ParseVersion(std::wstring value) {
     }
     version.parts[part++] = parsed;
 
-    if (dot == std::wstring::npos) break;
+    if (dot == std::wstring::npos) {
+      start = value.size();
+      break;
+    }
     start = dot + 1;
   }
 
@@ -256,6 +261,177 @@ inline bool VerifyFileSha256(const std::filesystem::path& path, std::string_view
   const auto expected = ExtractSha256Hex(expectedText);
   const auto actual = Sha256FileHex(path);
   return expected && actual && *expected == *actual;
+}
+
+inline std::optional<std::wstring> AuthenticodePublisher(const std::filesystem::path& path) {
+  HCERTSTORE store = nullptr;
+  HCRYPTMSG message = nullptr;
+  DWORD encoding = 0;
+  DWORD contentType = 0;
+  DWORD formatType = 0;
+  if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(),
+                        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                        CERT_QUERY_FORMAT_FLAG_BINARY, 0, &encoding, &contentType,
+                        &formatType, &store, &message, nullptr)) {
+    return std::nullopt;
+  }
+  auto close = [&] {
+    if (message) CryptMsgClose(message);
+    if (store) CertCloseStore(store, 0);
+  };
+
+  DWORD signerSize = 0;
+  if (!CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerSize) || signerSize == 0) {
+    close();
+    return std::nullopt;
+  }
+  std::vector<BYTE> signerBuffer(signerSize);
+  if (!CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, signerBuffer.data(), &signerSize)) {
+    close();
+    return std::nullopt;
+  }
+  const auto* signer = reinterpret_cast<const CMSG_SIGNER_INFO*>(signerBuffer.data());
+  CERT_INFO certificateInfo{};
+  certificateInfo.Issuer = signer->Issuer;
+  certificateInfo.SerialNumber = signer->SerialNumber;
+  PCCERT_CONTEXT certificate = CertFindCertificateInStore(
+      store, encoding, 0, CERT_FIND_SUBJECT_CERT, &certificateInfo, nullptr);
+  if (!certificate) {
+    close();
+    return std::nullopt;
+  }
+
+  const DWORD chars = CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+  std::wstring publisher;
+  if (chars > 1) {
+    publisher.resize(chars);
+    CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
+                       publisher.data(), chars);
+    if (!publisher.empty() && publisher.back() == L'\0') publisher.pop_back();
+  }
+  CertFreeCertificateContext(certificate);
+  close();
+  if (publisher.empty()) return std::nullopt;
+  return publisher;
+}
+
+inline std::optional<std::wstring> AuthenticodeSignerSha256(
+    const std::filesystem::path& path) {
+  HCERTSTORE store = nullptr;
+  HCRYPTMSG message = nullptr;
+  DWORD encoding = 0;
+  DWORD contentType = 0;
+  DWORD formatType = 0;
+  if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(),
+                        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                        CERT_QUERY_FORMAT_FLAG_BINARY, 0, &encoding, &contentType,
+                        &formatType, &store, &message, nullptr)) {
+    return std::nullopt;
+  }
+  auto close = [&] {
+    if (message) CryptMsgClose(message);
+    if (store) CertCloseStore(store, 0);
+  };
+
+  DWORD signerSize = 0;
+  if (!CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerSize) ||
+      signerSize == 0) {
+    close();
+    return std::nullopt;
+  }
+  std::vector<BYTE> signerBuffer(signerSize);
+  if (!CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, signerBuffer.data(),
+                        &signerSize)) {
+    close();
+    return std::nullopt;
+  }
+  const auto* signer =
+      reinterpret_cast<const CMSG_SIGNER_INFO*>(signerBuffer.data());
+  CERT_INFO certificateInfo{};
+  certificateInfo.Issuer = signer->Issuer;
+  certificateInfo.SerialNumber = signer->SerialNumber;
+  PCCERT_CONTEXT certificate = CertFindCertificateInStore(
+      store, encoding, 0, CERT_FIND_SUBJECT_CERT, &certificateInfo, nullptr);
+  if (!certificate) {
+    close();
+    return std::nullopt;
+  }
+
+  BYTE hash[32]{};
+  DWORD hashSize = static_cast<DWORD>(sizeof(hash));
+  const bool hashed =
+      CryptHashCertificate(0, CALG_SHA_256, 0, certificate->pbCertEncoded,
+                           certificate->cbCertEncoded, hash, &hashSize) != FALSE;
+  CertFreeCertificateContext(certificate);
+  close();
+  if (!hashed || hashSize != sizeof(hash)) return std::nullopt;
+
+  static constexpr wchar_t kHex[] = L"0123456789abcdef";
+  std::wstring out;
+  out.reserve(hashSize * 2);
+  for (DWORD i = 0; i < hashSize; ++i) {
+    out.push_back(kHex[(hash[i] >> 4) & 0x0F]);
+    out.push_back(kHex[hash[i] & 0x0F]);
+  }
+  return out;
+}
+
+inline std::vector<std::wstring> ParseSignerThumbprints(
+    const std::wstring& configured) {
+  std::vector<std::wstring> out;
+  std::wstring current;
+  auto finish = [&] {
+    std::wstring normalized;
+    for (const wchar_t ch : current) {
+      if (std::iswxdigit(ch)) {
+        normalized.push_back(static_cast<wchar_t>(std::towlower(ch)));
+      }
+    }
+    if (normalized.size() == 64) out.push_back(std::move(normalized));
+    current.clear();
+  };
+  for (const wchar_t ch : configured) {
+    if (ch == L';' || ch == L',') finish();
+    else current.push_back(ch);
+  }
+  finish();
+  return out;
+}
+
+inline bool VerifyAuthenticodePublisher(const std::filesystem::path& path,
+                                        const std::wstring& expectedPublisher) {
+  WINTRUST_FILE_INFO fileInfo{};
+  fileInfo.cbStruct = sizeof(fileInfo);
+  fileInfo.pcwszFilePath = path.c_str();
+
+  WINTRUST_DATA trustData{};
+  trustData.cbStruct = sizeof(trustData);
+  trustData.dwUIChoice = WTD_UI_NONE;
+  trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+  trustData.dwUnionChoice = WTD_CHOICE_FILE;
+  trustData.pFile = &fileInfo;
+  trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+  trustData.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+  GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+  const LONG status = WinVerifyTrust(nullptr, &policy, &trustData);
+  trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+  WinVerifyTrust(nullptr, &policy, &trustData);
+  if (status != ERROR_SUCCESS) return false;
+  if (expectedPublisher.empty()) return true;
+  const auto publisher = AuthenticodePublisher(path);
+  return publisher && LowerWide(*publisher) == LowerWide(expectedPublisher);
+}
+
+inline bool VerifyAuthenticodeSigner(
+    const std::filesystem::path& path, const std::wstring& expectedPublisher,
+    const std::wstring& allowedThumbprints) {
+  const auto pins = ParseSignerThumbprints(allowedThumbprints);
+  if (pins.empty()) return false;
+  if (!VerifyAuthenticodePublisher(path, expectedPublisher)) return false;
+  const auto thumbprint = AuthenticodeSignerSha256(path);
+  return thumbprint &&
+         std::find(pins.begin(), pins.end(), LowerWide(*thumbprint)) != pins.end();
 }
 
 }  // namespace feathercast::updater

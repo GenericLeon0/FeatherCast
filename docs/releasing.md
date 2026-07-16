@@ -2,16 +2,32 @@
 
 FeatherCast releases are distributed through GitHub Releases for `GenericLeon0/FeatherCast`. The in-app updater checks the latest stable release and expects the Windows installer plus a SHA-256 sidecar file.
 
+## Automated Release (preferred)
+
+Pushing a tag `vX.Y.Z` triggers `.github/workflows/ci.yml`: it builds, runs tests, packages via CPack, generates `.sha256` sidecars, and creates a **draft** GitHub Release with all assets attached. The updater ignores drafts, so verify the draft and publish it manually. The manual flow below remains as fallback.
+
+Release tags require the `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD` secrets plus the `FEATHERCAST_EXPECTED_PUBLISHER` and `FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS` repository variables. The thumbprint variable is a semicolon-separated list of SHA-256 signer-certificate thumbprints; keep the old and new certificates listed together during rotation. CI signs and timestamps the application, plugin host, and installer; the updater rejects installers whose trusted signer certificate is not pinned.
+
 ## Build And Test
 
 Run from a Visual Studio developer PowerShell:
 
 ```powershell
-cmake -S . -B build-native -G "Visual Studio 18 2026" -A x64
-cmake --build build-native --config Release
-ctest --test-dir build-native -C Release
+cmake --preset windows-x64
+cmake --build --preset release
+ctest --preset release
 cpack --config build-native/CPackConfig.cmake -C Release
 ```
+
+Manual release builds must also configure both signer values:
+
+```powershell
+cmake -S . -B build-native -A x64 `
+  "-DFEATHERCAST_EXPECTED_PUBLISHER=<publisher display name>" `
+  "-DFEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS=<sha256 thumbprint>"
+```
+
+A build without a signer thumbprint can check for releases but will not download or launch an installer.
 
 The configured package filename is:
 
@@ -49,7 +65,7 @@ The updater will not run an installer unless the `.sha256` asset exists and matc
 - Tags may be `vX.Y.Z` or `X.Y.Z`.
 - If the user dismisses an automatic update prompt, FeatherCast will not prompt again for that same version.
 - Installers are downloaded to `%LOCALAPPDATA%\FeatherCast\updates`.
-- Update logs are written to `%APPDATA%\FeatherCast\update-log.txt`.
+- Update logs are written to `%LOCALAPPDATA%\FeatherCast\update-log.txt`.
 
 ## Suggested Release Flow
 

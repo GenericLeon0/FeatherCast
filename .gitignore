@@ -18,3 +18,7 @@ _CPack_Packages/
 # Build artifacts
 LeanCast-*.zip
 LeanCast-*.exe
+FeatherCast-*.zip
+FeatherCast-*.exe
+*.sha256
+/FeatherCast.png

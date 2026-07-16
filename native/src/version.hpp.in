@@ -2,3 +2,6 @@
 
 inline constexpr char kFeatherCastVersionUtf8[] = "@PROJECT_VERSION@";
 inline constexpr wchar_t kFeatherCastVersion[] = L"@PROJECT_VERSION@";
+inline constexpr wchar_t kFeatherCastExpectedPublisher[] = L"@FEATHERCAST_EXPECTED_PUBLISHER@";
+inline constexpr wchar_t kFeatherCastAllowedSignerThumbprints[] =
+    L"@FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS@";

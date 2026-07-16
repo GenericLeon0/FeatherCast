@@ -9,6 +9,9 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 - App search across system and per-user Start Menu shortcuts plus AppsFolder entries
 - Open-window switching with foreground restore for minimized windows
 - Token-aware fuzzy search ranked for launcher usage
+- Optional local file/folder indexing and clipboard history
+- Calculator, unit/currency conversion, emoji, symbols, snippets, quicklinks, and web-search prefixes
+- Native out-of-process plugin host with timeouts and crash isolation
 - Lazy shell icon loading with a native PNG icon cache
 - Keyboard-first controls: Up/Down, Enter, Ctrl+Shift+Enter, Esc
 - Configurable global shortcut, default `Alt+Space`
@@ -26,6 +29,8 @@ AI chat and AI provider settings were removed in the native remake.
 | Move selection | `Up` / `Down` |
 | Launch selected app or focus selected window | `Enter` |
 | Launch selected app as administrator | `Ctrl+Shift+Enter` |
+| Open result actions | `Tab`, `Right`, or `Ctrl+K` |
+| Return from actions or a browse view | `Left` or `Esc` |
 | Close overlay | `Esc` |
 | Open Settings | Gear button or tray menu |
 
@@ -35,14 +40,14 @@ The tray icon runs in the background. Left-click opens search; right-click opens
 
 Prerequisites on Windows:
 
-- Visual Studio 2022 with Desktop development with C++
+- A current Visual Studio release with Desktop development with C++
 - CMake 3.22 or newer
 - Optional: NSIS if you want the CPack NSIS installer target
 
 ```powershell
-cmake -S . -B build-native -G "Visual Studio 18 2026" -A x64
-cmake --build build-native --config Release
-ctest --test-dir build-native -C Release
+cmake --preset windows-x64
+cmake --build --preset release
+ctest --preset release
 cpack --config build-native/CPackConfig.cmake -C Release
 ```
 
@@ -52,11 +57,23 @@ Plugin authors should start with [docs/plugin-development.md](docs/plugin-develo
 
 ## Settings and Cache
 
-Runtime data is stored under `%APPDATA%\FeatherCast`:
+Roaming user configuration is stored under `%APPDATA%\FeatherCast`:
 
-- `settings.json` stores launcher preferences, recent usage, appearance settings, and update-check state
-- `icon-cache-native/` stores resolved PNG icons keyed by icon source
-- `update-log.txt` records update checks and installer verification events
+- `settings.json` stores launcher preferences, privacy choices, recent usage, appearance, and update state
+- `snippets.json` stores user-authored snippets
+- `theme.json` stores optional theme overrides
+- `plugins/` contains user-installed native plugins
+
+Machine-local operational data is stored under `%LOCALAPPDATA%\FeatherCast`:
+
+- `feathercast.db` stores the optional file index and user-scoped DPAPI-protected clipboard history
+- `icon-cache-native/` stores resolved PNG icons
+- `updates/` stores verified update installers
+- update and opt-in diagnostic logs
+
+Clipboard history and file indexing are disabled until explicitly enabled in Settings. Settings exposes clipboard retention, file-index limits, custom roots, diagnostics, and data-clearing controls. File indexing defaults to Desktop, Documents, and Downloads when no custom roots are selected.
+
+FeatherCast contacts GitHub Releases for enabled update checks and `open.er-api.com` for cached currency rates. Update installation is disabled in builds that do not contain an allowed Authenticode signer certificate pin. Plugins are native code running with the current user’s permissions and should only be installed from trusted sources.
 
 Older AI-related fields are ignored and are not written back by the native app.
 

@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <ctime>
@@ -22,6 +23,15 @@
 
 namespace feathercast::extensions {
 
+struct PluginHealth {
+  std::wstring id;
+  std::wstring name;
+  std::wstring version;
+  std::filesystem::path directory;
+  bool available = false;
+  int failureStrikes = 0;
+};
+
 class ExtensionManager {
  public:
   ExtensionManager() = default;
@@ -31,6 +41,7 @@ class ExtensionManager {
   ExtensionManager& operator=(const ExtensionManager&) = delete;
 
   void Initialize(std::filesystem::path dataDir, std::filesystem::path exeDir, HWND notifyHwnd, UINT notifyMessage) {
+    stop_.store(false);
     dataDir_ = std::move(dataDir);
     exeDir_ = std::move(exeDir);
     notifyHwnd_ = notifyHwnd;
@@ -56,7 +67,7 @@ class ExtensionManager {
   void Shutdown() {
     {
       std::lock_guard lock(queryMutex_);
-      stop_ = true;
+      stop_.store(true);
       pendingQuery_.reset();
     }
     queryCv_.notify_all();
@@ -67,7 +78,7 @@ class ExtensionManager {
 
     std::lock_guard pluginsLock(pluginsMutex_);
     for (const auto& plugin : plugins_) {
-      plugin->available = false;
+      plugin->available.store(false);
       std::lock_guard ioLock(plugin->ioMutex);
       StopProcess(*plugin);
     }
@@ -75,24 +86,32 @@ class ExtensionManager {
   }
 
   void Reload() {
+    std::vector<std::shared_ptr<Plugin>> oldPlugins;
     {
       std::lock_guard pluginsLock(pluginsMutex_);
-      for (const auto& plugin : plugins_) {
-        plugin->available = false;
-        std::lock_guard ioLock(plugin->ioMutex);
-        StopProcess(*plugin);
-      }
-      plugins_.clear();
-
-      auto discovery = DiscoverManifests(dataDir_, exeDir_);
-      for (const auto& error : discovery.errors) Log(error);
-      for (auto& manifest : discovery.manifests) {
-        auto plugin = std::make_shared<Plugin>();
-        plugin->manifest = std::move(manifest);
-        plugins_.push_back(std::move(plugin));
-      }
-      Log(L"Loaded " + std::to_wstring(plugins_.size()) + L" extension(s)");
+      oldPlugins.swap(plugins_);
     }
+    for (const auto& plugin : oldPlugins) {
+      plugin->available.store(false);
+      std::lock_guard ioLock(plugin->ioMutex);
+      StopProcess(*plugin);
+    }
+
+    auto discovery = DiscoverManifests(dataDir_, exeDir_);
+    for (const auto& error : discovery.errors) Log(error);
+    std::vector<std::shared_ptr<Plugin>> loaded;
+    loaded.reserve(discovery.manifests.size());
+    for (auto& manifest : discovery.manifests) {
+      auto plugin = std::make_shared<Plugin>();
+      plugin->manifest = std::move(manifest);
+      loaded.push_back(std::move(plugin));
+    }
+    const size_t loadedCount = loaded.size();
+    {
+      std::lock_guard pluginsLock(pluginsMutex_);
+      plugins_ = std::move(loaded);
+    }
+    Log(L"Loaded " + std::to_wstring(loadedCount) + L" extension(s)");
 
     {
       std::lock_guard cacheLock(cacheMutex_);
@@ -110,6 +129,7 @@ class ExtensionManager {
     {
       std::lock_guard queryLock(queryMutex_);
       if (runningQuery_ == query) {
+        runningGeneration_ = generation;
         latestRequestedGeneration_ = generation;
         return;
       }
@@ -130,6 +150,23 @@ class ExtensionManager {
     return {};
   }
 
+  std::vector<PluginHealth> Health() {
+    std::vector<PluginHealth> out;
+    std::lock_guard pluginsLock(pluginsMutex_);
+    out.reserve(plugins_.size());
+    for (const auto& plugin : plugins_) {
+      out.push_back({
+          plugin->manifest.id,
+          plugin->manifest.name,
+          plugin->manifest.version,
+          plugin->manifest.directory,
+          plugin->available.load(),
+          plugin->failureStrikes.load(),
+      });
+    }
+    return out;
+  }
+
   std::optional<ActivationResponse> Activate(const QueryResultItem& item,
                                              std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
     std::shared_ptr<Plugin> plugin;
@@ -142,7 +179,7 @@ class ExtensionManager {
         }
       }
     }
-    if (!plugin || !plugin->available) return std::nullopt;
+    if (!plugin || !plugin->available.load()) return std::nullopt;
 
     std::string response;
     if (!SendRequest(*plugin, BuildActivateRequestJson(plugin->manifest, dataDir_, item), timeout, response)) {
@@ -154,9 +191,10 @@ class ExtensionManager {
  private:
   struct Plugin {
     Manifest manifest;
-    bool available = true;
-    int failureStrikes = 0;
+    std::atomic<bool> available = true;
+    std::atomic<int> failureStrikes = 0;
     HANDLE process = nullptr;
+    HANDLE job = nullptr;
     HANDLE stdinWrite = nullptr;
     HANDLE stdoutRead = nullptr;
     std::mutex ioMutex;
@@ -204,12 +242,13 @@ class ExtensionManager {
         {
           std::unique_lock lock(queryMutex_);
           queryCv_.wait(lock, [&] {
-            return pendingQuery_.has_value() || stop_ || stopToken.stop_requested();
+            return pendingQuery_.has_value() || stop_.load() || stopToken.stop_requested();
           });
-          if (stop_ || stopToken.stop_requested()) return;
+          if (stop_.load() || stopToken.stop_requested()) return;
           pending = std::move(*pendingQuery_);
           pendingQuery_.reset();
           runningQuery_ = pending.query;
+          runningGeneration_ = pending.generation;
         }
 
         auto results = QueryPlugins(pending.query, stopToken);
@@ -222,7 +261,7 @@ class ExtensionManager {
         bool newest = false;
         {
           std::lock_guard queryLock(queryMutex_);
-          newest = pending.generation == latestRequestedGeneration_;
+          newest = runningQuery_ == pending.query && runningGeneration_ == latestRequestedGeneration_;
           if (runningQuery_ == pending.query) runningQuery_.clear();
         }
         if (newest && notifyHwnd_) PostMessageW(notifyHwnd_, notifyMessage_, 0, 0);
@@ -232,27 +271,50 @@ class ExtensionManager {
 
   std::vector<QueryResultItem> QueryPlugins(const std::wstring& query, std::stop_token stopToken) {
     std::vector<QueryResultItem> results;
-    std::lock_guard pluginsLock(pluginsMutex_);
-    for (const auto& plugin : plugins_) {
-      if (stopToken.stop_requested() || stop_) break;
-      if (!plugin->available) continue;
+    std::vector<std::shared_ptr<Plugin>> plugins;
+    {
+      std::lock_guard pluginsLock(pluginsMutex_);
+      plugins = plugins_;
+    }
 
-      std::string response;
-      if (!SendRequest(*plugin, BuildQueryRequestJson(plugin->manifest, dataDir_, query, kDefaultQueryLimit),
-                       std::chrono::milliseconds(250), response)) {
-        continue;
-      }
+    std::mutex resultsMutex;
+    std::atomic<size_t> nextPlugin = 0;
+    std::vector<std::jthread> workers;
+    const size_t workerCount = std::min<size_t>(4, plugins.size());
+    workers.reserve(workerCount);
+    for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
+      workers.emplace_back([&](std::stop_token workerStop) {
+        for (;;) {
+          const size_t pluginIndex = nextPlugin.fetch_add(1, std::memory_order_relaxed);
+          if (pluginIndex >= plugins.size()) return;
+          const auto& plugin = plugins[pluginIndex];
+        if (workerStop.stop_requested() || stopToken.stop_requested() || stop_.load() ||
+            !plugin->available.load()) {
+            continue;
+        }
 
-      auto parsed = ParseQueryResponse(response, kDefaultQueryLimit);
-      if (!parsed) {
-        Log(plugin->manifest.id + L": invalid query response");
-        continue;
-      }
-      for (auto& item : parsed->items) {
-        item.pluginId = plugin->manifest.id;
-        item.pluginName = plugin->manifest.name;
-        results.push_back(std::move(item));
-      }
+        std::string response;
+        if (!SendRequest(*plugin, BuildQueryRequestJson(plugin->manifest, dataDir_, query, kDefaultQueryLimit),
+                         std::chrono::milliseconds(250), response)) {
+            continue;
+        }
+
+        auto parsed = ParseQueryResponse(response, kDefaultQueryLimit);
+        if (!parsed) {
+          Log(plugin->manifest.id + L": invalid query response");
+            continue;
+        }
+        std::lock_guard resultsLock(resultsMutex);
+        for (auto& item : parsed->items) {
+          item.pluginId = plugin->manifest.id;
+          item.pluginName = plugin->manifest.name;
+          results.push_back(std::move(item));
+        }
+        }
+      });
+    }
+    for (auto& worker : workers) {
+      if (worker.joinable()) worker.join();
     }
 
     std::sort(results.begin(), results.end(), [](const QueryResultItem& a, const QueryResultItem& b) {
@@ -263,7 +325,7 @@ class ExtensionManager {
   }
 
   bool EnsureProcess(Plugin& plugin) {
-    if (!plugin.available) return false;
+    if (!plugin.available.load()) return false;
     if (ProcessRunning(plugin.process)) return true;
 
     StopProcess(plugin);
@@ -291,17 +353,44 @@ class ExtensionManager {
     childStderr = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = childStdinRead;
-    startup.hStdOutput = childStdoutWrite;
-    startup.hStdError = childStderr ? childStderr : childStdoutWrite;
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = childStdinRead;
+    startup.StartupInfo.hStdOutput = childStdoutWrite;
+    startup.StartupInfo.hStdError = childStderr ? childStderr : childStdoutWrite;
+
+    SIZE_T attributesSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);
+    std::vector<BYTE> attributesBuffer(attributesSize);
+    startup.lpAttributeList =
+        reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attributesBuffer.data());
+    HANDLE inheritedHandles[] = {
+      childStdinRead,
+      childStdoutWrite,
+      startup.StartupInfo.hStdError,
+    };
+    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attributesSize) ||
+        !UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inheritedHandles, sizeof(inheritedHandles), nullptr, nullptr)) {
+      if (startup.lpAttributeList) DeleteProcThreadAttributeList(startup.lpAttributeList);
+      CloseHandleIfSet(childStdinRead);
+      CloseHandleIfSet(parentStdinWrite);
+      CloseHandleIfSet(parentStdoutRead);
+      CloseHandleIfSet(childStdoutWrite);
+      CloseHandleIfSet(childStderr);
+      MarkUnavailable(plugin, L"failed to restrict plugin host handle inheritance");
+      return false;
+    }
 
     PROCESS_INFORMATION process{};
     std::wstring command = QuoteCommandArg(hostPath) + L" " + QuoteCommandArg(plugin.manifest.dllPath);
     const BOOL created = CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, TRUE,
-                                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+                                        CREATE_NO_WINDOW | CREATE_SUSPENDED |
+                                            EXTENDED_STARTUPINFO_PRESENT,
+                                        nullptr, nullptr,
+                                        &startup.StartupInfo, &process);
+    DeleteProcThreadAttributeList(startup.lpAttributeList);
 
     CloseHandleIfSet(childStdinRead);
     CloseHandleIfSet(childStdoutWrite);
@@ -314,7 +403,40 @@ class ExtensionManager {
       return false;
     }
 
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    limits.BasicLimitInformation.ActiveProcessLimit = 1;
+    limits.ProcessMemoryLimit = 256ull * 1024ull * 1024ull;
+    if (!job ||
+        !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                 sizeof(limits)) ||
+        !AssignProcessToJobObject(job, process.hProcess)) {
+      if (job) CloseHandle(job);
+      TerminateProcess(process.hProcess, 0);
+      WaitForSingleObject(process.hProcess, 1000);
+      CloseHandleIfSet(process.hThread);
+      CloseHandleIfSet(process.hProcess);
+      CloseHandleIfSet(parentStdinWrite);
+      CloseHandleIfSet(parentStdoutRead);
+      MarkUnavailable(plugin, L"failed to apply plugin host resource limits");
+      return false;
+    }
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+      CloseHandle(job);
+      TerminateProcess(process.hProcess, 0);
+      WaitForSingleObject(process.hProcess, 1000);
+      CloseHandleIfSet(process.hThread);
+      CloseHandleIfSet(process.hProcess);
+      CloseHandleIfSet(parentStdinWrite);
+      CloseHandleIfSet(parentStdoutRead);
+      MarkUnavailable(plugin, L"failed to start constrained plugin host");
+      return false;
+    }
     CloseHandleIfSet(process.hThread);
+    plugin.job = job;
     plugin.process = process.hProcess;
     plugin.stdinWrite = parentStdinWrite;
     plugin.stdoutRead = parentStdoutRead;
@@ -377,24 +499,24 @@ class ExtensionManager {
   }
 
   void RecordRequestSuccess(Plugin& plugin) {
-    plugin.failureStrikes = 0;
+    plugin.failureStrikes.store(0);
   }
 
   void RecordRequestFailure(Plugin& plugin, const std::wstring& reason) {
-    plugin.failureStrikes += 1;
+    const int strikes = plugin.failureStrikes.fetch_add(1) + 1;
     Log(plugin.manifest.id + L": " + reason + L" (strike " +
-        std::to_wstring(plugin.failureStrikes) + L"/3)");
+        std::to_wstring(strikes) + L"/3)");
     StopProcess(plugin);
-    if (plugin.failureStrikes >= 3) {
-      plugin.available = false;
+    if (strikes >= 3) {
+      plugin.available.store(false);
       Log(plugin.manifest.id + L": disabled after repeated plugin host failures");
     }
   }
 
   void MarkUnavailable(Plugin& plugin, const std::wstring& reason) {
     Log(plugin.manifest.id + L": " + reason);
-    plugin.available = false;
-    plugin.failureStrikes = 3;
+    plugin.available.store(false);
+    plugin.failureStrikes.store(3);
     StopProcess(plugin);
   }
 
@@ -408,6 +530,7 @@ class ExtensionManager {
       }
       CloseHandleIfSet(plugin.process);
     }
+    CloseHandleIfSet(plugin.job);
   }
 
   void Log(const std::wstring& message) const {
@@ -438,8 +561,9 @@ class ExtensionManager {
   std::condition_variable queryCv_;
   std::optional<PendingQuery> pendingQuery_;
   std::wstring runningQuery_;
+  unsigned long long runningGeneration_ = 0;
   unsigned long long latestRequestedGeneration_ = 0;
-  bool stop_ = false;
+  std::atomic<bool> stop_ = false;
 };
 
 }  // namespace feathercast::extensions

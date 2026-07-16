@@ -32,9 +32,10 @@ build/                     # Generated icon assets used by native resources
 
 ## Behavior Notes
 
-- Settings are stored in `%APPDATA%\FeatherCast\settings.json`. Only native-supported fields are saved: `shortcut`, `recentApps`, `compactMode`, `syncAccentColor`, `customAccentColor`, and `startOnStartup`.
+- Settings, snippets, themes, and user plugins are stored under `%APPDATA%\FeatherCast`.
+- Operational data is stored under `%LOCALAPPDATA%\FeatherCast`; clipboard history and file indexing are explicit opt-in features backed by `feathercast.db`.
 - App discovery scans Start Menu `.lnk` files and AppsFolder shell entries, then de-duplicates by id/name.
-- Icons are lazy-loaded from the Windows Shell and cached as PNG files under `%APPDATA%\FeatherCast\icon-cache-native`.
+- Icons are lazy-loaded from the Windows Shell and cached as PNG files under `%LOCALAPPDATA%\FeatherCast\icon-cache-native`.
 - The low-level keyboard hook handles both global shortcut monitoring and settings shortcut recording.
 - The app is single-instance via a named mutex; a second launch asks the existing window to open search.
 

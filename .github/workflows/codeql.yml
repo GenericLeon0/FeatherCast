@@ -1,0 +1,37 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build-codeql -A x64 -DFEATHERCAST_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-codeql --config Release
+
+      - uses: github/codeql-action/analyze@v3

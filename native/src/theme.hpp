@@ -20,8 +20,7 @@ struct Color {
 };
 
 struct Theme {
-  // Obsidian font stack: Segoe UI Variable (Win11 optical scaling) with fallbacks.
-  std::wstring fontFamily = L"Segoe UI Variable Text, Segoe UI Variable, Inter, Segoe UI";
+  std::wstring fontFamily = L"Segoe UI Variable Text";
   // Obsidian dark panel at ~85 % opacity over real DirectComposition transparency.
   Color overlayBackground{0.063f, 0.063f, 0.071f, 0.85f};
   Color settingsBackground{0.063f, 0.063f, 0.071f, 0.85f};

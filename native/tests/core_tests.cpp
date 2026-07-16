@@ -1,26 +1,36 @@
 ﻿#include "calculator.hpp"
 #include "converter.hpp"
+#include "background_executor.hpp"
 #include "core.hpp"
+#include "discovery.hpp"
 #include "emoji.hpp"
 #include "extension_protocol.hpp"
+#include "json.hpp"
 #include "run_command.hpp"
+#include "settings.hpp"
 #include "shortcut.hpp"
 #include "snippets.hpp"
 #include "storage.hpp"
 #include "symbols.hpp"
 #include "theme.hpp"
+#include "text_edit.hpp"
 #include "updater.hpp"
+#include "test_framework.hpp"
 
-#include <cassert>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <set>
+#include <string_view>
 
 using feathercast::core::ScoreItem;
 using feathercast::core::ScoreText;
 using feathercast::core::Search;
+using feathercast::core::SearchOptions;
+using feathercast::core::SearchPrepared;
 using feathercast::core::SearchItem;
 using feathercast::calculator::TryEvaluate;
 using feathercast::converter::TryConvert;
@@ -48,6 +58,11 @@ using feathercast::updater::SelectSha256Asset;
 using feathercast::updater::VerifyFileSha256;
 
 namespace {
+
+std::filesystem::path TestTempRoot(std::wstring_view name) {
+  return std::filesystem::temp_directory_path() /
+         (std::wstring(name) + L"-" + std::to_wstring(GetCurrentProcessId()));
+}
 
 PressedModifiers Mods(bool ctrl = false, bool alt = false, bool shift = false, bool win = false) {
   return {ctrl, alt, shift, win};
@@ -89,10 +104,42 @@ void WriteUtf8(const std::filesystem::path& path, const std::string& text) {
 }  // namespace
 
 int main() {
+  {
+    feathercast::background::Executor executor;
+    executor.Start(1);
+    std::promise<int> completed;
+    auto result = completed.get_future();
+    assert(executor.Submit([&](std::stop_token) { completed.set_value(42); }));
+    assert(result.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    assert(result.get() == 42);
+    executor.Shutdown();
+  }
+  {
+    feathercast::background::Executor executor;
+    executor.Start(1);
+    std::atomic<int> completed = 0;
+    for (int i = 0; i < 5; ++i) {
+      assert(executor.Submit([&](std::stop_token) { completed.fetch_add(1); }));
+    }
+    executor.Shutdown(true);
+    assert(completed.load() == 5);
+  }
+
   assert(ScoreText(L"terminal", L"Terminal") == 5000);
   assert(ScoreText(L"term", L"Terminal") > ScoreText(L"trm", L"Terminal"));
   assert(ScoreText(L"calc", L"Calculator") > 0);
   assert(ScoreText(L"xyz", L"Calculator") < 0);
+  assert(ScoreText(L"uber", L"Über") > 0);
+  assert(ScoreText(L"cafe", L"Cafe\u0301") > 0);
+
+  {
+    std::wstring emojiText = L"A\U0001F600B";
+    size_t position = 3;
+    assert(feathercast::text_edit::PreviousCodePoint(emojiText, position) == 1);
+    assert(feathercast::text_edit::ErasePrevious(emojiText, position));
+    assert(emojiText == L"AB");
+    assert(position == 1);
+  }
 
   {
     const auto simple = TryEvaluate(L"9+9");
@@ -243,8 +290,15 @@ int main() {
     const auto extracted = ExtractSha256Hex(
         "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  file.txt");
     assert(extracted && *extracted == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const auto signerPins = feathercast::updater::ParseSignerThumbprints(
+        L"BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD;"
+        L"invalid");
+    assert(signerPins.size() == 1);
+    assert(signerPins.front() ==
+           L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert(feathercast::updater::ParseSignerThumbprints(L"").empty());
 
-    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastUpdaterCoreTests";
+    const auto tempRoot = TestTempRoot(L"FeatherCastUpdaterCoreTests");
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
     WriteUtf8(tempRoot / L"hash.txt", "abc");
@@ -252,11 +306,12 @@ int main() {
                             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
     assert(!VerifyFileSha256(tempRoot / L"hash.txt",
                              "0000000000000000000000000000000000000000000000000000000000000000"));
+    assert(!feathercast::updater::VerifyAuthenticodePublisher(tempRoot / L"hash.txt", L""));
     std::filesystem::remove_all(tempRoot, ec);
   }
 
   {
-    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastExtensionCoreTests";
+    const auto tempRoot = TestTempRoot(L"FeatherCastExtensionCoreTests");
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
 
@@ -349,7 +404,7 @@ int main() {
   }
 
   {
-    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastPhase5StorageTests";
+    const auto tempRoot = TestTempRoot(L"FeatherCastPhase5StorageTests");
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
 
@@ -366,6 +421,19 @@ int main() {
     assert(loadedFiles.front().name == L"Notes");
     assert(loadedFiles.front().isDirectory);
 
+    files = {
+      {L"C:\\Users\\Leon\\Downloads\\setup.exe", L"setup.exe", false,
+       L"C:\\Users\\Leon\\Downloads\\setup.exe", 12, 84, 101},
+      {L"C:\\Users\\Leon\\Documents\\todo.txt", L"todo.txt", false,
+       L"C:\\Users\\Leon\\Documents\\todo.txt", 13, 21, 101},
+    };
+    assert(storage.UpdateFileIndex(files));
+    const auto updatedFiles = storage.LoadFileIndex();
+    assert(updatedFiles.size() == 2);
+    assert(updatedFiles.front().name == L"setup.exe");
+    assert(updatedFiles.front().size == 84);
+    assert(updatedFiles.back().name == L"todo.txt");
+
     assert(storage.AddClipboardEntry(L"first", L"first", 1, 2));
     assert(storage.AddClipboardEntry(L"second", L"second", 2, 2));
     assert(storage.AddClipboardEntry(L"first", L"first", 3, 2));
@@ -378,6 +446,53 @@ int main() {
     assert(storage.LoadClipboardHistory(10).empty());
 
     storage.Close();
+    WriteUtf8(tempRoot / L"corrupt.db", "not a sqlite database");
+    feathercast::storage::Storage recovered;
+    assert(recovered.Open(tempRoot / L"corrupt.db"));
+    assert(recovered.RecoveredFromCorruption());
+    assert(!recovered.QuarantinedPath().empty());
+    assert(std::filesystem::exists(recovered.QuarantinedPath()));
+    assert(recovered.LoadClipboardHistory().empty());
+    recovered.Close();
+
+    const auto legacyPath = tempRoot / L"legacy.db";
+    sqlite3* legacyDb = nullptr;
+    assert(sqlite3_open16(legacyPath.c_str(), &legacyDb) == SQLITE_OK);
+    assert(sqlite3_exec(
+               legacyDb,
+               "CREATE TABLE clipboard_history ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               "text TEXT NOT NULL,"
+               "preview TEXT NOT NULL,"
+               "captured_at INTEGER NOT NULL);"
+               "INSERT INTO clipboard_history(text,preview,captured_at) "
+               "VALUES('legacy secret','legacy preview',42);"
+               "PRAGMA user_version=1;",
+               nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(legacyDb);
+
+    feathercast::storage::Storage migrated;
+    assert(migrated.Open(legacyPath));
+    const auto migratedClips = migrated.LoadClipboardHistory();
+    assert(migratedClips.size() == 1);
+    assert(migratedClips.front().text == L"legacy secret");
+    assert(std::filesystem::exists(legacyPath.wstring() + L".pre-v2.bak"));
+    migrated.Close();
+
+    assert(sqlite3_open16(legacyPath.c_str(), &legacyDb) == SQLITE_OK);
+    sqlite3_stmt* encryptedRow = nullptr;
+    assert(sqlite3_prepare_v2(
+               legacyDb,
+               "SELECT text, encrypted FROM clipboard_history LIMIT 1;",
+               -1, &encryptedRow, nullptr) == SQLITE_OK);
+    assert(sqlite3_step(encryptedRow) == SQLITE_ROW);
+    assert(sqlite3_column_int(encryptedRow, 1) == 1);
+    const auto* storedCiphertext =
+        static_cast<const wchar_t*>(sqlite3_column_text16(encryptedRow, 0));
+    assert(storedCiphertext && std::wstring(storedCiphertext) != L"legacy secret");
+    sqlite3_finalize(encryptedRow);
+    sqlite3_close(legacyDb);
+
     std::filesystem::remove_all(tempRoot, ec);
   }
 
@@ -412,7 +527,7 @@ int main() {
     assert(scheme->kind == feathercast::run_command::Kind::OpenTarget);
     assert(scheme->target == L"ms-settings:display");
 
-    const auto pathRoot = std::filesystem::temp_directory_path() / L"FeatherCastRunCommandTests";
+    const auto pathRoot = TestTempRoot(L"FeatherCastRunCommandTests");
     std::filesystem::create_directories(pathRoot);
     const auto pathCommand = feathercast::run_command::Classify(L">\"" + pathRoot.wstring() + L"\"");
     assert(pathCommand);
@@ -511,6 +626,22 @@ int main() {
   const auto clipboardHit = Search(L"copied value", items);
   assert(!clipboardHit.empty() && clipboardHit.front() == 4);
 
+  {
+    std::vector<feathercast::core::PreparedSearchItem> prepared;
+    for (const auto& item : items) prepared.push_back(feathercast::core::PrepareSearchItem(item));
+    SearchOptions options;
+    options.limit = 2;
+    const auto limited = SearchPrepared(L"i", prepared, {}, options);
+    const auto full = Search(L"i", items);
+    assert(limited.size() == std::min<size_t>(2, full.size()));
+    assert(std::equal(limited.begin(), limited.end(), full.begin()));
+
+    std::atomic<unsigned long long> latestGeneration = 2;
+    options.generation = 1;
+    options.latestGeneration = &latestGeneration;
+    assert(SearchPrepared(L"terminal", prepared, {}, options).empty());
+  }
+
   const double base = ScoreItem(L"notepad", notepad, {});
   const double recent = ScoreItem(L"notepad", notepad, {L"notepad"});
   assert(recent > base);
@@ -544,6 +675,174 @@ int main() {
   visualStudioCode.usageCount = 20;
   visualStudioCode.lastUsed = 1000;
   assert(ScoreItem(L"code", visualStudioCode, {L"vscode"}) > ScoreItem(L"code", codeBlocks, {}));
+
+  {
+    const long long now = 1750000000;
+
+    // A frequently used, recently launched app must beat a cold prefix match
+    // even without a matching keyword.
+    SearchItem dailyDriver;
+    dailyDriver.id = L"vscode-daily";
+    dailyDriver.kind = L"app";
+    dailyDriver.name = L"Visual Studio Code";
+    dailyDriver.usageCount = 30;
+    dailyDriver.lastUsed = now;
+    assert(ScoreItem(L"code", dailyDriver, {L"vscode-daily"}, now) > ScoreItem(L"code", codeBlocks, {}, now));
+
+    // Recency decays over time.
+    SearchItem aged = dailyDriver;
+    const double fresh = ScoreItem(L"code", aged, {}, now);
+    aged.lastUsed = now - 30LL * 86400;
+    const double monthOld = ScoreItem(L"code", aged, {}, now);
+    aged.lastUsed = now - 365LL * 86400;
+    const double yearOld = ScoreItem(L"code", aged, {}, now);
+    assert(fresh > monthOld && monthOld > yearOld);
+
+    // Frequency keeps counting past the old cap of 20, with diminishing returns.
+    auto scoreWithUsage = [&](int usage) {
+      SearchItem item = dailyDriver;
+      item.usageCount = usage;
+      return ScoreItem(L"code", item, {}, now);
+    };
+    assert(scoreWithUsage(100) > scoreWithUsage(20));
+    assert(scoreWithUsage(10) - scoreWithUsage(5) > scoreWithUsage(105) - scoreWithUsage(100));
+
+    // Exact-name matches stay dominant over any usage-boosted prefix match.
+    SearchItem exactCode;
+    exactCode.id = L"exact-code";
+    exactCode.kind = L"app";
+    exactCode.name = L"Code";
+    SearchItem hotPrefix = dailyDriver;
+    hotPrefix.name = L"Code Insiders";
+    hotPrefix.usageCount = 500;
+    assert(ScoreItem(L"code", exactCode, {}, now) > ScoreItem(L"code", hotPrefix, {L"vscode-daily"}, now));
+
+    // camelCase boundaries earn boundary credit.
+    assert(ScoreText(L"fb", L"FooBar") > ScoreText(L"fb", L"foobar"));
+    assert(ScoreText(L"bar", L"FooBar") > ScoreText(L"bar", L"xxxbar"));
+  }
+
+  {
+    using feathercast::json::Parse;
+    using feathercast::json::Value;
+
+    const auto doc = Parse(R"({"a": [1, -2.5e2, "xy"], "b": {"c": true, "d": null}})");
+    assert(doc && doc->type == Value::Type::Object);
+    const Value* a = doc->Find("a");
+    assert(a && a->type == Value::Type::Array && a->array.size() == 3);
+    assert(a->array[0].number == 1 && a->array[1].number == -250);
+    assert(a->array[2].str == "xy");
+    const Value* b = doc->Find("b");
+    assert(b && b->Find("c")->boolean && b->Find("d")->type == Value::Type::Null);
+
+    // \uXXXX escapes decode to UTF-8, including surrogate pairs. The inputs are
+    // built with an explicit backslash char to keep this source file pure ASCII.
+    const char BS = 0x5C;
+    const std::string umlaut = std::string("\"x") + BS + "u00e4\"";      // "xä"
+    assert(Parse(umlaut)->str == "x\xC3\xA4");                            // a-umlaut in UTF-8
+    const std::string smiley = std::string("\"") + BS + "ud83d" + BS + "ude00\"";  // "😀"
+    assert(Parse(smiley)->str == "\xF0\x9F\x98\x80");                     // U+1F600 in UTF-8
+
+    assert(!Parse(""));
+    assert(!Parse("{"));
+    assert(!Parse(R"({"a": 1,})"));
+    assert(!Parse(R"({"a": "unterminated)"));
+    assert(!Parse("{} trailing"));
+    assert(Parse("{}") && Parse("[]") && Parse("  42  "));
+  }
+
+  {
+    namespace fs = feathercast::settings;
+
+    fs::Settings original;
+    original.shortcut = L"Ctrl+Shift+P";
+    original.recentApps = {L"app:one", L"app:two"};
+    original.pinnedApps = {L"app:pinned"};
+    original.hiddenApps = {L"app:hidden"};
+    original.appAliases[std::wstring(L"vs") + wchar_t(0xE4)] = L"line1\nline2\t\"quoted\"";  // key with a-umlaut
+    original.usageStats[L"app:one"] = {42, 1750000000};
+    original.compactMode = true;
+    original.animationsEnabled = false;
+    original.customAccentColor = L"#ff0000";
+    original.lastUpdateAttempt = 1234567890000;
+    original.lastUpdateCheck = 1234567890123;
+    original.dismissedUpdateVersion = L"1.2.3";
+    original.overlayWidth = 800;
+    original.maxResults = 120;
+    original.showStoreApps = false;
+    original.privacyConsentVersion = 1;
+    original.clipboardHistoryEnabled = true;
+    original.clipboardHistoryLimit = 25;
+    original.fileIndexEnabled = true;
+    original.fileIndexMaxEntries = 2500;
+    original.fileIndexRoots = {L"C:\\Work", L"D:\\Projects"};
+    original.diagnosticsEnabled = true;
+    original.quicklinks.push_back({L"docs", L"My \"Docs\"", L"C:\\Users\\Leon\\Docs"});
+
+    const fs::Settings copy = fs::ParseSettings(fs::SerializeSettings(original));
+    assert(copy.shortcut == original.shortcut);
+    assert(copy.recentApps == original.recentApps);
+    assert(copy.pinnedApps == original.pinnedApps);
+    assert(copy.hiddenApps == original.hiddenApps);
+    assert(copy.appAliases == original.appAliases);
+    assert(copy.usageStats.size() == 1);
+    assert(copy.usageStats.at(L"app:one").launches == 42);
+    assert(copy.usageStats.at(L"app:one").lastUsed == 1750000000);
+    assert(copy.compactMode == original.compactMode);
+    assert(copy.animationsEnabled == original.animationsEnabled);
+    assert(copy.customAccentColor == original.customAccentColor);
+    assert(copy.lastUpdateAttempt == original.lastUpdateAttempt);
+    assert(copy.lastUpdateCheck == original.lastUpdateCheck);
+    assert(copy.dismissedUpdateVersion == original.dismissedUpdateVersion);
+    assert(copy.overlayWidth == original.overlayWidth);
+    assert(copy.maxResults == original.maxResults);
+    assert(copy.showStoreApps == original.showStoreApps);
+    assert(copy.privacyConsentVersion == original.privacyConsentVersion);
+    assert(copy.clipboardHistoryEnabled == original.clipboardHistoryEnabled);
+    assert(copy.clipboardHistoryLimit == original.clipboardHistoryLimit);
+    assert(copy.fileIndexEnabled == original.fileIndexEnabled);
+    assert(copy.fileIndexMaxEntries == original.fileIndexMaxEntries);
+    assert(copy.fileIndexRoots == original.fileIndexRoots);
+    assert(copy.diagnosticsEnabled == original.diagnosticsEnabled);
+    assert(copy.searchEngines == original.searchEngines);
+    assert(copy.quicklinks.size() == 1);
+    assert(copy.quicklinks[0].keyword == L"docs");
+    assert(copy.quicklinks[0].name == L"My \"Docs\"");
+    assert(copy.quicklinks[0].target == L"C:\\Users\\Leon\\Docs");
+
+    // Malformed/edge inputs fall back to defaults without crashing.
+    assert(fs::ParseSettings("").shortcut == L"Alt+Space");
+    assert(fs::ParseSettings("{}").maxResults == 200);
+    assert(!fs::ParseSettings("{}").clipboardHistoryEnabled);
+    assert(!fs::ParseSettings("{}").fileIndexEnabled);
+    assert(fs::ParseSettings(R"({"shortcut": "Alt)").shortcut == L"Alt+Space");
+    // A key name inside a string value must not be mistaken for the key
+    // (the old substring scanner got this wrong).
+    const auto tricky = fs::ParseSettings(R"({"shortcut": "\"recentApps\": [\"fake\"]"})");
+    assert(tricky.recentApps.empty());
+  }
+
+  {
+    namespace fd = feathercast::discovery;
+
+    assert(fd::ShouldSkipName(L"Uninstall Foo"));
+    assert(fd::ShouldSkipName(L"Hilfe zu X"));
+    assert(!fd::ShouldSkipName(L"Notepad"));
+    assert(fd::NameKey(L"Foo.lnk") == L"foo");
+    assert(fd::CleanName(L"  Bar.lnk ") == L"Bar");
+    assert(fd::BaseNameNoExt(L"C:\\Tools\\wt.exe") == L"wt");
+    assert(fd::IsSystemEssentialName(L"Windows Terminal"));
+    assert(!fd::IsSystemEssentialName(L"Notepad"));
+
+    const auto unique = fd::UniqueKeywords({L"Visual Studio", L"visual x", L"a"});
+    assert(unique == (std::vector<std::wstring>{L"visual", L"studio"}));  // dedup + drop 1-char words
+
+    const auto terminalKeywords = fd::KeywordsFor(L"Windows Terminal", L"C:\\wt.exe", L"");
+    const auto has = [&](const wchar_t* word) {
+      return std::find(terminalKeywords.begin(), terminalKeywords.end(), word) != terminalKeywords.end();
+    };
+    assert(has(L"wt") && has(L"shell") && has(L"terminal"));
+  }
 
   {
     ShortcutRecorder recorder;

@@ -2,6 +2,8 @@
 
 FeatherCast plugins are native Windows DLLs loaded through `FeatherCastPluginHost.exe`. The host process isolates plugin crashes from the launcher process and communicates with each plugin using one-line JSON requests and responses over standard input/output.
 
+Plugins are trusted native code. Process isolation protects FeatherCast from many crashes, but plugins still run with the current Windows user’s filesystem and network permissions. Install only plugins whose source and publisher you trust.
+
 ## Install Locations
 
 FeatherCast discovers plugins from both of these folders:
@@ -131,6 +133,8 @@ v1 plugins are still accepted. The host keeps the native ABI shape unchanged and
 - A response must be no larger than 1 MiB.
 - Plugin exceptions and access violations are caught by the host and returned as errors.
 - If a plugin process exits, times out, or has host I/O failures, FeatherCast restarts the plugin host and records a strike. Three consecutive strikes mark the plugin unavailable until extensions are reloaded. A successful request resets the strike count.
+- FeatherCast runs at most four plugin queries concurrently.
+- Each plugin host is assigned to a kill-on-close Windows Job Object with one active process and a 256 MiB process-memory limit.
 - Logs are written to `%APPDATA%\FeatherCast\extension-log.txt`.
 
 ## Testing

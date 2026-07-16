@@ -41,7 +41,12 @@ FEATHERCAST_EXTENSION_EXPORT uint32_t FeatherCastExtensionHandleJson(const char*
   if (Contains(requestUtf8, "\"query\":\"throw\"")) {
     throw std::runtime_error("test exception");
   }
-  if (Contains(requestUtf8, "\"query\":\"slow\"")) {
+  if (Contains(requestUtf8, "\"query\":\"slow")) {
+    Sleep(1000);
+    return WriteResponse("{\"items\":[]}", responseUtf8, responseCapacity);
+  }
+  if (Contains(requestUtf8, "\"query\":\"parallel\"") &&
+      Contains(requestUtf8, "\"pluginId\":\"slow-")) {
     Sleep(1000);
     return WriteResponse("{\"items\":[]}", responseUtf8, responseCapacity);
   }

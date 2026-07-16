@@ -114,14 +114,35 @@ inline std::string UnescapeJsonString(std::string_view value) {
 }
 
 inline std::optional<size_t> FindJsonValue(const std::string& json, const std::string& key) {
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return std::nullopt;
-  pos = json.find(':', pos + marker.size());
-  if (pos == std::string::npos) return std::nullopt;
-  pos = json.find_first_not_of(" \t\r\n", pos + 1);
-  if (pos == std::string::npos) return std::nullopt;
-  return pos;
+  for (size_t pos = 0; pos < json.size();) {
+    pos = json.find('"', pos);
+    if (pos == std::string::npos) return std::nullopt;
+
+    const size_t stringStart = ++pos;
+    bool escaped = false;
+    for (; pos < json.size(); ++pos) {
+      const char ch = json[pos];
+      if (escaped) {
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == '"') {
+        break;
+      }
+    }
+    if (pos >= json.size()) return std::nullopt;
+
+    const size_t stringEnd = pos;
+    size_t colon = json.find_first_not_of(" \t\r\n", pos + 1);
+    if (colon != std::string::npos && json[colon] == ':' &&
+        json.compare(stringStart, stringEnd - stringStart, key) == 0) {
+      const size_t value = json.find_first_not_of(" \t\r\n", colon + 1);
+      if (value == std::string::npos) return std::nullopt;
+      return value;
+    }
+    ++pos;
+  }
+  return std::nullopt;
 }
 
 inline std::optional<std::string> JsonString(const std::string& json, const std::string& key) {
@@ -441,7 +462,7 @@ inline std::optional<QueryResponse> ParseQueryResponse(const std::string& json, 
     if (auto iconPath = JsonString(object, "iconPath")) item.iconPath = Utf8ToWide(*iconPath);
     if (const auto detail = JsonObjectSlice(object, "detail")) {
       if (auto type = JsonString(*detail, "type")) item.detailType = Utf8ToWide(*type);
-      if (auto title = JsonString(*detail, "title")) item.detailTitle = Utf8ToWide(*title);
+      if (auto detailTitle = JsonString(*detail, "title")) item.detailTitle = Utf8ToWide(*detailTitle);
       if (auto body = JsonString(*detail, "body")) item.detailBody = Utf8ToWide(*body);
     }
     item.payloadJson = JsonObjectSlice(object, "payload").value_or("{}");

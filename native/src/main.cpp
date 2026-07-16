@@ -1,14 +1,20 @@
 #include "calculator.hpp"
+#include "accessibility.hpp"
+#include "background_executor.hpp"
 #include "converter.hpp"
 #include "core.hpp"
+#include "discovery.hpp"
 #include "emoji.hpp"
 #include "extension_manager.hpp"
+#include "json.hpp"
 #include "run_command.hpp"
+#include "settings.hpp"
 #include "shortcut.hpp"
 #include "snippets.hpp"
 #include "storage.hpp"
 #include "symbols.hpp"
 #include "theme.hpp"
+#include "text_edit.hpp"
 #include "updater.hpp"
 #include "version.hpp"
 
@@ -23,6 +29,7 @@
 #include <dcomp.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <imm.h>
 #include <dxgi1_2.h>
 #include <endpointvolume.h>
 #include <knownfolders.h>
@@ -92,7 +99,11 @@ constexpr UINT WM_SHORTCUT_TOGGLE = WM_APP + 6;
 constexpr UINT WM_UPDATE_READY = WM_APP + 7;
 constexpr UINT WM_TRACK_RECENT = WM_APP + 8;
 constexpr UINT WM_ANIMATION_FRAME = WM_APP + 9;
+constexpr UINT WM_EXTENSION_ACTIVATED = WM_APP + 10;
+constexpr UINT WM_SNAPSHOT_READY = WM_APP + 11;
+constexpr UINT WM_PERSISTENCE_ERROR = WM_APP + 12;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
+constexpr int HOTKEY_VALIDATE_SHORTCUT = 0x4C44;
 constexpr UINT TIMER_MEM_TRIM = 3;
 constexpr UINT TIMER_SELECTION_ANIM = 4;
 
@@ -106,7 +117,10 @@ constexpr int MAX_OVERLAY_WIDTH = 980;
 constexpr int SETTINGS_WIDTH = 580;
 constexpr int MIN_RESULTS = 25;
 constexpr int MAX_RESULT_SETTING = 400;
-constexpr size_t CLIPBOARD_HISTORY_LIMIT = 50;
+constexpr int MIN_CLIPBOARD_HISTORY_LIMIT = 1;
+constexpr int MAX_CLIPBOARD_HISTORY_LIMIT = 500;
+constexpr int MIN_FILE_INDEX_ENTRIES = 100;
+constexpr int MAX_FILE_INDEX_ENTRIES = 100000;
 constexpr size_t CLIPBOARD_TEXT_CAP_CHARS = (16 * 1024) / sizeof(wchar_t);
 
 // --- RAII helpers for raw Win32 resources ------------------------------------
@@ -191,6 +205,20 @@ enum class HitType {
   UpdateChecksToggle,
   ShowWindowsToggle,
   ShowStoreAppsToggle,
+  ClipboardHistoryToggle,
+  ClipboardLimitDown,
+  ClipboardLimitUp,
+  FileIndexToggle,
+  FileIndexLimitDown,
+  FileIndexLimitUp,
+  AddFileRoot,
+  ClearFileRoots,
+  DiagnosticsToggle,
+  ClearClipboardData,
+  ClearFileIndexData,
+  OpenLocalDataFolder,
+  ReloadExtensions,
+  OpenPluginsFolder,
   ClearRecents,
   ClearIconCache,
   CheckUpdates,
@@ -208,6 +236,7 @@ enum class CommandKind {
   ClearIconCache,
   ClearRecents,
   OpenDataFolder,
+  OpenLocalDataFolder,
   ReloadExtensions,
   LockPC,
   SleepPC,
@@ -262,46 +291,10 @@ struct HitTarget {
   int index = -1;
 };
 
-// A user-defined keyword that opens a URL, file, or folder directly.
-struct Quicklink {
-  std::wstring keyword;
-  std::wstring name;
-  std::wstring target;
-};
-
-struct Settings {
-  std::wstring shortcut = L"Alt+Space";
-  std::vector<std::wstring> recentApps;
-  std::vector<std::wstring> pinnedApps;
-  std::vector<std::wstring> hiddenApps;
-  std::map<std::wstring, std::wstring> appAliases;
-  struct UsageStat {
-    int launches = 0;
-    long long lastUsed = 0;
-  };
-  std::map<std::wstring, UsageStat> usageStats;
-  bool compactMode = false;
-  bool animationsEnabled = true;
-  bool syncAccentColor = true;
-  std::wstring customAccentColor = L"#5b6cff";
-  bool startOnStartup = false;
-  bool updateChecksEnabled = true;
-  long long lastUpdateCheck = 0;
-  std::wstring dismissedUpdateVersion;
-  int overlayWidth = WIN_WIDTH;
-  int maxResults = MAX_RESULTS;
-  bool showOpenWindows = true;
-  bool showStoreApps = true;
-  // Web search prefixes: keyword -> URL template containing "%s" for the query.
-  std::map<std::wstring, std::wstring> searchEngines = {
-    {L"g", L"https://www.google.com/search?q=%s"},
-    {L"ddg", L"https://duckduckgo.com/?q=%s"},
-    {L"yt", L"https://www.youtube.com/results?search_query=%s"},
-    {L"gh", L"https://github.com/search?q=%s"},
-    {L"w", L"https://en.wikipedia.org/w/index.php?search=%s"},
-  };
-  std::vector<Quicklink> quicklinks;
-};
+// Settings model and JSON round-trip live in settings.hpp (unit-tested there).
+using Quicklink = feathercast::settings::Quicklink;
+using Settings = feathercast::settings::Settings;
+using feathercast::settings::JsonEscape;
 
 struct ShortcutInfo {
   std::wstring target;
@@ -443,7 +436,7 @@ struct Section {
 struct SearchSnapshot {
   // Non-empty search path (pool is parallel to searchItems).
   std::vector<DisplayItem> pool;
-  std::vector<feathercast::core::SearchItem> searchItems;
+  std::vector<feathercast::core::PreparedSearchItem> searchItems;
 
   // Empty-query path (pre-bucketed; needs settings_).
   std::vector<DisplayItem> pinned;
@@ -459,6 +452,23 @@ struct SearchSnapshot {
   std::vector<feathercast::core::SearchItem> clipboardSearchItems;
 };
 
+struct SnapshotBuildRequest {
+  uint64_t revision = 0;
+  Settings settings;
+};
+
+struct SnapshotBuildResult {
+  uint64_t revision = 0;
+  std::shared_ptr<const SearchSnapshot> snapshot;
+};
+
+struct DiscoveryRequest {
+  uint64_t generation = 0;
+  bool fileIndexEnabled = false;
+  size_t fileIndexLimit = 0;
+  std::vector<std::wstring> configuredRoots;
+};
+
 // Self-contained snapshot of everything the search engine needs to produce a
 // result set. The heavy, query-independent corpus is referenced through a shared
 // SearchSnapshot; the remaining fields are cheap and query/mode specific, so they
@@ -472,6 +482,8 @@ struct QueryRequest {
   BrowseView browseView = BrowseView::None;  // dedicated clipboard/emoji sub-view
   bool compactClear = false;  // compact mode + empty query: render nothing
   int limit = 0;              // already clamped from settings_.maxResults
+  long long now = 0;          // shared clock for usage/recency scoring
+  const std::atomic<unsigned long long>* latestGeneration = nullptr;
   std::set<std::wstring> recentIds;
   std::map<std::wstring, std::wstring> searchEngines;   // web search prefixes
   std::map<std::wstring, double> currencyRates;          // code -> rate per USD
@@ -510,13 +522,16 @@ std::string WideToUtf8(const std::wstring& value) {
   return out;
 }
 
-std::wstring Lower(std::wstring value) {
-  return feathercast::core::Lower(std::move(value));
-}
-
-std::wstring Trim(std::wstring value) {
-  return feathercast::core::Trim(std::move(value));
-}
+using feathercast::core::Lower;
+using feathercast::core::Trim;
+using feathercast::discovery::BaseNameNoExt;
+using feathercast::discovery::CleanName;
+using feathercast::discovery::IsSystemEssentialName;
+using feathercast::discovery::KeywordsFor;
+using feathercast::discovery::NameKey;
+using feathercast::discovery::ShouldSkipName;
+using feathercast::discovery::StartsWith;
+using feathercast::discovery::UniqueKeywords;
 
 // The user's locale currency as an ISO-4217 code (e.g. "EUR"), used as the
 // default conversion target for queries like "USD 5". Falls back to USD.
@@ -532,93 +547,6 @@ std::wstring DetectLocaleCurrency() {
     }
   }
   return L"USD";
-}
-
-bool StartsWith(const std::wstring& value, const std::wstring& prefix) {
-  return value.rfind(prefix, 0) == 0;
-}
-
-std::wstring BaseNameNoExt(const std::wstring& path) {
-  std::filesystem::path p(path);
-  return p.stem().wstring();
-}
-
-std::wstring CleanName(const std::wstring& value) {
-  std::wstring name = Trim(value);
-  if (Lower(name).ends_with(L".lnk")) name.resize(name.size() - 4);
-  return name;
-}
-
-std::wstring NameKey(const std::wstring& value) {
-  return Lower(CleanName(value));
-}
-
-bool ShouldSkipName(const std::wstring& value) {
-  const std::wstring name = NameKey(value);
-  static const wchar_t* prefixes[] = {
-    L"uninstall", L"deinstall", L"readme", L"hilfe", L"help", L"website", L"homepage",
-  };
-  for (const auto* prefix : prefixes) {
-    if (StartsWith(name, prefix)) return true;
-  }
-  return false;
-}
-
-std::vector<std::wstring> SplitWords(const std::wstring& value) {
-  std::vector<std::wstring> out;
-  std::wstring current;
-  for (const wchar_t ch : Lower(value)) {
-    if (std::iswalnum(ch)) {
-      current.push_back(ch);
-    } else if (!current.empty()) {
-      out.push_back(current);
-      current.clear();
-    }
-  }
-  if (!current.empty()) out.push_back(current);
-  return out;
-}
-
-std::vector<std::wstring> UniqueKeywords(const std::vector<std::wstring>& values) {
-  std::set<std::wstring> seen;
-  std::vector<std::wstring> out;
-  for (const auto& value : values) {
-    for (const auto& word : SplitWords(value)) {
-      if (word.size() < 2 || seen.contains(word)) continue;
-      seen.insert(word);
-      out.push_back(word);
-    }
-  }
-  return out;
-}
-
-std::vector<std::wstring> KeywordsFor(const std::wstring& name, const std::wstring& target, const std::wstring& appId) {
-  std::vector<std::wstring> groups = {name, BaseNameNoExt(target), appId};
-  const std::wstring lower = Lower(name + L" " + target + L" " + appId);
-  if (lower.find(L"terminal") != std::wstring::npos || lower.find(L"wt.exe") != std::wstring::npos) {
-    groups.insert(groups.end(), {L"wt", L"shell", L"console", L"cmd", L"powershell"});
-  }
-  if (lower.find(L"command prompt") != std::wstring::npos || lower.find(L"cmd.exe") != std::wstring::npos) {
-    groups.insert(groups.end(), {L"cmd", L"console", L"terminal"});
-  }
-  if (lower.find(L"powershell") != std::wstring::npos || lower.find(L"pwsh.exe") != std::wstring::npos) {
-    groups.insert(groups.end(), {L"pwsh", L"shell", L"terminal"});
-  }
-  if (lower.find(L"settings") != std::wstring::npos || lower.find(L"immersivecontrolpanel") != std::wstring::npos) {
-    groups.insert(groups.end(), {L"preferences", L"control panel", L"system"});
-  }
-  if (lower.find(L"calculator") != std::wstring::npos || lower.find(L"calc.exe") != std::wstring::npos) {
-    groups.push_back(L"calc");
-  }
-  return UniqueKeywords(groups);
-}
-
-bool IsSystemEssentialName(const std::wstring& name) {
-  static const std::set<std::wstring> names = {
-    L"terminal", L"windows terminal", L"command prompt", L"windows powershell",
-    L"powershell 7 (x64)", L"settings", L"calculator",
-  };
-  return names.contains(NameKey(name));
 }
 
 long long UnixNow() {
@@ -972,17 +900,29 @@ std::filesystem::path UserDataPath() {
   return root;
 }
 
-// TEMP DEBUG helpers: diagnose why some apps fail to launch. Remove once fixed.
+std::filesystem::path LocalDataPath();
+
+std::atomic<bool> g_diagnosticsEnabled = false;
+
+// Opt-in diagnostics for launch troubleshooting. Paths can contain personal
+// information, so release builds never create this log unless enabled.
 std::wstring ToHex(unsigned value) {
   wchar_t buf[16]{};
   swprintf_s(buf, L"%08X", value);
   return buf;
 }
 
-// TEMP DEBUG: append a line to %APPDATA%\FeatherCast\launch-debug.log to diagnose
-// why some apps fail to launch. Remove once the launch bug is understood.
 void DebugLaunchLog(const std::wstring& line) {
-  std::wofstream f(UserDataPath() / L"launch-debug.log", std::ios::app);
+  if (!g_diagnosticsEnabled.load()) return;
+  const auto path = LocalDataPath() / L"launch-debug.log";
+  std::error_code ec;
+  if (std::filesystem::file_size(path, ec) > 1024 * 1024) {
+    const auto rotated = LocalDataPath() / L"launch-debug.previous.log";
+    std::filesystem::remove(rotated, ec);
+    ec.clear();
+    std::filesystem::rename(path, rotated, ec);
+  }
+  std::wofstream f(path, std::ios::app);
   if (!f) return;
   SYSTEMTIME st{};
   GetLocalTime(&st);
@@ -1004,6 +944,51 @@ std::filesystem::path LocalDataPath() {
   return root;
 }
 
+bool MigrateLegacyOperationalData() {
+  const auto roaming = UserDataPath();
+  const auto local = LocalDataPath();
+  bool foundLegacyData = false;
+
+  auto migrateFile = [&](const std::filesystem::path& source, const std::filesystem::path& destination) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(source, ec)) return;
+    foundLegacyData = true;
+    if (std::filesystem::exists(destination, ec)) return;
+    std::filesystem::rename(source, destination, ec);
+    if (!ec) return;
+
+    ec.clear();
+    std::filesystem::copy_file(source, destination, std::filesystem::copy_options::none, ec);
+    if (!ec) {
+      std::error_code removeEc;
+      std::filesystem::remove(source, removeEc);
+    }
+  };
+
+  migrateFile(roaming / L"feathercast.db", local / L"feathercast.db");
+  migrateFile(roaming / L"feathercast.db-wal", local / L"feathercast.db-wal");
+  migrateFile(roaming / L"feathercast.db-shm", local / L"feathercast.db-shm");
+
+  const auto oldIcons = roaming / L"icon-cache-native";
+  const auto newIcons = local / L"icon-cache-native";
+  std::error_code ec;
+  if (std::filesystem::is_directory(oldIcons, ec)) {
+    foundLegacyData = true;
+    if (!std::filesystem::exists(newIcons, ec)) {
+      std::filesystem::rename(oldIcons, newIcons, ec);
+      if (ec) {
+        ec.clear();
+        std::filesystem::copy(oldIcons, newIcons, std::filesystem::copy_options::recursive, ec);
+        if (!ec) {
+          std::error_code removeEc;
+          std::filesystem::remove_all(oldIcons, removeEc);
+        }
+      }
+    }
+  }
+  return foundLegacyData;
+}
+
 std::filesystem::path UpdatesPath() {
   auto path = LocalDataPath() / L"updates";
   std::error_code ec;
@@ -1012,7 +997,7 @@ std::filesystem::path UpdatesPath() {
 }
 
 std::filesystem::path UpdateLogPath() {
-  return UserDataPath() / L"update-log.txt";
+  return LocalDataPath() / L"update-log.txt";
 }
 
 void AppendUpdateLog(const std::wstring& message) {
@@ -1029,360 +1014,6 @@ std::filesystem::path ExeDirectory() {
   return std::filesystem::path(exePath).parent_path();
 }
 
-std::optional<std::string> JsonString(const std::string& json, const std::string& key) {
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return std::nullopt;
-  pos = json.find(':', pos);
-  if (pos == std::string::npos) return std::nullopt;
-  pos = json.find('"', pos);
-  if (pos == std::string::npos) return std::nullopt;
-  ++pos;
-  std::string out;
-  bool escaped = false;
-  for (; pos < json.size(); ++pos) {
-    const char ch = json[pos];
-    if (escaped) {
-      if (ch == 'n') out.push_back('\n');
-      else out.push_back(ch);
-      escaped = false;
-      continue;
-    }
-    if (ch == '\\') {
-      escaped = true;
-      continue;
-    }
-    if (ch == '"') return out;
-    out.push_back(ch);
-  }
-  return std::nullopt;
-}
-
-bool JsonBool(const std::string& json, const std::string& key, bool fallback) {
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return fallback;
-  pos = json.find(':', pos);
-  if (pos == std::string::npos) return fallback;
-  const size_t value = json.find_first_not_of(" \t\r\n", pos + 1);
-  if (value == std::string::npos) return fallback;
-  if (json.compare(value, 4, "true") == 0) return true;
-  if (json.compare(value, 5, "false") == 0) return false;
-  return fallback;
-}
-
-int JsonInt(const std::string& json, const std::string& key, int fallback) {
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return fallback;
-  pos = json.find(':', pos);
-  if (pos == std::string::npos) return fallback;
-  const size_t value = json.find_first_not_of(" \t\r\n", pos + 1);
-  if (value == std::string::npos) return fallback;
-  char* end = nullptr;
-  const long parsed = std::strtol(json.c_str() + value, &end, 10);
-  if (end == json.c_str() + value) return fallback;
-  return static_cast<int>(parsed);
-}
-
-long long JsonLongLong(const std::string& json, const std::string& key, long long fallback) {
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return fallback;
-  pos = json.find(':', pos);
-  if (pos == std::string::npos) return fallback;
-  const size_t value = json.find_first_not_of(" \t\r\n", pos + 1);
-  if (value == std::string::npos) return fallback;
-  char* end = nullptr;
-  const long long parsed = std::strtoll(json.c_str() + value, &end, 10);
-  if (end == json.c_str() + value) return fallback;
-  return parsed;
-}
-
-std::vector<std::wstring> JsonStringArray(const std::string& json, const std::string& key) {
-  std::vector<std::wstring> out;
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return out;
-  pos = json.find('[', pos);
-  if (pos == std::string::npos) return out;
-  const size_t end = json.find(']', pos);
-  if (end == std::string::npos) return out;
-  std::string slice = json.substr(pos, end - pos + 1);
-  size_t cursor = 0;
-  while (true) {
-    cursor = slice.find('"', cursor);
-    if (cursor == std::string::npos) break;
-    ++cursor;
-    std::string value;
-    bool escaped = false;
-    for (; cursor < slice.size(); ++cursor) {
-      const char ch = slice[cursor];
-      if (escaped) {
-        value.push_back(ch);
-        escaped = false;
-      } else if (ch == '\\') {
-        escaped = true;
-      } else if (ch == '"') {
-        out.push_back(Utf8ToWide(value));
-        ++cursor;
-        break;
-      } else {
-        value.push_back(ch);
-      }
-    }
-  }
-  return out;
-}
-
-std::optional<std::string> JsonObjectSlice(const std::string& json, const std::string& key) {
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return std::nullopt;
-  pos = json.find('{', pos);
-  if (pos == std::string::npos) return std::nullopt;
-
-  int depth = 0;
-  bool inString = false;
-  bool escaped = false;
-  for (size_t i = pos; i < json.size(); ++i) {
-    const char ch = json[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch == '\\') escaped = true;
-      else if (ch == '"') inString = false;
-      continue;
-    }
-    if (ch == '"') {
-      inString = true;
-    } else if (ch == '{') {
-      ++depth;
-    } else if (ch == '}') {
-      --depth;
-      if (depth == 0) return json.substr(pos, i - pos + 1);
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<std::string> ReadJsonString(const std::string& text, size_t& cursor) {
-  cursor = text.find('"', cursor);
-  if (cursor == std::string::npos) return std::nullopt;
-  ++cursor;
-  std::string value;
-  bool escaped = false;
-  for (; cursor < text.size(); ++cursor) {
-    const char ch = text[cursor];
-    if (escaped) {
-      if (ch == 'n') value.push_back('\n');
-      else value.push_back(ch);
-      escaped = false;
-    } else if (ch == '\\') {
-      escaped = true;
-    } else if (ch == '"') {
-      ++cursor;
-      return value;
-    } else {
-      value.push_back(ch);
-    }
-  }
-  return std::nullopt;
-}
-
-std::map<std::wstring, std::wstring> JsonStringObject(const std::string& json, const std::string& key) {
-  std::map<std::wstring, std::wstring> out;
-  const auto slice = JsonObjectSlice(json, key);
-  if (!slice) return out;
-
-  size_t cursor = 1;
-  while (cursor < slice->size()) {
-    auto rawKey = ReadJsonString(*slice, cursor);
-    if (!rawKey) break;
-    cursor = slice->find(':', cursor);
-    if (cursor == std::string::npos) break;
-    ++cursor;
-    auto rawValue = ReadJsonString(*slice, cursor);
-    if (!rawValue) break;
-    out[Utf8ToWide(*rawKey)] = Utf8ToWide(*rawValue);
-    cursor = slice->find(',', cursor);
-    if (cursor == std::string::npos) break;
-    ++cursor;
-  }
-  return out;
-}
-
-std::map<std::wstring, double> JsonNumberObject(const std::string& json, const std::string& key) {
-  std::map<std::wstring, double> out;
-  const auto slice = JsonObjectSlice(json, key);
-  if (!slice) return out;
-
-  size_t cursor = 1;
-  while (cursor < slice->size()) {
-    auto rawKey = ReadJsonString(*slice, cursor);
-    if (!rawKey) break;
-    cursor = slice->find(':', cursor);
-    if (cursor == std::string::npos) break;
-    ++cursor;
-    const size_t valueStart = slice->find_first_not_of(" \t\r\n", cursor);
-    if (valueStart == std::string::npos) break;
-    char* end = nullptr;
-    const double value = std::strtod(slice->c_str() + valueStart, &end);
-    if (end != slice->c_str() + valueStart) {
-      out[Utf8ToWide(*rawKey)] = value;
-      cursor = static_cast<size_t>(end - slice->c_str());
-    }
-    cursor = slice->find(',', cursor);
-    if (cursor == std::string::npos) break;
-    ++cursor;
-  }
-  return out;
-}
-
-std::map<std::wstring, Settings::UsageStat> JsonUsageStats(const std::string& json, const std::string& key) {
-  std::map<std::wstring, Settings::UsageStat> out;
-  const auto slice = JsonObjectSlice(json, key);
-  if (!slice) return out;
-
-  size_t cursor = 1;
-  while (cursor < slice->size()) {
-    auto rawKey = ReadJsonString(*slice, cursor);
-    if (!rawKey) break;
-    const size_t valueStart = slice->find('{', cursor);
-    if (valueStart == std::string::npos) break;
-    int depth = 0;
-    size_t valueEnd = std::string::npos;
-    for (size_t i = valueStart; i < slice->size(); ++i) {
-      if ((*slice)[i] == '{') ++depth;
-      else if ((*slice)[i] == '}') {
-        --depth;
-        if (depth == 0) {
-          valueEnd = i;
-          break;
-        }
-      }
-    }
-    if (valueEnd == std::string::npos) break;
-    const std::string statJson = slice->substr(valueStart, valueEnd - valueStart + 1);
-    out[Utf8ToWide(*rawKey)] = {
-      JsonInt(statJson, "launches", 0),
-      JsonLongLong(statJson, "lastUsed", 0),
-    };
-    cursor = slice->find(',', valueEnd);
-    if (cursor == std::string::npos) break;
-    ++cursor;
-  }
-  return out;
-}
-
-std::vector<Quicklink> JsonQuicklinks(const std::string& json, const std::string& key) {
-  std::vector<Quicklink> out;
-  const std::string marker = "\"" + key + "\"";
-  size_t pos = json.find(marker);
-  if (pos == std::string::npos) return out;
-  pos = json.find('[', pos);
-  if (pos == std::string::npos) return out;
-  // Walk objects inside the array by brace-matching (strings ignored).
-  size_t i = pos + 1;
-  while (i < json.size()) {
-    if (json[i] == ']') break;
-    if (json[i] != '{') {
-      ++i;
-      continue;
-    }
-    int depth = 0;
-    bool inString = false;
-    bool escaped = false;
-    size_t end = std::string::npos;
-    for (size_t j = i; j < json.size(); ++j) {
-      const char ch = json[j];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch == '\\') escaped = true;
-        else if (ch == '"') inString = false;
-        continue;
-      }
-      if (ch == '"') inString = true;
-      else if (ch == '{') ++depth;
-      else if (ch == '}') {
-        --depth;
-        if (depth == 0) {
-          end = j;
-          break;
-        }
-      }
-    }
-    if (end == std::string::npos) break;
-    const std::string obj = json.substr(i, end - i + 1);
-    Quicklink link;
-    if (auto kw = JsonString(obj, "keyword")) link.keyword = Utf8ToWide(*kw);
-    if (auto nm = JsonString(obj, "name")) link.name = Utf8ToWide(*nm);
-    if (auto tg = JsonString(obj, "target")) link.target = Utf8ToWide(*tg);
-    if (!link.keyword.empty() && !link.target.empty()) out.push_back(std::move(link));
-    i = end + 1;
-  }
-  return out;
-}
-
-std::string JsonEscape(const std::wstring& value) {
-  std::string in = WideToUtf8(value);
-  std::string out;
-  for (const char ch : in) {
-    if (ch == '\\' || ch == '"') {
-      out.push_back('\\');
-      out.push_back(ch);
-    } else if (ch == '\n') {
-      out += "\\n";
-    } else {
-      out.push_back(ch);
-    }
-  }
-  return out;
-}
-
-void WriteStringArray(std::ofstream& file, const std::vector<std::wstring>& values) {
-  file << "[";
-  for (size_t i = 0; i < values.size(); ++i) {
-    if (i) file << ", ";
-    file << "\"" << JsonEscape(values[i]) << "\"";
-  }
-  file << "]";
-}
-
-void WriteStringObject(std::ofstream& file, const std::map<std::wstring, std::wstring>& values) {
-  file << "{";
-  bool first = true;
-  for (const auto& [key, value] : values) {
-    if (!first) file << ", ";
-    first = false;
-    file << "\"" << JsonEscape(key) << "\": \"" << JsonEscape(value) << "\"";
-  }
-  file << "}";
-}
-
-void WriteQuicklinks(std::ofstream& file, const std::vector<Quicklink>& links) {
-  file << "[";
-  bool first = true;
-  for (const auto& link : links) {
-    if (!first) file << ", ";
-    first = false;
-    file << "{\"keyword\": \"" << JsonEscape(link.keyword) << "\", \"name\": \""
-         << JsonEscape(link.name) << "\", \"target\": \"" << JsonEscape(link.target) << "\"}";
-  }
-  file << "]";
-}
-
-void WriteUsageStats(std::ofstream& file, const std::map<std::wstring, Settings::UsageStat>& values) {
-  file << "{";
-  bool first = true;
-  for (const auto& [key, stat] : values) {
-    if (!first) file << ", ";
-    first = false;
-    file << "\"" << JsonEscape(key) << "\": {\"launches\": " << stat.launches
-         << ", \"lastUsed\": " << stat.lastUsed << "}";
-  }
-  file << "}";
-}
-
 std::filesystem::path SettingsPath() {
   return UserDataPath() / L"settings.json";
 }
@@ -1392,7 +1023,7 @@ std::filesystem::path SnippetsPath() {
 }
 
 std::filesystem::path DatabasePath() {
-  return UserDataPath() / L"feathercast.db";
+  return LocalDataPath() / L"feathercast.db";
 }
 
 std::filesystem::path ThemePath() {
@@ -1423,6 +1054,21 @@ std::filesystem::path CurrencyCachePath() {
   return UserDataPath() / L"currency-rates.json";
 }
 
+// Extracts the {"rates": {"CODE": number, ...}} member as a currency-rate map.
+std::map<std::wstring, double> RatesFromJson(const std::string& text) {
+  std::map<std::wstring, double> out;
+  const auto root = feathercast::json::Parse(text);
+  if (!root) return out;
+  const auto* rates = root->Find("rates");
+  if (!rates || rates->type != feathercast::json::Value::Type::Object) return out;
+  for (const auto& member : rates->object) {
+    if (member.value.type == feathercast::json::Value::Type::Number) {
+      out[Utf8ToWide(member.key)] = member.value.number;
+    }
+  }
+  return out;
+}
+
 CurrencyRates LoadCurrencyCache() {
   CurrencyRates rates;
   std::ifstream file(CurrencyCachePath(), std::ios::binary);
@@ -1430,8 +1076,12 @@ CurrencyRates LoadCurrencyCache() {
   std::ostringstream buffer;
   buffer << file.rdbuf();
   const std::string json = buffer.str();
-  rates.fetchedAt = JsonLongLong(json, "fetchedAt", 0);
-  rates.perUsd = JsonNumberObject(json, "rates");
+  if (const auto root = feathercast::json::Parse(json)) {
+    if (const auto* fetchedAt = root->Find("fetchedAt"); fetchedAt && fetchedAt->type == feathercast::json::Value::Type::Number) {
+      rates.fetchedAt = static_cast<long long>(fetchedAt->number);
+    }
+  }
+  rates.perUsd = RatesFromJson(json);
   return rates;
 }
 
@@ -1704,7 +1354,7 @@ bool ToggleDefaultAudioMute() {
   return SUCCEEDED(volume->SetMute(!muted, nullptr));
 }
 
-void SetStartOnStartup(bool enable) {
+bool SetStartOnStartup(bool enable) {
   HKEY hKey = nullptr;
   LSTATUS status = RegOpenKeyExW(
       HKEY_CURRENT_USER,
@@ -1713,24 +1363,28 @@ void SetStartOnStartup(bool enable) {
       KEY_WRITE,
       &hKey
   );
-  if (status == ERROR_SUCCESS) {
-    if (enable) {
-      wchar_t exePath[MAX_PATH];
-      GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-      std::wstring pathStr = L"\"" + std::wstring(exePath) + L"\"";
-      RegSetValueExW(
-          hKey,
-          L"FeatherCast",
-          0,
-          REG_SZ,
-          reinterpret_cast<const BYTE*>(pathStr.c_str()),
-          static_cast<DWORD>((pathStr.length() + 1) * sizeof(wchar_t))
-      );
-    } else {
-      RegDeleteValueW(hKey, L"FeatherCast");
+  if (status != ERROR_SUCCESS) return false;
+
+  if (enable) {
+    wchar_t exePath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+      RegCloseKey(hKey);
+      return false;
     }
-    RegCloseKey(hKey);
+    const std::wstring pathStr = L"\"" + std::wstring(exePath) + L"\"";
+    status = RegSetValueExW(
+        hKey,
+        L"FeatherCast",
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(pathStr.c_str()),
+        static_cast<DWORD>((pathStr.length() + 1) * sizeof(wchar_t)));
+  } else {
+    status = RegDeleteValueW(hKey, L"FeatherCast");
+    if (status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
   }
+  RegCloseKey(hKey);
+  return status == ERROR_SUCCESS;
 }
 
 Settings LoadSettings() {
@@ -1739,81 +1393,43 @@ Settings LoadSettings() {
   if (!file) return settings;
   std::ostringstream buffer;
   buffer << file.rdbuf();
-  const std::string json = buffer.str();
-  if (auto shortcut = JsonString(json, "shortcut")) settings.shortcut = Utf8ToWide(*shortcut);
-  settings.recentApps = JsonStringArray(json, "recentApps");
-  settings.pinnedApps = JsonStringArray(json, "pinnedApps");
-  settings.hiddenApps = JsonStringArray(json, "hiddenApps");
-  settings.appAliases = JsonStringObject(json, "appAliases");
-  settings.usageStats = JsonUsageStats(json, "usageStats");
-  settings.compactMode = JsonBool(json, "compactMode", settings.compactMode);
-  settings.animationsEnabled = JsonBool(json, "animationsEnabled", settings.animationsEnabled);
-  settings.syncAccentColor = JsonBool(json, "syncAccentColor", settings.syncAccentColor);
-  if (auto custom = JsonString(json, "customAccentColor")) settings.customAccentColor = Utf8ToWide(*custom);
-  settings.startOnStartup = JsonBool(json, "startOnStartup", settings.startOnStartup);
-  settings.updateChecksEnabled = JsonBool(json, "updateChecksEnabled", settings.updateChecksEnabled);
-  settings.lastUpdateCheck = JsonLongLong(json, "lastUpdateCheck", settings.lastUpdateCheck);
-  if (auto dismissed = JsonString(json, "dismissedUpdateVersion")) {
-    settings.dismissedUpdateVersion = Utf8ToWide(*dismissed);
-  }
-  settings.overlayWidth = std::clamp(JsonInt(json, "overlayWidth", settings.overlayWidth), MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
-  settings.maxResults = std::clamp(JsonInt(json, "maxResults", settings.maxResults), MIN_RESULTS, MAX_RESULT_SETTING);
-  settings.showOpenWindows = JsonBool(json, "showOpenWindows", settings.showOpenWindows);
-  settings.showStoreApps = JsonBool(json, "showStoreApps", settings.showStoreApps);
-  if (auto engines = JsonStringObject(json, "searchEngines"); !engines.empty()) settings.searchEngines = std::move(engines);
-  settings.quicklinks = JsonQuicklinks(json, "quicklinks");
+  settings = feathercast::settings::ParseSettings(buffer.str());
+  settings.overlayWidth = std::clamp(settings.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
+  settings.maxResults = std::clamp(settings.maxResults, MIN_RESULTS, MAX_RESULT_SETTING);
+  settings.clipboardHistoryLimit =
+      std::clamp(settings.clipboardHistoryLimit, MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT);
+  settings.fileIndexMaxEntries =
+      std::clamp(settings.fileIndexMaxEntries, MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
   return settings;
 }
 
-void SaveSettings(const Settings& settings) {
+bool SaveSettings(const Settings& settings) {
   const auto path = SettingsPath();
   auto temp = path;
   temp += L".tmp";
   std::ofstream file(temp, std::ios::binary | std::ios::trunc);
-  if (!file) return;
-  file << "{\n";
-  file << "  \"shortcut\": \"" << JsonEscape(settings.shortcut) << "\",\n";
-  file << "  \"recentApps\": ";
-  WriteStringArray(file, settings.recentApps);
-  file << ",\n";
-  file << "  \"pinnedApps\": ";
-  WriteStringArray(file, settings.pinnedApps);
-  file << ",\n";
-  file << "  \"hiddenApps\": ";
-  WriteStringArray(file, settings.hiddenApps);
-  file << ",\n";
-  file << "  \"appAliases\": ";
-  WriteStringObject(file, settings.appAliases);
-  file << ",\n";
-  file << "  \"usageStats\": ";
-  WriteUsageStats(file, settings.usageStats);
-  file << ",\n";
-  file << "  \"compactMode\": " << (settings.compactMode ? "true" : "false") << ",\n";
-  file << "  \"animationsEnabled\": " << (settings.animationsEnabled ? "true" : "false") << ",\n";
-  file << "  \"syncAccentColor\": " << (settings.syncAccentColor ? "true" : "false") << ",\n";
-  file << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\",\n";
-  file << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << ",\n";
-  file << "  \"updateChecksEnabled\": " << (settings.updateChecksEnabled ? "true" : "false") << ",\n";
-  file << "  \"lastUpdateCheck\": " << settings.lastUpdateCheck << ",\n";
-  file << "  \"dismissedUpdateVersion\": \"" << JsonEscape(settings.dismissedUpdateVersion) << "\",\n";
-  file << "  \"overlayWidth\": " << std::clamp(settings.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH) << ",\n";
-  file << "  \"maxResults\": " << std::clamp(settings.maxResults, MIN_RESULTS, MAX_RESULT_SETTING) << ",\n";
-  file << "  \"showOpenWindows\": " << (settings.showOpenWindows ? "true" : "false") << ",\n";
-  file << "  \"showStoreApps\": " << (settings.showStoreApps ? "true" : "false") << ",\n";
-  file << "  \"searchEngines\": ";
-  WriteStringObject(file, settings.searchEngines);
-  file << ",\n";
-  file << "  \"quicklinks\": ";
-  WriteQuicklinks(file, settings.quicklinks);
-  file << "\n";
-  file << "}\n";
+  if (!file) return false;
+  Settings clamped = settings;
+  clamped.overlayWidth = std::clamp(clamped.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
+  clamped.maxResults = std::clamp(clamped.maxResults, MIN_RESULTS, MAX_RESULT_SETTING);
+  clamped.clipboardHistoryLimit =
+      std::clamp(clamped.clipboardHistoryLimit, MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT);
+  clamped.fileIndexMaxEntries =
+      std::clamp(clamped.fileIndexMaxEntries, MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
+  file << feathercast::settings::SerializeSettings(clamped);
   file.close();
+  if (!file) {
+    std::error_code ec;
+    std::filesystem::remove(temp, ec);
+    return false;
+  }
 
   if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
     std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::rename(temp, path, ec);
+    std::filesystem::remove(temp, ec);
+    return false;
   }
+  return true;
 }
 
 COLORREF ColorRefFromHex(const std::wstring& hex, COLORREF fallback = RGB(0x5b, 0x6c, 0xff)) {
@@ -1940,7 +1556,7 @@ uint64_t Fnv1a(const std::wstring& value) {
 }
 
 std::filesystem::path IconCacheDir() {
-  auto dir = UserDataPath() / L"icon-cache-native";
+  auto dir = LocalDataPath() / L"icon-cache-native";
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   return dir;
@@ -2111,35 +1727,79 @@ struct UpdateTaskResult {
   std::wstring message;
 };
 
+struct ExtensionActivationResult {
+  std::optional<feathercast::extensions::ActivationResponse> response;
+};
+
+struct LaunchCompletion {
+  std::wstring id;
+  std::wstring name;
+  bool succeeded = false;
+};
+
+struct NavigationState {
+  View view = View::Search;
+  bool actionMode = false;
+  BrowseView browseView = BrowseView::None;
+  std::wstring query;
+  size_t caret = 0;
+  std::optional<size_t> selectionAnchor;
+  int selected = 0;
+  int scroll = 0;
+  std::wstring selectedKey;
+};
+
 class FeatherCastApp;
 FeatherCastApp* g_app = nullptr;
 
-class FeatherCastApp {
+class FeatherCastApp : public feathercast::accessibility::Model {
  public:
   explicit FeatherCastApp(HINSTANCE instance, std::wstring cmdLine)
       : instance_(instance), cmdLine_(std::move(cmdLine)) {
     QueryPerformanceFrequency(&qpcFrequency_);
     settings_ = LoadSettings();
+    g_diagnosticsEnabled = settings_.diagnosticsEnabled;
+    hadLegacyOperationalData_ = MigrateLegacyOperationalData();
     shortcut_ = ParseShortcut(settings_.shortcut);
     theme_ = feathercast::theme::LoadTheme(ThemePath());
+    RefreshSystemPreferences();
     snippets_ = LoadSnippets();
     systemFolders_ = SystemFolderEntries();
-    LoadPersistentState();
-    SetStartOnStartup(settings_.startOnStartup);
+    if (!SetStartOnStartup(settings_.startOnStartup) && settings_.startOnStartup) {
+      settings_.startOnStartup = false;
+      SaveSettings(settings_);
+    }
   }
 
   ~FeatherCastApp() {
+    ShutdownBackgroundWorkers();
+    if (clipboardListenerRegistered_ && hwnd_) RemoveClipboardFormatListener(hwnd_);
+    UnregisterShortcutHotKey();
+    if (hook_) UnhookWindowsHookEx(hook_);
+    RemoveTray();
+  }
+
+  void ShutdownBackgroundWorkers() {
+    if (shutdownStarted_.exchange(true)) return;
     stopThreads_ = true;
+    launchExecutor_.Shutdown();
     extensions_.Shutdown();
     searchCv_.notify_all();
+    snapshotCv_.notify_all();
+    discoveryCv_.notify_all();
     if (searchThread_.joinable()) {
       searchThread_.request_stop();
       searchThread_.join();
+    }
+    if (snapshotThread_.joinable()) {
+      snapshotThread_.request_stop();
+      snapshotThread_.join();
     }
     if (discoveryThread_.joinable()) {
       discoveryThread_.request_stop();
       discoveryThread_.join();
     }
+    persistenceExecutor_.Shutdown(true);
     if (currencyThread_.joinable()) {
       currencyThread_.request_stop();
       currencyThread_.join();
@@ -2149,25 +1809,45 @@ class FeatherCastApp {
       updateThread_.join();
     }
     StopIconThreads();
-    if (clipboardListenerRegistered_ && hwnd_) RemoveClipboardFormatListener(hwnd_);
-    UnregisterShortcutHotKey();
-    if (hook_) UnhookWindowsHookEx(hook_);
-    RemoveTray();
   }
 
   int Run() {
     g_app = this;
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    InitializeFactories();
-    RegisterWindowClass();
-    CreateMainWindow();
-    CreateSettingsWindow();
-    clipboardListenerRegistered_ = AddClipboardFormatListener(hwnd_) != FALSE;
-    CreateTray();
+    taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
+    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(coHr)) {
+      MessageBoxW(nullptr, L"FeatherCast could not initialize the Windows COM apartment.",
+                  L"FeatherCast Startup", MB_OK | MB_ICONERROR);
+      g_app = nullptr;
+      return 1;
+    }
+    if (!InitializeFactories() || !RegisterWindowClass() || !CreateMainWindow() || !CreateSettingsWindow()) {
+      MessageBoxW(nullptr, L"FeatherCast could not initialize its native windows or graphics factories.",
+                  L"FeatherCast Startup", MB_OK | MB_ICONERROR);
+      ReleaseComResources();
+      CoUninitialize();
+      g_app = nullptr;
+      return 1;
+    }
+    PromptForPrivacyConsentIfNeeded();
+    LoadPersistentState();
+    UpdateClipboardListenerRegistration();
+    if (!CreateTray()) {
+      MessageBoxW(hwnd_, L"FeatherCast could not create its tray icon.",
+                  L"FeatherCast Startup", MB_OK | MB_ICONWARNING);
+    }
     extensions_.Initialize(UserDataPath(), ExeDirectory(), hwnd_, WM_REBUILD_RESULTS);
-    RegisterShortcutHotKey();
-    InstallHook();
+    const bool hotKeyReady = RegisterShortcutHotKey();
+    const bool hookReady = InstallHook();
+    if (!hotKeyReady && !hookReady) {
+      MessageBoxW(hwnd_, L"FeatherCast could not register the global shortcut or keyboard hook.",
+                  L"FeatherCast Startup", MB_OK | MB_ICONWARNING);
+    }
+    launchExecutor_.Start(2);
+    persistenceExecutor_.Start(1);
     StartSearchWorker();
+    StartSnapshotWorker();
+    StartDiscoveryWorker();
     StartIconWorkers();
     StartAppDiscovery();
     StartCurrencyFetch();
@@ -2185,7 +1865,9 @@ class FeatherCastApp {
       DispatchMessageW(&msg);
     }
 
+    ShutdownBackgroundWorkers();
     g_app = nullptr;
+    ReleaseComResources();
     CoUninitialize();
     return static_cast<int>(msg.wParam);
   }
@@ -2222,6 +1904,172 @@ class FeatherCastApp {
     return CallNextHookEx(hook_, nCode, wParam, lParam);
   }
 
+  std::wstring AccessibleWindowName(HWND hwnd) const override {
+    return hwnd == settingsHwnd_ ? L"FeatherCast Settings" : L"FeatherCast Launcher";
+  }
+
+  std::vector<feathercast::accessibility::Item> AccessibleItems(HWND hwnd) const override {
+    using feathercast::accessibility::Item;
+    std::vector<Item> items;
+    const float scale = GetWindowScale(hwnd);
+    POINT origin{0, 0};
+    ClientToScreen(hwnd, &origin);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    auto screenRect = [&](RectF rect) {
+      return RECT{
+        origin.x + static_cast<LONG>(rect.left * scale),
+        origin.y + static_cast<LONG>(rect.top * scale),
+        origin.x + static_cast<LONG>(rect.right * scale),
+        origin.y + static_cast<LONG>(rect.bottom * scale),
+      };
+    };
+
+    if (hwnd == hwnd_) {
+      Item search;
+      search.name = L"Search";
+      search.value = query_;
+      search.description = std::to_wstring(flatItems_.size()) + L" results";
+      search.role = ROLE_SYSTEM_TEXT;
+      search.state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_FOCUSED;
+      search.screenRect = screenRect({52, 12, static_cast<float>(client.right) / scale - 94, 50});
+      items.push_back(std::move(search));
+
+      float y = kResultsTop - static_cast<float>(scroll_);
+      int index = 0;
+      for (const auto& section : sections_) {
+        y += kSectionHeaderHeight;
+        for (const auto& display : section.items) {
+          Item result;
+          result.name = display.Name();
+          result.description = SourceLabel(display);
+          result.defaultAction = ActionHint(display);
+          result.role = ROLE_SYSTEM_LISTITEM;
+          result.state = STATE_SYSTEM_SELECTABLE | STATE_SYSTEM_FOCUSABLE;
+          if (index == selected_) result.state |= STATE_SYSTEM_SELECTED | STATE_SYSTEM_FOCUSED;
+          result.screenRect = screenRect({8, y, static_cast<float>(client.right) / scale - 8,
+                                          y + kResultRowHeight});
+          if (result.screenRect.bottom < origin.y ||
+              result.screenRect.top > origin.y + client.bottom) {
+            result.state |= STATE_SYSTEM_OFFSCREEN;
+          }
+          items.push_back(std::move(result));
+          y += kResultRowStride;
+          ++index;
+        }
+      }
+      return items;
+    }
+
+    const auto order = SettingsFocusOrder();
+    auto nameFor = [](HitType type) {
+      switch (type) {
+        case HitType::RecordShortcut: return L"Record global shortcut";
+        case HitType::SaveShortcut: return L"Save global shortcut";
+        case HitType::ClearShortcut: return L"Clear global shortcut";
+        case HitType::StartupToggle: return L"Start on startup";
+        case HitType::UpdateChecksToggle: return L"Automatic update checks";
+        case HitType::CompactToggle: return L"Compact mode";
+        case HitType::AnimationsToggle: return L"Enable animations";
+        case HitType::ShowWindowsToggle: return L"Open window results";
+        case HitType::ShowStoreAppsToggle: return L"Store and system apps";
+        case HitType::OverlayWidthDown: return L"Decrease overlay width";
+        case HitType::OverlayWidthUp: return L"Increase overlay width";
+        case HitType::MaxResultsDown: return L"Decrease maximum results";
+        case HitType::MaxResultsUp: return L"Increase maximum results";
+        case HitType::ClipboardHistoryToggle: return L"Clipboard history";
+        case HitType::ClipboardLimitDown: return L"Decrease clipboard history retention";
+        case HitType::ClipboardLimitUp: return L"Increase clipboard history retention";
+        case HitType::FileIndexToggle: return L"Files and folders index";
+        case HitType::FileIndexLimitDown: return L"Decrease file index limit";
+        case HitType::FileIndexLimitUp: return L"Increase file index limit";
+        case HitType::AddFileRoot: return L"Add file index folder";
+        case HitType::ClearFileRoots: return L"Use default file index folders";
+        case HitType::DiagnosticsToggle: return L"Enable diagnostics";
+        case HitType::ClearClipboardData: return L"Delete clipboard data";
+        case HitType::ClearFileIndexData: return L"Delete file index";
+        case HitType::OpenLocalDataFolder: return L"Open local data folder";
+        case HitType::ReloadExtensions: return L"Reload extensions";
+        case HitType::OpenPluginsFolder: return L"Open plugins folder";
+        case HitType::AccentToggle: return L"Sync accent color";
+        case HitType::AccentColor: return L"Pick accent color";
+        case HitType::ClearRecents: return L"Clear recents";
+        case HitType::ClearIconCache: return L"Clear icon cache";
+        case HitType::CheckUpdates: return L"Check for updates";
+        case HitType::CloseSettings: return L"Close settings";
+        default: return L"Setting";
+      }
+    };
+    auto checked = [&](HitType type) {
+      switch (type) {
+        case HitType::StartupToggle: return settings_.startOnStartup;
+        case HitType::UpdateChecksToggle: return settings_.updateChecksEnabled;
+        case HitType::CompactToggle: return settings_.compactMode;
+        case HitType::AnimationsToggle: return settings_.animationsEnabled;
+        case HitType::ShowWindowsToggle: return settings_.showOpenWindows;
+        case HitType::ShowStoreAppsToggle: return settings_.showStoreApps;
+        case HitType::ClipboardHistoryToggle: return settings_.clipboardHistoryEnabled;
+        case HitType::FileIndexToggle: return settings_.fileIndexEnabled;
+        case HitType::DiagnosticsToggle: return settings_.diagnosticsEnabled;
+        case HitType::AccentToggle: return settings_.syncAccentColor;
+        default: return false;
+      }
+    };
+    for (const HitType type : order) {
+      const auto hit = std::find_if(hits_.begin(), hits_.end(),
+                                    [&](const HitTarget& target) { return target.type == type; });
+      if (hit == hits_.end()) continue;
+      Item setting;
+      setting.name = nameFor(type);
+      setting.defaultAction = L"Activate";
+      setting.role = type == HitType::StartupToggle || type == HitType::UpdateChecksToggle ||
+                             type == HitType::CompactToggle || type == HitType::AnimationsToggle ||
+                             type == HitType::ShowWindowsToggle || type == HitType::ShowStoreAppsToggle ||
+                             type == HitType::ClipboardHistoryToggle || type == HitType::FileIndexToggle ||
+                             type == HitType::DiagnosticsToggle || type == HitType::AccentToggle
+                         ? ROLE_SYSTEM_CHECKBUTTON
+                         : ROLE_SYSTEM_PUSHBUTTON;
+      setting.state = STATE_SYSTEM_FOCUSABLE;
+      if (checked(type)) setting.state |= STATE_SYSTEM_CHECKED;
+      setting.screenRect = screenRect(hit->rect);
+      items.push_back(std::move(setting));
+    }
+    return items;
+  }
+
+  int AccessibleFocusedChild(HWND hwnd) const override {
+    if (hwnd == hwnd_) return flatItems_.empty() ? 1 : selected_ + 2;
+    return settingsFocusIndex_ + 1;
+  }
+
+  void AccessibleFocusChild(HWND hwnd, int child) override {
+    if (hwnd == hwnd_) {
+      if (child <= 1) {
+        SetFocus(hwnd_);
+      } else {
+        SelectResult(child - 2, false, true);
+      }
+      return;
+    }
+    const auto order = SettingsFocusOrder();
+    settingsFocusIndex_ = std::clamp(child - 1, 0, static_cast<int>(order.size()) - 1);
+    EnsureSettingsFocusVisible();
+    InvalidateRect(settingsHwnd_, nullptr, FALSE);
+  }
+
+  void AccessibleInvokeChild(HWND hwnd, int child) override {
+    if (hwnd == hwnd_) {
+      const int index = child - 2;
+      if (index >= 0 && index < static_cast<int>(flatItems_.size())) Activate(flatItems_[index], false);
+      return;
+    }
+    const auto order = SettingsFocusOrder();
+    const int index = child - 1;
+    if (index < 0 || index >= static_cast<int>(order.size())) return;
+    if (order[static_cast<size_t>(index)] == HitType::CloseSettings) HideSettings();
+    else HandleSettingsHit(order[static_cast<size_t>(index)]);
+  }
+
  private:
   static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     FeatherCastApp* app = nullptr;
@@ -2241,6 +2089,11 @@ class FeatherCastApp {
 
   LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (hwnd == settingsHwnd_) return SettingsWndProc(hwnd, msg, wParam, lParam);
+    if (taskbarCreatedMessage_ && msg == taskbarCreatedMessage_) {
+      RemoveTray();
+      CreateTray();
+      return 0;
+    }
     switch (msg) {
       case WM_TIMER:
         if (wParam == 1) {
@@ -2271,10 +2124,16 @@ class FeatherCastApp {
         return 0;
       case WM_ERASEBKGND:
         return 1;
+      case WM_GETOBJECT:
+        if (static_cast<LONG>(lParam) == OBJID_CLIENT) {
+          return feathercast::accessibility::HandleGetObject(this, hwnd, wParam, lParam);
+        }
+        break;
       case WM_DWMCOMPOSITIONCHANGED:
       case WM_THEMECHANGED:
       case WM_SETTINGCHANGE:
       case WM_DISPLAYCHANGE:
+        RefreshSystemPreferences();
         ApplyGlass(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -2333,6 +2192,16 @@ class FeatherCastApp {
       case WM_CHAR:
         OnChar(static_cast<wchar_t>(wParam));
         return 0;
+      case WM_IME_STARTCOMPOSITION:
+        imeComposition_.clear();
+        return 0;
+      case WM_IME_COMPOSITION:
+        OnImeComposition(lParam);
+        return 0;
+      case WM_IME_ENDCOMPOSITION:
+        imeComposition_.clear();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return 0;
       case WM_SYSCHAR:
         if (AltGrPressedForTextInput()) OnChar(static_cast<wchar_t>(wParam));
         return 0;
@@ -2353,6 +2222,12 @@ class FeatherCastApp {
         OnClick(static_cast<float>(GET_X_LPARAM(lParam)) / scale, static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
         return 0;
       }
+      case WM_RBUTTONUP: {
+        const float scale = GetWindowScale(hwnd_);
+        OnRightClick(static_cast<float>(GET_X_LPARAM(lParam)) / scale,
+                     static_cast<float>(GET_Y_LPARAM(lParam)) / scale);
+        return 0;
+      }
       case WM_MOUSEWHEEL:
         OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
@@ -2363,12 +2238,12 @@ class FeatherCastApp {
         ShowOverlay(View::Search);
         return 0;
       case WM_ICON_READY:
-        RequestSearch();
+        iconReadyMessageQueued_.store(false, std::memory_order_release);
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
       case WM_REBUILD_RESULTS:
         // Data-mutation sites (apps_/windows_/fileIndex_/snippets_/clipboard) and
-        // settings changes mark snapshotDirty_ themselves; this also fires for
+        // Settings/data changes advance the corpus revision themselves; this also fires for
         // async extension results, which do not affect the cached corpus.
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2386,10 +2261,21 @@ class FeatherCastApp {
         return 0;
       }
       case WM_TRACK_RECENT: {
-        auto* pId = reinterpret_cast<std::wstring*>(lParam);
-        if (pId) {
-          TrackRecent(*pId);
-          delete pId;
+        std::deque<LaunchCompletion> completions;
+        {
+          std::lock_guard lock(completedLaunchMutex_);
+          completions.swap(completedLaunches_);
+        }
+        for (const auto& completion : completions) {
+          if (completion.succeeded) {
+            TrackRecent(completion.id);
+          } else {
+            ShowTrayNotification(
+                L"FeatherCast Launch Failed",
+                completion.name.empty()
+                    ? L"Windows could not open the selected item."
+                    : L"Windows could not open " + completion.name + L".");
+          }
         }
         return 0;
       }
@@ -2398,6 +2284,23 @@ class FeatherCastApp {
         return 0;
       case WM_UPDATE_READY:
         OnUpdateReady();
+        return 0;
+      case WM_EXTENSION_ACTIVATED:
+        OnExtensionActivationReady();
+        return 0;
+      case WM_SNAPSHOT_READY:
+        OnSnapshotReady();
+        return 0;
+      case WM_PERSISTENCE_ERROR:
+        persistenceErrorQueued_.store(false, std::memory_order_release);
+        if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
+          MessageBoxW(settingsHwnd_,
+                      L"FeatherCast could not save local changes. Check disk access and available space.",
+                      L"FeatherCast Storage", MB_OK | MB_ICONWARNING);
+        } else {
+          ShowTrayNotification(L"FeatherCast Storage",
+                               L"Some local changes could not be saved.");
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -2409,10 +2312,16 @@ class FeatherCastApp {
         return 0;
       case WM_ERASEBKGND:
         return 1;
+      case WM_GETOBJECT:
+        if (static_cast<LONG>(lParam) == OBJID_CLIENT) {
+          return feathercast::accessibility::HandleGetObject(this, hwnd, wParam, lParam);
+        }
+        break;
       case WM_DWMCOMPOSITIONCHANGED:
       case WM_THEMECHANGED:
       case WM_SETTINGCHANGE:
       case WM_DISPLAYCHANGE:
+        RefreshSystemPreferences();
         ApplyGlass(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -2423,6 +2332,13 @@ class FeatherCastApp {
         ResizeGlassSurface(settingsSurface_, settingsHwnd_, LOWORD(lParam), HIWORD(lParam));
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+      case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        const float scale = GetWindowScale(hwnd);
+        info->ptMinTrackSize.x = static_cast<LONG>(520.0f * scale);
+        info->ptMinTrackSize.y = static_cast<LONG>(400.0f * scale);
+        return 0;
+      }
       case WM_DPICHANGED: {
         auto prc = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2443,12 +2359,30 @@ class FeatherCastApp {
         RECT rc{};
         GetClientRect(hwnd, &rc);
         const float lwidth = static_cast<float>(rc.right - rc.left) / scale;
+        const float lheight = static_cast<float>(rc.bottom - rc.top) / scale;
+        constexpr float border = 8.0f;
+        const bool left = lx < border;
+        const bool right = lx >= lwidth - border;
+        const bool top = ly < border;
+        const bool bottom = ly >= lheight - border;
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
         const bool overClose = lx >= lwidth - 46.0f && lx <= lwidth - 14.0f && ly >= 12.0f && ly <= 44.0f;
         if (ly >= 0.0f && ly < 52.0f && !overClose) return HTCAPTION;
         return HTCLIENT;
       }
       case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE && !recording_) HideSettings();
+        if (wParam == VK_ESCAPE && !recording_) {
+          HideSettings();
+        } else {
+          HandleSettingsKeyDown(static_cast<UINT>(wParam));
+        }
         return 0;
       case WM_MOUSEMOVE: {
         const float scale = GetWindowScale(hwnd);
@@ -2477,13 +2411,21 @@ class FeatherCastApp {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
   }
 
-  void InitializeFactories() {
-    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwriteFactory_.GetAddressOf()));
-    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wicFactory_));
+  bool InitializeFactories() {
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                   reinterpret_cast<IUnknown**>(dwriteFactory_.GetAddressOf())))) {
+      return false;
+    }
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&wicFactory_)))) {
+      dwriteFactory_.Reset();
+      return false;
+    }
     // The Direct3D/Direct2D/DirectComposition device stack is created lazily on first paint.
+    return true;
   }
 
-  void RegisterWindowClass() {
+  bool RegisterWindowClass() {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = 0;
@@ -2493,10 +2435,10 @@ class FeatherCastApp {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
     wc.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
-    RegisterClassExW(&wc);
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
     wc.lpszClassName = kSettingsWindowClass;
-    RegisterClassExW(&wc);
+    return RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
   }
 
   // (Re)applies the transparent window treatment. The visible background is drawn into
@@ -2512,7 +2454,7 @@ class FeatherCastApp {
     DisableDwmBorder(hwnd);
   }
 
-  void CreateMainWindow() {
+  bool CreateMainWindow() {
     const int width = OverlayWidth();
     hwnd_ = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
@@ -2528,18 +2470,20 @@ class FeatherCastApp {
       instance_,
       this);
 
+    if (!hwnd_) return false;
     SetWindowPos(hwnd_, HWND_TOPMOST, -32000, -32000, width, WIN_HEIGHT, SWP_NOACTIVATE | SWP_HIDEWINDOW);
     // Transparent popup: DirectComposition supplies per-pixel alpha; DWM materials stay off.
     ApplyGlass(hwnd_);
+    return true;
   }
 
-  void CreateSettingsWindow() {
+  bool CreateSettingsWindow() {
     const int height = SettingsContentHeight();
     settingsHwnd_ = CreateWindowExW(
-      WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+      WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP,
       kSettingsWindowClass,
       L"FeatherCast Settings",
-      WS_POPUP,
+      WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX,
       -32000,
       -32000,
       SETTINGS_WIDTH,
@@ -2549,8 +2493,17 @@ class FeatherCastApp {
       instance_,
       this);
 
+    if (!settingsHwnd_) return false;
     // Settings uses the same transparent DirectComposition background as the launcher.
     ApplyGlass(settingsHwnd_);
+    return true;
+  }
+
+  void ReleaseComResources() {
+    DiscardGlassDevice();
+    ResetTextFormats();
+    wicFactory_.Reset();
+    dwriteFactory_.Reset();
   }
 
   // Per-window composition render surface: a DXGI swap chain bound to a Direct2D device
@@ -2699,6 +2652,45 @@ class FeatherCastApp {
     emojiFormat_.Reset();
   }
 
+  static feathercast::theme::Color ThemeColorFromSystem(COLORREF color) {
+    return {
+      GetRValue(color) / 255.0f,
+      GetGValue(color) / 255.0f,
+      GetBValue(color) / 255.0f,
+      1.0f,
+    };
+  }
+
+  void RefreshSystemPreferences() {
+    theme_ = feathercast::theme::LoadTheme(ThemePath());
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    highContrast_ = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+                    (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    BOOL animations = TRUE;
+    systemAnimationsEnabled_ =
+        !SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0) || animations != FALSE;
+    if (highContrast_) {
+      theme_.overlayBackground = ThemeColorFromSystem(GetSysColor(COLOR_WINDOW));
+      theme_.settingsBackground = theme_.overlayBackground;
+      theme_.surface = ThemeColorFromSystem(GetSysColor(COLOR_BTNFACE));
+      theme_.surfaceHover = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
+      theme_.selectedBase = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
+      theme_.iconTile = theme_.surface;
+      theme_.border = ThemeColorFromSystem(GetSysColor(COLOR_WINDOWTEXT));
+      theme_.divider = theme_.border;
+      theme_.textPrimary = ThemeColorFromSystem(GetSysColor(COLOR_WINDOWTEXT));
+      theme_.textMuted = ThemeColorFromSystem(GetSysColor(COLOR_GRAYTEXT));
+      theme_.textDim = theme_.textMuted;
+      theme_.sectionText = theme_.textPrimary;
+      theme_.accentFallback = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
+    }
+    ResetTextFormats();
+  }
+
+  bool AnimationsAllowed() const {
+    return settings_.animationsEnabled && systemAnimationsEnabled_ && !highContrast_;
+  }
+
   void EnsureTextFormats() {
     if (!dwriteFactory_ || inputFormat_) return;
     // 18px Regular: elegant search-bar input (was 19px).
@@ -2728,7 +2720,7 @@ class FeatherCastApp {
   }
 
   void CreateTextFormat(float size, DWRITE_FONT_WEIGHT weight, ComPtr<IDWriteTextFormat>& out) {
-    dwriteFactory_->CreateTextFormat(
+    HRESULT hr = dwriteFactory_->CreateTextFormat(
       theme_.fontFamily.c_str(),
       nullptr,
       weight,
@@ -2737,13 +2729,25 @@ class FeatherCastApp {
       size,
       L"",
       out.GetAddressOf());
+    if (FAILED(hr) && theme_.fontFamily != L"Segoe UI") {
+      out.Reset();
+      dwriteFactory_->CreateTextFormat(
+        L"Segoe UI",
+        nullptr,
+        weight,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        size,
+        L"",
+        out.GetAddressOf());
+    }
     if (out) {
       out->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
       out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
     }
   }
 
-  void CreateTray() {
+  bool CreateTray() {
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd_;
@@ -2752,10 +2756,14 @@ class FeatherCastApp {
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
     wcscpy_s(nid.szTip, L"FeatherCast");
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+      if (nid.hIcon) DestroyIcon(nid.hIcon);
+      return false;
+    }
     nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &nid);
     tray_ = nid;
+    return true;
   }
 
   void RemoveTray() {
@@ -2766,8 +2774,9 @@ class FeatherCastApp {
     }
   }
 
-  void InstallHook() {
+  bool InstallHook() {
     hook_ = SetWindowsHookExW(WH_KEYBOARD_LL, StaticKeyboardProc, GetModuleHandleW(nullptr), 0);
+    return hook_ != nullptr;
   }
 
   void SetHookModifier(UINT vk, bool pressed) {
@@ -2778,11 +2787,23 @@ class FeatherCastApp {
     else if (generic == VK_LWIN) hookModifiers_.win = pressed;
   }
 
-  void RegisterShortcutHotKey() {
+  bool RegisterShortcutHotKey() {
     UnregisterShortcutHotKey();
     const auto hotKey = ToHotKeySpec(shortcut_);
-    if (!hwnd_ || !hotKey.supported) return;
+    if (!hwnd_ || !hotKey.supported) return false;
     hotKeyRegistered_ = RegisterHotKey(hwnd_, HOTKEY_OPEN_SEARCH, hotKey.modifiers, hotKey.vk) != FALSE;
+    return hotKeyRegistered_;
+  }
+
+  bool CanActivateShortcut(const ShortcutSpec& candidate) const {
+    if (candidate.display.empty() || candidate.display == L"none") return true;
+    const auto hotKey = ToHotKeySpec(candidate);
+    if (!hotKey.supported) return hook_ != nullptr;
+    if (!hwnd_) return false;
+    const bool registered =
+        RegisterHotKey(hwnd_, HOTKEY_VALIDATE_SHORTCUT, hotKey.modifiers, hotKey.vk) != FALSE;
+    if (registered) UnregisterHotKey(hwnd_, HOTKEY_VALIDATE_SHORTCUT);
+    return registered;
   }
 
   void UnregisterShortcutHotKey() {
@@ -2805,139 +2826,310 @@ class FeatherCastApp {
     return result.consume ? 1 : 0;
   }
 
-  void LoadPersistentState() {
-    std::lock_guard storageLock(storageMutex_);
-    if (!storage_.Open(DatabasePath())) return;
+  size_t ClipboardHistoryLimit() const {
+    return static_cast<size_t>(std::clamp(settings_.clipboardHistoryLimit,
+                                         MIN_CLIPBOARD_HISTORY_LIMIT,
+                                         MAX_CLIPBOARD_HISTORY_LIMIT));
+  }
 
-    for (const auto& entry : storage_.LoadFileIndex(kFileIndexCap)) {
-      if (!entry.path.empty() && !entry.name.empty()) fileIndex_.push_back(FileIndexApp(entry));
+  void ApplyClipboardHistoryLimit() {
+    const size_t limit = ClipboardHistoryLimit();
+    {
+      std::lock_guard lock(dataMutex_);
+      if (clipboardHistory_.size() > limit) clipboardHistory_.resize(limit);
     }
+    persistenceExecutor_.Submit([this, limit](std::stop_token stopToken) {
+      if (stopToken.stop_requested()) return;
+      std::lock_guard lock(storageMutex_);
+      if (storage_.IsOpen()) storage_.PruneClipboardHistory(limit);
+    });
+    MarkSearchDataChanged();
+    RequestSearch();
+  }
 
-    for (const auto& entry : storage_.LoadClipboardHistory(CLIPBOARD_HISTORY_LIMIT)) {
+  size_t FileIndexLimit() const {
+    return static_cast<size_t>(std::clamp(settings_.fileIndexMaxEntries,
+                                         MIN_FILE_INDEX_ENTRIES,
+                                         MAX_FILE_INDEX_ENTRIES));
+  }
+
+  void PromptForPrivacyConsentIfNeeded() {
+    if (settings_.privacyConsentVersion >= 1 || !hadLegacyOperationalData_) return;
+    const int choice = MessageBoxW(
+        hwnd_,
+        L"FeatherCast previously stored clipboard text and indexed personal file paths.\n\n"
+        L"Enable Clipboard History and Files & Folders indexing? You can change these "
+        L"independently in Settings and clear their data at any time.",
+        L"FeatherCast Privacy",
+        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2);
+    settings_.privacyConsentVersion = 1;
+    settings_.clipboardHistoryEnabled = choice == IDYES;
+    settings_.fileIndexEnabled = choice == IDYES;
+    PersistSettings();
+  }
+
+  void UpdateClipboardListenerRegistration() {
+    const bool shouldListen = settings_.privacyConsentVersion >= 1 && settings_.clipboardHistoryEnabled;
+    if (shouldListen && !clipboardListenerRegistered_ && hwnd_) {
+      clipboardListenerRegistered_ = AddClipboardFormatListener(hwnd_) != FALSE;
+    } else if (!shouldListen && clipboardListenerRegistered_ && hwnd_) {
+      RemoveClipboardFormatListener(hwnd_);
+      clipboardListenerRegistered_ = false;
+    }
+  }
+
+  void ShowTrayNotification(const std::wstring& title, const std::wstring& message) {
+    if (!tray_.cbSize) return;
+    NOTIFYICONDATAW notification = tray_;
+    notification.uFlags = NIF_INFO;
+    wcsncpy_s(notification.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(notification.szInfo, message.c_str(), _TRUNCATE);
+    notification.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &notification);
+  }
+
+  void ReloadClipboardHistoryFromStorage() {
+    std::vector<ClipboardEntry> loaded;
+    unsigned long long serial = 0;
+    if (!settings_.clipboardHistoryEnabled || !storage_.IsOpen()) {
+      std::lock_guard dataLock(dataMutex_);
+      clipboardHistory_.clear();
+      clipboardSerial_ = 0;
+      return;
+    }
+    for (const auto& entry : storage_.LoadClipboardHistory(ClipboardHistoryLimit())) {
       ClipboardEntry item;
       item.id = std::to_wstring(entry.id);
       item.text = entry.text;
       item.preview = entry.preview;
       item.capturedAt = entry.capturedAt;
-      clipboardHistory_.push_back(std::move(item));
-      clipboardSerial_ = std::max<unsigned long long>(clipboardSerial_, static_cast<unsigned long long>(entry.id));
+      loaded.push_back(std::move(item));
+      serial = std::max<unsigned long long>(serial, static_cast<unsigned long long>(entry.id));
     }
+    {
+      std::lock_guard dataLock(dataMutex_);
+      clipboardHistory_ = std::move(loaded);
+      clipboardSerial_ = serial;
+    }
+  }
+
+  void LoadPersistentState() {
+    std::lock_guard storageLock(storageMutex_);
+    if (!storage_.Open(DatabasePath())) {
+      const auto& error = storage_.LastError();
+      const std::wstring detail =
+          error.message.empty() ? L"Unknown SQLite error." : Utf8ToWide(error.message);
+      MessageBoxW(hwnd_,
+                  (L"FeatherCast could not open its local database.\n\n" + detail +
+                   L"\n\nFile indexing and clipboard persistence will be unavailable.").c_str(),
+                  L"FeatherCast Storage", MB_OK | MB_ICONWARNING);
+      return;
+    }
+    if (storage_.RecoveredFromCorruption()) {
+      MessageBoxW(
+          hwnd_,
+          (L"FeatherCast detected a damaged local database and created a new one.\n\n"
+           L"The damaged file was preserved at:\n" +
+           storage_.QuarantinedPath().wstring()).c_str(),
+          L"FeatherCast Storage Recovery", MB_OK | MB_ICONWARNING);
+    }
+
+    if (settings_.fileIndexEnabled) {
+      for (const auto& entry : storage_.LoadFileIndex(FileIndexLimit())) {
+        if (!entry.path.empty() && !entry.name.empty()) fileIndex_.push_back(FileIndexApp(entry));
+      }
+    }
+    ReloadClipboardHistoryFromStorage();
   }
 
   void ReloadTheme() {
     theme_ = feathercast::theme::LoadTheme(ThemePath());
-    ResetTextFormats();
+    RefreshSystemPreferences();
     InvalidateRect(hwnd_, nullptr, FALSE);
     if (settingsHwnd_) InvalidateRect(settingsHwnd_, nullptr, FALSE);
   }
 
   void StartAppDiscovery() {
-    if (discoveryThread_.joinable()) {
-      discoveryThread_.request_stop();
-      discoveryThread_.join();
-    }
-
-    {
-      std::lock_guard lock(dataMutex_);
-      appsReady_ = false;
-    }
+    const uint64_t generation =
+        latestDiscoveryGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    appsReady_.store(false, std::memory_order_release);
     PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
 
+    DiscoveryRequest request;
+    request.generation = generation;
+    request.fileIndexEnabled = settings_.fileIndexEnabled;
+    request.fileIndexLimit = FileIndexLimit();
+    request.configuredRoots = settings_.fileIndexRoots;
+    {
+      std::lock_guard lock(discoveryMutex_);
+      pendingDiscovery_ = std::move(request);
+    }
+    discoveryCv_.notify_one();
+  }
+
+  bool DiscoveryCanceled(std::stop_token stopToken, uint64_t generation) const {
+    return stopToken.stop_requested() || stopThreads_ ||
+           latestDiscoveryGeneration_.load(std::memory_order_acquire) != generation;
+  }
+
+  void StartDiscoveryWorker() {
     discoveryThread_ = std::jthread([this](std::stop_token stopToken) {
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-      auto apps = DiscoverApps();
-      if (stopToken.stop_requested() || stopThreads_) {
-        CoUninitialize();
-        return;
+      ScopeExit uninitialize([] { CoUninitialize(); });
+      for (;;) {
+        DiscoveryRequest request;
+        {
+          std::unique_lock lock(discoveryMutex_);
+          discoveryCv_.wait(lock, [&] {
+            return pendingDiscovery_.has_value() || stopToken.stop_requested() || stopThreads_;
+          });
+          if (stopToken.stop_requested() || stopThreads_) return;
+          request = std::move(*pendingDiscovery_);
+          pendingDiscovery_.reset();
+        }
+
+        auto apps = DiscoverApps(stopToken, request.generation);
+        if (!apps || DiscoveryCanceled(stopToken, request.generation)) continue;
+        {
+          std::lock_guard lock(dataMutex_);
+          apps_ = std::move(*apps);
+        }
+        appsReady_.store(true, std::memory_order_release);
+        MarkSearchDataChanged();
+        if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+
+        if (request.fileIndexEnabled) {
+          BuildFileIndex(stopToken, request.generation, request.configuredRoots,
+                         request.fileIndexLimit);
+        } else if (!DiscoveryCanceled(stopToken, request.generation)) {
+          {
+            std::lock_guard lock(dataMutex_);
+            fileIndex_.clear();
+          }
+          MarkSearchDataChanged();
+        }
+        if (DiscoveryCanceled(stopToken, request.generation)) continue;
+        if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+        PrecacheIcons(stopToken, request.generation);
       }
-      {
-        std::lock_guard lock(dataMutex_);
-        apps_ = std::move(apps);
-        appsReady_ = true;
-      }
-      snapshotDirty_ = true;
-      if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
-      BuildFileIndex(stopToken);
-      if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
-      PrecacheIcons(stopToken);
-      CoUninitialize();
     });
   }
 
-  static constexpr size_t kFileIndexCap = 5000;
   static constexpr int kFileIndexDepth = 4;
 
-  // Recursively collects files and folders into a flat searchable index, capped
-  // by depth and total count, skipping hidden/system/reparse entries.
-  void ScanFolder(const std::filesystem::path& dir, int depth, long long indexedAt, std::vector<AppEntry>& out,
-                  std::set<std::wstring>& seen, std::stop_token stopToken) {
-    if (depth > kFileIndexDepth || out.size() >= kFileIndexCap) return;
-    if (stopToken.stop_requested() || stopThreads_) return;
-    std::error_code ec;
-    std::filesystem::directory_iterator it(dir, std::filesystem::directory_options::skip_permission_denied, ec);
-    const std::filesystem::directory_iterator end;
-    if (ec) return;
-    for (; it != end; it.increment(ec)) {
-      if (ec || stopToken.stop_requested() || stopThreads_ || out.size() >= kFileIndexCap) break;
-      const std::filesystem::path path = it->path();
-      const std::wstring name = path.filename().wstring();
-      if (name.empty() || name.front() == L'.') continue;
-      const DWORD attrs = GetFileAttributesW(path.c_str());
-      if (attrs == INVALID_FILE_ATTRIBUTES) continue;
-      if (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
-      const std::wstring full = path.wstring();
-      if (seen.insert(Lower(full)).second) {
-        const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        long long lastWriteTime = 0;
-        long long fileSize = 0;
-        std::error_code metaEc;
-        const auto writeTime = std::filesystem::last_write_time(path, metaEc);
-        if (!metaEc) lastWriteTime = writeTime.time_since_epoch().count();
-        if (!isDirectory) {
-          fileSize = static_cast<long long>(std::filesystem::file_size(path, metaEc));
-          if (metaEc) fileSize = 0;
-        }
-
-        AppEntry app;
-        app.id = L"file:" + full;
-        app.name = name;
-        app.path = full;
-        app.source = L"file";
-        app.launchType = LaunchType::Exe;
-        app.launchTarget = full;
-        app.iconKey = full;
-        app.fileIsDirectory = isDirectory;
-        app.fileLastWriteTime = lastWriteTime;
-        app.fileSize = fileSize;
-        app.fileIndexedAt = indexedAt;
-        out.push_back(std::move(app));
-      }
-      if (attrs & FILE_ATTRIBUTE_DIRECTORY) ScanFolder(path, depth + 1, indexedAt, out, seen, stopToken);
-    }
-  }
-
-  void BuildFileIndex(std::stop_token stopToken) {
+  void BuildFileIndex(std::stop_token stopToken, uint64_t generation,
+                      const std::vector<std::wstring>& configuredRoots, size_t limit) {
     std::vector<AppEntry> files;
     std::set<std::wstring> seen;
-    const long long indexedAt = UnixNow();
-    for (const KNOWNFOLDERID& folder : {FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads}) {
-      if (stopToken.stop_requested() || stopThreads_) break;
-      const std::wstring root = KnownFolderPath(folder);
-      if (root.empty()) continue;
-      ScanFolder(root, 0, indexedAt, files, seen, stopToken);
+    const long long indexedAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::vector<std::filesystem::path> roots;
+    for (const auto& configuredRoot : configuredRoots) {
+      if (!Trim(configuredRoot).empty()) roots.emplace_back(configuredRoot);
     }
-    if (stopToken.stop_requested() || stopThreads_) return;
+    if (roots.empty()) {
+      for (const KNOWNFOLDERID& folder : {FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads}) {
+        const std::wstring root = KnownFolderPath(folder);
+        if (!root.empty()) roots.emplace_back(root);
+      }
+    }
+
+    struct RootState {
+      std::deque<std::pair<std::filesystem::path, int>> directories;
+      std::deque<std::pair<std::filesystem::path, int>> entries;
+    };
+    std::vector<RootState> states(roots.size());
+    for (size_t i = 0; i < roots.size(); ++i) states[i].directories.emplace_back(roots[i], 0);
+
+    auto fillEntries = [&](RootState& state) {
+      while (state.entries.empty() && !state.directories.empty()) {
+        if (DiscoveryCanceled(stopToken, generation)) return false;
+        auto [directory, depth] = std::move(state.directories.front());
+        state.directories.pop_front();
+        std::error_code ec;
+        std::vector<std::filesystem::path> sorted;
+        size_t enumerated = 0;
+        for (std::filesystem::directory_iterator it(
+                 directory, std::filesystem::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+          sorted.push_back(it->path());
+          if ((++enumerated & 63u) == 0 && DiscoveryCanceled(stopToken, generation)) {
+            return false;
+          }
+        }
+        if (DiscoveryCanceled(stopToken, generation)) return false;
+        std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
+          return Lower(left.wstring()) < Lower(right.wstring());
+        });
+        for (auto& path : sorted) state.entries.emplace_back(std::move(path), depth);
+      }
+      return true;
+    };
+
+    constexpr size_t kRootBatch = 64;
+    bool madeProgress = true;
+    while (files.size() < limit && madeProgress && !DiscoveryCanceled(stopToken, generation)) {
+      madeProgress = false;
+      for (auto& state : states) {
+        if (!fillEntries(state)) return;
+        size_t batch = 0;
+        while (!state.entries.empty() && batch++ < kRootBatch && files.size() < limit) {
+          if (DiscoveryCanceled(stopToken, generation)) return;
+          madeProgress = true;
+          auto [path, depth] = std::move(state.entries.front());
+          state.entries.pop_front();
+          const std::wstring name = path.filename().wstring();
+          if (name.empty() || name.front() == L'.') continue;
+          const DWORD attrs = GetFileAttributesW(path.c_str());
+          if (attrs == INVALID_FILE_ATTRIBUTES ||
+              (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT))) {
+            continue;
+          }
+          const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+          if (isDirectory && depth < kFileIndexDepth) state.directories.emplace_back(path, depth + 1);
+
+          const std::wstring full = path.wstring();
+          if (!seen.insert(Lower(full)).second) continue;
+          long long lastWriteTime = 0;
+          long long fileSize = 0;
+          std::error_code metaEc;
+          const auto writeTime = std::filesystem::last_write_time(path, metaEc);
+          if (!metaEc) lastWriteTime = writeTime.time_since_epoch().count();
+          if (!isDirectory) {
+            fileSize = static_cast<long long>(std::filesystem::file_size(path, metaEc));
+            if (metaEc) fileSize = 0;
+          }
+
+          AppEntry app;
+          app.id = L"file:" + full;
+          app.name = name;
+          app.path = full;
+          app.source = L"file";
+          app.launchType = LaunchType::Exe;
+          app.launchTarget = full;
+          app.iconKey = full;
+          app.fileIsDirectory = isDirectory;
+          app.fileLastWriteTime = lastWriteTime;
+          app.fileSize = fileSize;
+          app.fileIndexedAt = indexedAt;
+          files.push_back(std::move(app));
+        }
+      }
+    }
+    if (DiscoveryCanceled(stopToken, generation)) return;
     std::vector<feathercast::storage::FileIndexEntry> storageEntries;
     storageEntries.reserve(files.size());
     for (const auto& file : files) storageEntries.push_back(StorageFileEntry(file));
     {
       std::lock_guard lock(dataMutex_);
+      if (latestDiscoveryGeneration_.load(std::memory_order_acquire) != generation) return;
       fileIndex_ = std::move(files);
     }
-    snapshotDirty_ = true;
+    MarkSearchDataChanged();
+    if (DiscoveryCanceled(stopToken, generation)) return;
     {
       std::lock_guard lock(storageMutex_);
-      if (storage_.IsOpen()) storage_.ReplaceFileIndex(storageEntries);
+      if (storage_.IsOpen()) storage_.UpdateFileIndex(storageEntries);
     }
   }
 
@@ -2956,7 +3148,7 @@ class FeatherCastApp {
       if (stopToken.stop_requested() || stopThreads_) return;
       const auto body = HttpsGet(L"open.er-api.com", L"/v6/latest/USD");
       if (!body || stopToken.stop_requested() || stopThreads_) return;
-      auto rates = JsonNumberObject(*body, "rates");
+      auto rates = RatesFromJson(*body);
       if (rates.empty()) return;
       CurrencyRates updated;
       updated.perUsd = std::move(rates);
@@ -2986,6 +3178,7 @@ class FeatherCastApp {
   void StartAutomaticUpdateCheck() {
     if (!settings_.updateChecksEnabled) return;
     const long long now = UnixNow();
+    if (settings_.lastUpdateAttempt > 0 && now - settings_.lastUpdateAttempt < 3600) return;
     if (settings_.lastUpdateCheck > 0 && now - settings_.lastUpdateCheck < 24 * 3600) return;
     StartUpdateCheck(false);
   }
@@ -3000,7 +3193,7 @@ class FeatherCastApp {
       return;
     }
 
-    settings_.lastUpdateCheck = UnixNow();
+    settings_.lastUpdateAttempt = UnixNow();
     PersistSettings();
     const std::wstring dismissedVersion = settings_.dismissedUpdateVersion;
 
@@ -3069,6 +3262,20 @@ class FeatherCastApp {
                   MB_OK | MB_ICONINFORMATION);
       return;
     }
+    if (feathercast::updater::ParseSignerThumbprints(
+            kFeatherCastAllowedSignerThumbprints).empty()) {
+      const int choice = MessageBoxW(
+          hwnd_,
+          L"This build does not contain a pinned FeatherCast signing certificate, "
+          L"so it cannot safely install updates.\n\nOpen the GitHub release page instead?",
+          L"FeatherCast Updates",
+          MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1);
+      if (choice == IDYES && !release.htmlUrl.empty()) {
+        ShellExecuteW(nullptr, L"open", release.htmlUrl.c_str(), nullptr, nullptr,
+                      SW_SHOWNORMAL);
+      }
+      return;
+    }
 
     updateWorkerRunning_ = true;
     AppendUpdateLog(L"Update download started: " + release.tagName);
@@ -3121,6 +3328,16 @@ class FeatherCastApp {
         FinishUpdateTask(std::move(result));
         return;
       }
+      if (!feathercast::updater::VerifyAuthenticodeSigner(
+              installerPath, kFeatherCastExpectedPublisher,
+              kFeatherCastAllowedSignerThumbprints)) {
+        std::error_code ec;
+        std::filesystem::remove(installerPath, ec);
+        result.status = UpdateTaskStatus::Error;
+        result.message = L"Downloaded installer has an invalid or unexpected Authenticode signature.";
+        FinishUpdateTask(std::move(result));
+        return;
+      }
 
       result.status = UpdateTaskStatus::ReadyToInstall;
       result.installerPath = installerPath;
@@ -3141,6 +3358,10 @@ class FeatherCastApp {
     if (!result) return;
 
     AppendUpdateLog(result->message);
+    if (result->kind == UpdateTaskKind::Check && result->status != UpdateTaskStatus::Error) {
+      settings_.lastUpdateCheck = UnixNow();
+      PersistSettings();
+    }
 
     if (result->kind == UpdateTaskKind::Check) {
       if (result->status == UpdateTaskStatus::NoUpdate) {
@@ -3158,6 +3379,12 @@ class FeatherCastApp {
       }
       if (result->status == UpdateTaskStatus::Available) {
         const std::wstring releaseVersion = feathercast::updater::AssetVersionFromTag(result->release.tagName);
+        if (!result->manual) {
+          ShowTrayNotification(L"FeatherCast Update Available",
+                               L"Version " + releaseVersion + L" is available. "
+                               L"Use Check for Updates when you are ready.");
+          return;
+        }
         const std::wstring message =
             L"FeatherCast " + releaseVersion + L" is available.\n\nCurrent version: " +
             std::wstring(kFeatherCastVersion) + L"\n\nDownload, verify, and install it now?";
@@ -3199,37 +3426,55 @@ class FeatherCastApp {
     }
   }
 
-  std::vector<AppEntry> DiscoverApps() {
+  std::optional<std::vector<AppEntry>> DiscoverApps(std::stop_token stopToken,
+                                                    uint64_t generation) {
     std::vector<AppEntry> apps;
-    std::set<std::wstring> ids;
-    std::set<std::wstring> names;
+    std::map<std::wstring, size_t> identities;
 
     auto addUnique = [&](AppEntry entry) {
       if (entry.id.empty() || entry.name.empty()) return;
-      const std::wstring id = Lower(entry.id);
-      const std::wstring name = NameKey(entry.name);
-      if (ids.contains(id) || names.contains(name)) return;
-      ids.insert(id);
-      names.insert(name);
+      std::wstring identity;
+      if (!entry.appUserModelId.empty()) identity = L"aumid:" + Lower(entry.appUserModelId);
+      else if (!entry.targetPath.empty()) identity = L"target:" + Lower(entry.targetPath);
+      else if (!entry.launchTarget.empty()) identity = L"launch:" + Lower(entry.launchTarget);
+      else identity = L"id:" + Lower(entry.id);
+
+      if (const auto found = identities.find(identity); found != identities.end()) {
+        auto& existing = apps[found->second];
+        existing.adminSupported = existing.adminSupported || entry.adminSupported;
+        existing.systemEssential = existing.systemEssential || entry.systemEssential;
+        if (existing.iconKey.empty()) existing.iconKey = std::move(entry.iconKey);
+        if (existing.targetPath.empty()) existing.targetPath = std::move(entry.targetPath);
+        existing.keywords = UniqueKeywords({
+            feathercast::core::JoinKeywords(existing.keywords),
+            feathercast::core::JoinKeywords(entry.keywords),
+        });
+        return;
+      }
+      identities.emplace(std::move(identity), apps.size());
       apps.push_back(std::move(entry));
     };
 
-    for (const auto& path : StartMenuShortcutPaths()) {
+    for (const auto& path : StartMenuShortcutPaths(stopToken, generation)) {
+      if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
       auto entry = ShortcutEntry(path);
       if (entry) addUnique(std::move(*entry));
     }
 
-    for (auto& entry : AppsFolderEntries()) {
+    for (auto& entry : AppsFolderEntries(stopToken, generation)) {
+      if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
       addUnique(std::move(entry));
     }
 
+    if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
     std::sort(apps.begin(), apps.end(), [](const AppEntry& a, const AppEntry& b) {
       return Lower(a.name) < Lower(b.name);
     });
     return apps;
   }
 
-  std::vector<std::filesystem::path> StartMenuShortcutPaths() {
+  std::vector<std::filesystem::path> StartMenuShortcutPaths(std::stop_token stopToken,
+                                                            uint64_t generation) {
     std::vector<std::filesystem::path> dirs;
     wchar_t programData[MAX_PATH]{};
     wchar_t appData[MAX_PATH]{};
@@ -3240,11 +3485,14 @@ class FeatherCastApp {
 
     std::vector<std::filesystem::path> out;
     for (const auto& dir : dirs) {
+      if (DiscoveryCanceled(stopToken, generation)) break;
       std::error_code ec;
       if (!std::filesystem::is_directory(dir, ec)) continue;
+      size_t enumerated = 0;
       for (std::filesystem::recursive_directory_iterator it(dir, std::filesystem::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec)) {
         if (ec) continue;
         if (it->is_regular_file(ec) && Lower(it->path().extension().wstring()) == L".lnk") out.push_back(it->path());
+        if ((++enumerated & 63u) == 0 && DiscoveryCanceled(stopToken, generation)) break;
       }
     }
     return out;
@@ -3274,7 +3522,8 @@ class FeatherCastApp {
     return entry;
   }
 
-  std::vector<AppEntry> AppsFolderEntries() {
+  std::vector<AppEntry> AppsFolderEntries(std::stop_token stopToken,
+                                          uint64_t generation) {
     std::vector<AppEntry> out;
     PIDLIST_ABSOLUTE appsPidl = nullptr;
     if (FAILED(SHParseDisplayName(L"shell:AppsFolder", nullptr, &appsPidl, 0, nullptr))) return out;
@@ -3288,6 +3537,7 @@ class FeatherCastApp {
         ULONG fetched = 0;
         constexpr int kNameBufferLen = 512;
         while (enumList->Next(1, &child, &fetched) == S_OK) {
+          if (DiscoveryCanceled(stopToken, generation)) break;
           ScopeExit freeChild([&] { CoTaskMemFree(child); });
           STRRET str{};
           wchar_t nameBuf[kNameBufferLen]{};
@@ -3325,7 +3575,7 @@ class FeatherCastApp {
             // activation, which reliably brings the window to the foreground
             // instead of occasionally opening an Explorer folder.
             entry.targetPath = terminalAlias;
-            entry.adminSupported = true;  // all AppsFolder entries support Ctrl+Shift+Enter elevation
+            entry.adminSupported = !entry.targetPath.empty();
             if (terminal) entry.systemEssential = true;
             out.push_back(std::move(entry));
           }
@@ -3336,7 +3586,7 @@ class FeatherCastApp {
     return out;
   }
 
-  void PrecacheIcons(std::stop_token stopToken) {
+  void PrecacheIcons(std::stop_token stopToken, uint64_t generation) {
     std::vector<std::wstring> keys;
     {
       std::lock_guard lock(dataMutex_);
@@ -3347,8 +3597,8 @@ class FeatherCastApp {
     caching_ = true;
     if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
     for (const auto& key : keys) {
-      if (stopToken.stop_requested() || stopThreads_) break;
-      ResolveIconToCache(key);
+      if (DiscoveryCanceled(stopToken, generation)) break;
+      QueueIcon(key);
     }
     caching_ = false;
     if (!stopThreads_) PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
@@ -3360,7 +3610,27 @@ class FeatherCastApp {
       std::lock_guard lock(dataMutex_);
       windows_ = std::move(windows);
     }
-    snapshotDirty_ = true;
+    MarkSearchDataChanged();
+  }
+
+  void RefreshWindowsAsync() {
+    if (windowRefreshPending_.exchange(true)) return;
+    if (!launchExecutor_.Submit([this, own = hwnd_](std::stop_token stopToken) {
+          auto windows = ListWindows(own);
+          if (stopToken.stop_requested() || stopThreads_) {
+            windowRefreshPending_.store(false);
+            return;
+          }
+          {
+            std::lock_guard lock(dataMutex_);
+            windows_ = std::move(windows);
+          }
+          MarkSearchDataChanged();
+          windowRefreshPending_.store(false);
+          PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+        })) {
+      windowRefreshPending_.store(false);
+    }
   }
 
   std::vector<DisplayItem> BuiltInCommands() const {
@@ -3373,7 +3643,8 @@ class FeatherCastApp {
       CommandDisplay(CommandKind::RefreshApps, L"Refresh App Index", L"Rescan Start Menu and Store apps", {L"rescan", L"reload apps"}),
       CommandDisplay(CommandKind::ClearIconCache, L"Clear Icon Cache", L"Delete cached shell icons", {L"icons", L"cache"}),
       CommandDisplay(CommandKind::ClearRecents, L"Clear Recents", L"Forget recently used apps", {L"history", L"recent apps"}),
-      CommandDisplay(CommandKind::OpenDataFolder, L"Open App Data Folder", L"Open the FeatherCast data directory", {L"settings json", L"logs", L"cache folder"}),
+      CommandDisplay(CommandKind::OpenDataFolder, L"Open Settings Folder", L"Open roaming FeatherCast configuration", {L"settings json", L"snippets", L"theme", L"plugins"}),
+      CommandDisplay(CommandKind::OpenLocalDataFolder, L"Open Local Data Folder", L"Open logs, cache, database, and updates", {L"logs", L"cache", L"database", L"updates"}),
       CommandDisplay(CommandKind::ReloadExtensions, L"Reload Extensions", L"Reload plugin manifests and helper processes", {L"plugins", L"extensions", L"dll"}),
       CommandDisplay(CommandKind::CheckForUpdates, L"Check for Updates", L"Find and install the latest FeatherCast release", {L"update", L"upgrade", L"release"}),
       CommandDisplay(CommandKind::ClearClipboardHistory, L"Clear Clipboard History", L"Forget saved clipboard entries", {L"clipboard", L"history", L"clear"}),
@@ -3429,16 +3700,58 @@ class FeatherCastApp {
   // Cheap result sets (empty query, action mode) are computed synchronously so
   // callers that immediately show/position the window see correct sizing with
   // no flicker; the expensive full-pool search is offloaded to the worker.
+  void MarkSearchDataChanged() {
+    dataRevision_.fetch_add(1, std::memory_order_release);
+  }
+
   // Persist settings and invalidate the cached search corpus, since several
   // settings (pinnedApps, appAliases, usageStats, hiddenApps, showStoreApps,
   // quicklinks, recentApps) feed into the snapshot's items and ranking.
-  void PersistSettings() {
-    SaveSettings(settings_);
-    snapshotDirty_ = true;
+  bool PersistSettings() {
+    bool schedule = false;
+    {
+      std::lock_guard lock(settingsPersistenceMutex_);
+      pendingSettingsSave_ = settings_;
+      if (!settingsSaveScheduled_) {
+        settingsSaveScheduled_ = true;
+        schedule = true;
+      }
+    }
+    if (schedule && !persistenceExecutor_.Submit([this](std::stop_token) {
+          for (;;) {
+            std::optional<Settings> pending;
+            {
+              std::lock_guard lock(settingsPersistenceMutex_);
+              if (!pendingSettingsSave_) {
+                settingsSaveScheduled_ = false;
+                return;
+              }
+              pending = std::move(pendingSettingsSave_);
+              pendingSettingsSave_.reset();
+            }
+            if (!SaveSettings(*pending) && !stopThreads_ &&
+                !persistenceErrorQueued_.exchange(true, std::memory_order_acq_rel)) {
+              PostMessageW(hwnd_, WM_PERSISTENCE_ERROR, 0, 0);
+            }
+          }
+        })) {
+      {
+        std::lock_guard lock(settingsPersistenceMutex_);
+        settingsSaveScheduled_ = false;
+        pendingSettingsSave_.reset();
+      }
+      const bool saved = SaveSettings(settings_);
+      if (!saved && !persistenceErrorQueued_.exchange(true, std::memory_order_acq_rel)) {
+        PostMessageW(hwnd_, WM_PERSISTENCE_ERROR, 0, 0);
+      }
+    }
+    MarkSearchDataChanged();
+    return true;
   }
 
   void RequestSearch() {
     QueryRequest req = GatherRequest();
+    if (visible_) NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 1);
     if (!req.compactClear && !req.empty && !req.actionMode) {
       extensions_.RequestQuery(req.query, req.generation);
     }
@@ -3457,6 +3770,8 @@ class FeatherCastApp {
   QueryRequest GatherRequest() {
     QueryRequest req;
     req.generation = ++searchGeneration_;
+    latestRequestedSearchGeneration_.store(req.generation, std::memory_order_release);
+    req.latestGeneration = &latestRequestedSearchGeneration_;
     req.query = query_;
 
     const bool empty = Trim(query_).empty();
@@ -3467,6 +3782,7 @@ class FeatherCastApp {
                        !actionMode_ && browseView_ == BrowseView::None;
     req.recentIds = std::set<std::wstring>(settings_.recentApps.begin(), settings_.recentApps.end());
     req.limit = std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING);
+    req.now = UnixNow();
     req.searchEngines = settings_.searchEngines;
     {
       std::lock_guard lock(dataMutex_);
@@ -3476,10 +3792,9 @@ class FeatherCastApp {
 
     if (req.compactClear) return req;
 
-    if (snapshotDirty_ || !snapshot_) {
-      snapshot_ = BuildSnapshot();
-      snapshotDirty_ = false;
-    }
+    const uint64_t requestedRevision = dataRevision_.load(std::memory_order_acquire);
+    if (!snapshot_) snapshot_ = std::make_shared<SearchSnapshot>();
+    if (snapshotRevision_ != requestedRevision) ScheduleSnapshotBuild(requestedRevision);
     req.snapshot = snapshot_;
 
     // Action mode builds a small, target-specific list each call.
@@ -3503,44 +3818,53 @@ class FeatherCastApp {
 
   // Builds the query-independent search corpus once per data/settings version.
   // Expensive (deep-copies every app/window/file and derives a SearchItem each),
-  // so it runs only when snapshotDirty_ is set, not on every keystroke.
-  std::shared_ptr<const SearchSnapshot> BuildSnapshot() {
+  // so it runs only when the data revision changes, not on every keystroke.
+  std::shared_ptr<const SearchSnapshot> BuildSnapshot(
+      const Settings& snapshotSettings) {
     auto snap = std::make_shared<SearchSnapshot>();
 
     std::vector<AppEntry> apps;
     std::vector<WindowEntry> windows;
+    std::vector<AppEntry> files;
+    std::vector<feathercast::snippets::Snippet> snippets;
+    std::vector<ClipboardEntry> clipboard;
     {
       std::lock_guard lock(dataMutex_);
       apps = apps_;
       windows = windows_;
+      files = fileIndex_;
+      snippets = snippets_;
+      clipboard = clipboardHistory_;
     }
 
     std::vector<DisplayItem> appItems;
     for (const auto& app : apps) {
-      if (ContainsAnyAppKey(settings_.hiddenApps, app)) continue;
-      if (!settings_.showStoreApps && IsStoreLikeSource(app.source)) continue;
+      if (ContainsAnyAppKey(snapshotSettings.hiddenApps, app)) continue;
+      if (!snapshotSettings.showStoreApps && IsStoreLikeSource(app.source)) continue;
       appItems.push_back(AppDisplay(app));
     }
-    for (const auto& link : settings_.quicklinks) {
+    for (const auto& link : snapshotSettings.quicklinks) {
       if (link.keyword.empty() || link.target.empty()) continue;
       appItems.push_back(AppDisplay(QuicklinkApp(link)));
     }
     for (const auto& folder : systemFolders_) {
-      if (ContainsAnyAppKey(settings_.hiddenApps, folder)) continue;
+      if (ContainsAnyAppKey(snapshotSettings.hiddenApps, folder)) continue;
       appItems.push_back(AppDisplay(folder));
     }
-    for (const auto& snippet : snippets_) {
+    for (const auto& snippet : snippets) {
       snap->snippetItems.push_back(SnippetDisplay(snippet));
     }
-    for (const auto& entry : clipboardHistory_) {
-      snap->clipboardItems.push_back(ClipboardDisplay(entry));
+    if (snapshotSettings.clipboardHistoryEnabled) {
+      for (const auto& entry : clipboard) {
+        snap->clipboardItems.push_back(ClipboardDisplay(entry));
+      }
     }
     for (const auto& item : snap->clipboardItems) {
-      snap->clipboardSearchItems.push_back(ToSearchItem(item));
+      snap->clipboardSearchItems.push_back(ToSearchItem(item, snapshotSettings));
     }
 
     std::vector<DisplayItem> windowItems;
-    if (settings_.showOpenWindows) {
+    if (snapshotSettings.showOpenWindows) {
       for (const auto& window : windows) windowItems.push_back(WindowDisplay(window));
     }
     auto commandItems = BuiltInCommands();
@@ -3552,9 +3876,9 @@ class FeatherCastApp {
         for (const auto& key : AppKeys(item.app)) byId[key] = item;
       }
       for (const auto& item : appItems) {
-        if (ContainsAnyAppKey(settings_.pinnedApps, item.app)) snap->pinned.push_back(item);
+        if (ContainsAnyAppKey(snapshotSettings.pinnedApps, item.app)) snap->pinned.push_back(item);
       }
-      for (const auto& id : settings_.recentApps) {
+      for (const auto& id : snapshotSettings.recentApps) {
         if (byId.contains(id)) snap->recent.push_back(byId[id]);
       }
       for (const auto& item : appItems) {
@@ -3572,15 +3896,77 @@ class FeatherCastApp {
     pool.insert(pool.end(), snap->clipboardItems.begin(), snap->clipboardItems.end());
     pool.insert(pool.end(), appItems.begin(), appItems.end());
     pool.insert(pool.end(), commandItems.begin(), commandItems.end());
-    {
-      std::lock_guard lock(dataMutex_);
-      for (const auto& file : fileIndex_) pool.push_back(AppDisplay(file));
+    if (snapshotSettings.fileIndexEnabled) {
+      for (const auto& file : files) pool.push_back(AppDisplay(file));
     }
-    snap->searchItems.reserve(pool.size());
-    for (const auto& item : pool) snap->searchItems.push_back(ToSearchItem(item));
+    std::vector<feathercast::core::PreparedSearchItem> searchItems;
+    searchItems.reserve(pool.size());
+    for (const auto& item : pool) {
+      searchItems.push_back(feathercast::core::PrepareSearchItem(ToSearchItem(item, snapshotSettings)));
+    }
+    snap->searchItems = std::move(searchItems);
     snap->pool = std::move(pool);
 
     return snap;
+  }
+
+  void ScheduleSnapshotBuild(uint64_t revision) {
+    if (snapshotRevision_ == revision || snapshotScheduledRevision_ == revision) return;
+    SnapshotBuildRequest request;
+    request.revision = revision;
+    request.settings = settings_;
+    {
+      std::lock_guard lock(snapshotMutex_);
+      pendingSnapshotBuild_ = std::move(request);
+    }
+    snapshotScheduledRevision_ = revision;
+    snapshotCv_.notify_one();
+  }
+
+  void StartSnapshotWorker() {
+    snapshotThread_ = std::jthread([this](std::stop_token stopToken) {
+      for (;;) {
+        SnapshotBuildRequest request;
+        {
+          std::unique_lock lock(snapshotMutex_);
+          snapshotCv_.wait(lock, [&] {
+            return pendingSnapshotBuild_.has_value() || stopToken.stop_requested() || stopThreads_;
+          });
+          if (stopToken.stop_requested() || stopThreads_) return;
+          request = std::move(*pendingSnapshotBuild_);
+          pendingSnapshotBuild_.reset();
+        }
+
+        auto built = BuildSnapshot(request.settings);
+        if (stopToken.stop_requested() || stopThreads_) return;
+        if (dataRevision_.load(std::memory_order_acquire) != request.revision) continue;
+        {
+          std::lock_guard lock(snapshotMutex_);
+          latestSnapshotBuild_ = SnapshotBuildResult{request.revision, std::move(built)};
+        }
+        if (!stopThreads_) PostMessageW(hwnd_, WM_SNAPSHOT_READY, 0, 0);
+      }
+    });
+  }
+
+  void OnSnapshotReady() {
+    std::optional<SnapshotBuildResult> result;
+    {
+      std::lock_guard lock(snapshotMutex_);
+      if (latestSnapshotBuild_) result = std::move(latestSnapshotBuild_);
+      latestSnapshotBuild_.reset();
+    }
+    if (!result || !result->snapshot) return;
+
+    const uint64_t currentRevision = dataRevision_.load(std::memory_order_acquire);
+    if (result->revision != currentRevision) {
+      ScheduleSnapshotBuild(currentRevision);
+      return;
+    }
+    snapshot_ = std::move(result->snapshot);
+    snapshotRevision_ = result->revision;
+    RequestSearch();
+    InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
   // Pure engine: QueryRequest -> ResultsCollection. No member/UI state access,
@@ -3679,9 +4065,13 @@ class FeatherCastApp {
 
       addSection(L"Extensions", take(req.extensionItems, 20));
 
-      auto order = feathercast::core::Search(req.query, req.snapshot->searchItems, req.recentIds);
-      const size_t limit = static_cast<size_t>(req.limit);
-      if (order.size() > limit) order.resize(limit);
+      feathercast::core::SearchOptions searchOptions;
+      searchOptions.limit = static_cast<size_t>(req.limit);
+      searchOptions.now = req.now;
+      searchOptions.generation = req.generation;
+      searchOptions.latestGeneration = req.latestGeneration;
+      auto order = feathercast::core::SearchPrepared(
+          req.query, req.snapshot->searchItems, req.recentIds, searchOptions);
 
       std::vector<DisplayItem> hits;
       hits.reserve(order.size());
@@ -3743,9 +4133,21 @@ class FeatherCastApp {
   void ApplyResults(ResultsCollection result) {
     sections_ = std::move(result.sections);
     flatItems_ = std::move(result.flatItems);
+    if (pendingNavigationRestore_) {
+      const auto& restore = *pendingNavigationRestore_;
+      const auto match = std::find_if(
+          flatItems_.begin(), flatItems_.end(),
+          [&](const DisplayItem& item) { return item.Key() == restore.selectedKey; });
+      selected_ = match != flatItems_.end()
+                      ? static_cast<int>(std::distance(flatItems_.begin(), match))
+                      : restore.selected;
+      scroll_ = restore.scroll;
+      pendingNavigationRestore_.reset();
+    }
     if (selected_ >= static_cast<int>(flatItems_.size())) selected_ = std::max<int>(0, static_cast<int>(flatItems_.size()) - 1);
     ApplyWindowSize();
     SyncSelectionAnimationToTarget();
+    NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
   }
 
   // Hand the newest request to the worker, coalescing any unstarted request.
@@ -3780,7 +4182,8 @@ class FeatherCastApp {
     });
   }
 
-  feathercast::core::SearchItem ToSearchItem(const DisplayItem& item) {
+  feathercast::core::SearchItem ToSearchItem(const DisplayItem& item,
+                                             const Settings& searchSettings) const {
     feathercast::core::SearchItem out;
     if (item.isCalculator) {
       out.id = item.Key();
@@ -3857,18 +4260,22 @@ class FeatherCastApp {
       out.launchTarget = item.app.launchTarget;
       out.keywords = item.app.keywords;
       out.systemEssential = item.app.systemEssential;
-      out.pinned = ContainsAnyAppKey(settings_.pinnedApps, item.app);
+      out.pinned = ContainsAnyAppKey(searchSettings.pinnedApps, item.app);
       for (const auto& key : AppKeys(item.app)) {
-        if (auto alias = settings_.appAliases.find(key); alias != settings_.appAliases.end()) {
+        if (auto alias = searchSettings.appAliases.find(key); alias != searchSettings.appAliases.end()) {
           out.keywords.push_back(alias->second);
         }
-        if (auto usage = settings_.usageStats.find(key); usage != settings_.usageStats.end()) {
+        if (auto usage = searchSettings.usageStats.find(key); usage != searchSettings.usageStats.end()) {
           out.usageCount = std::max(out.usageCount, usage->second.launches);
           out.lastUsed = std::max(out.lastUsed, usage->second.lastUsed);
         }
       }
     }
     return out;
+  }
+
+  feathercast::core::SearchItem ToSearchItem(const DisplayItem& item) const {
+    return ToSearchItem(item, settings_);
   }
 
   HMONITOR ResolveOverlayMonitor(HWND foreground) const {
@@ -3908,54 +4315,33 @@ class FeatherCastApp {
       powerThrottling.StateMask = 0;
       SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
     } else {
-      // Immediately free heavyweight Direct2D resources and in-memory caches
-      overlaySurface_.Reset();
-      settingsSurface_.Reset();
-      ClearIconBitmaps();
-      brushCache_.clear();
-
-      // Background Memory Optimization:
-      
-      // 1. Release query-independent search corpus snapshot
-      snapshot_ = nullptr;
-      snapshotDirty_ = true;
-
-      // 2. Reclaim query-dependent result lists
-      latestResult_ = ResultsCollection{};
+      // Retain prepared search, rendering, icon, emoji, and extension state so
+      // the next launcher invocation stays warm. Only query-specific results
+      // are discarded; reusable capacity is intentionally kept.
+      {
+        std::lock_guard lock(searchMutex_);
+        latestResult_ = ResultsCollection{};
+        pendingRequest_.reset();
+      }
+      ++searchGeneration_;
+      latestRequestedSearchGeneration_.store(searchGeneration_, std::memory_order_release);
       sections_.clear();
-      sections_.shrink_to_fit();
       flatItems_.clear();
-      flatItems_.shrink_to_fit();
       hits_.clear();
-      hits_.shrink_to_fit();
 
-      // 3. Clear extension caches and terminate background plugin processes
-      extensions_.OnBackground();
-
-      // 4. Free lazy-loaded emoji and symbols memory lists & caches
-      feathercast::emoji::FreeEmojiMemory();
-      feathercast::symbols::FreeSymbolsMemory();
-
-      // Minimize CRT heap fragmentation and decommit unused pages back to the OS
-      _heapmin();
-
-      // Lower scheduling priority class
+      // Background work remains unobtrusive without forcing page faults,
+      // re-decoding icons, or restarting plugin hosts on every reopen.
       SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
-      // Set low memory priority class
       MEMORY_PRIORITY_INFORMATION memPriority{};
-      memPriority.MemoryPriority = MEMORY_PRIORITY_VERY_LOW;
+      memPriority.MemoryPriority = MEMORY_PRIORITY_LOW;
       SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memPriority, sizeof(memPriority));
 
-      // Enable EcoQoS (Power Throttling)
       PROCESS_POWER_THROTTLING_STATE powerThrottling{};
       powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
       powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
       powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
       SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
-
-      // Schedule deferred working set empty (10 seconds delay) to prevent page-fault storms
-      SetTimer(hwnd_, TIMER_MEM_TRIM, 10000, nullptr);
     }
   }
 
@@ -3966,7 +4352,10 @@ class FeatherCastApp {
       if (foreground && foreground != hwnd_) lastActiveWindow_ = foreground;
     }
     overlayMonitor_ = ResolveOverlayMonitor(foreground);
-    RefreshWindows();
+    visible_ = true;
+    UpdateBackgroundState();
+    navigationStack_.clear();
+    pendingNavigationRestore_.reset();
     actionMode_ = false;
     browseView_ = BrowseView::None;
     ClearQuery();
@@ -3979,6 +4368,7 @@ class FeatherCastApp {
     ApplyGlass(hwnd_);
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    RefreshWindowsAsync();
 
     // Auto-focus overlay
     SendVirtualKeyTap(0xE8);
@@ -4003,9 +4393,7 @@ class FeatherCastApp {
     ignoreMouseUntilMove_ = true;
 
     SetTimer(hwnd_, 1, 200, nullptr);
-    visible_ = true;
-    UpdateBackgroundState();
-    animating_ = settings_.animationsEnabled;
+    animating_ = AnimationsAllowed();
     if (animating_) {
       animStartQpc_ = NowQpc();
       lastAnimationFrameQpc_ = animStartQpc_;
@@ -4049,6 +4437,7 @@ class FeatherCastApp {
     shortcutRecorder_.Reset();
     pendingShortcut_.clear();
     settingsHover_ = -1;
+    settingsFocusIndex_ = 0;
     ShowSettingsWindow();
   }
 
@@ -4070,7 +4459,7 @@ class FeatherCastApp {
     const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - width) / 2;
     const int yPos = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - clamped) / 2;
 
-    SetWindowPos(settingsHwnd_, HWND_TOPMOST, x, yPos, width, clamped, SWP_NOACTIVATE);
+    SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, x, yPos, width, clamped, SWP_NOACTIVATE);
     // Reassert the transparent window treatment now that the window is sized.
     ApplyGlass(settingsHwnd_);
     ShowWindow(settingsHwnd_, SW_SHOW);
@@ -4091,6 +4480,7 @@ class FeatherCastApp {
   void EnterActionMode(const DisplayItem& target) {
     if (target.isCommand || target.isAction || target.isExtension || target.isSnippet ||
         target.isClipboard || target.isRunCommand || target.isSymbol) return;
+    PushNavigationState();
     actionMode_ = true;
     actionTarget_ = target;
     ClearQuery();
@@ -4102,17 +4492,12 @@ class FeatherCastApp {
   }
 
   void ExitActionMode() {
-    actionMode_ = false;
-    ClearQuery();
-    selected_ = 0;
-    scroll_ = 0;
-    SyncSelectionAnimationToTarget();
-    RequestSearch();
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    RestoreNavigationState();
   }
 
   // Open a dedicated clipboard/emoji browse view in place of the result list.
   void EnterBrowseView(BrowseView view) {
+    PushNavigationState();
     actionMode_ = false;
     browseView_ = view;
     ClearQuery();
@@ -4124,10 +4509,47 @@ class FeatherCastApp {
   }
 
   void ExitBrowseView() {
-    browseView_ = BrowseView::None;
-    ClearQuery();
-    selected_ = 0;
-    scroll_ = 0;
+    RestoreNavigationState();
+  }
+
+  void PushNavigationState() {
+    NavigationState state;
+    state.view = view_;
+    state.actionMode = actionMode_;
+    state.browseView = browseView_;
+    state.query = query_;
+    state.caret = caret_;
+    state.selectionAnchor = selectionAnchor_;
+    state.selected = selected_;
+    state.scroll = scroll_;
+    if (selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size())) {
+      state.selectedKey = flatItems_[selected_].Key();
+    }
+    navigationStack_.push_back(std::move(state));
+  }
+
+  void RestoreNavigationState() {
+    if (navigationStack_.empty()) {
+      actionMode_ = false;
+      browseView_ = BrowseView::None;
+      ClearQuery();
+      selected_ = 0;
+      scroll_ = 0;
+    } else {
+      NavigationState state = std::move(navigationStack_.back());
+      navigationStack_.pop_back();
+      view_ = state.view;
+      actionMode_ = state.actionMode;
+      browseView_ = state.browseView;
+      query_ = state.query;
+      imeComposition_.clear();
+      caret_ = std::min(state.caret, query_.size());
+      selectionAnchor_ = state.selectionAnchor;
+      if (selectionAnchor_) *selectionAnchor_ = std::min(*selectionAnchor_, query_.size());
+      selected_ = state.selected;
+      scroll_ = state.scroll;
+      pendingNavigationRestore_ = std::move(state);
+    }
     SyncSelectionAnimationToTarget();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -4144,11 +4566,15 @@ class FeatherCastApp {
   void ClearQuery() {
     query_.clear();
     caret_ = 0;
+    selectionAnchor_.reset();
   }
 
   void SetQueryText(std::wstring value) {
+    navigationStack_.clear();
+    pendingNavigationRestore_.reset();
     query_ = std::move(value);
     caret_ = query_.size();
+    selectionAnchor_.reset();
     actionMode_ = false;
     browseView_ = BrowseView::None;
     selected_ = 0;
@@ -4160,12 +4586,54 @@ class FeatherCastApp {
 
   void ClampCaret() {
     caret_ = std::min(caret_, query_.size());
+    if (selectionAnchor_) *selectionAnchor_ = std::min(*selectionAnchor_, query_.size());
+  }
+
+  std::optional<std::pair<size_t, size_t>> SelectionRange() const {
+    if (!selectionAnchor_ || *selectionAnchor_ == caret_) return std::nullopt;
+    return std::minmax(*selectionAnchor_, caret_);
+  }
+
+  void MoveCaret(size_t next, bool extendSelection) {
+    next = std::min(next, query_.size());
+    if (extendSelection) {
+      if (!selectionAnchor_) selectionAnchor_ = caret_;
+    } else {
+      selectionAnchor_.reset();
+    }
+    caret_ = next;
+  }
+
+  bool DeleteSelection() {
+    const auto range = SelectionRange();
+    if (!range) return false;
+    query_.erase(range->first, range->second - range->first);
+    caret_ = range->first;
+    selectionAnchor_.reset();
+    return true;
+  }
+
+  void CopySelectionToClipboard() {
+    if (const auto range = SelectionRange()) {
+      CopyTextToClipboard(query_.substr(range->first, range->second - range->first));
+    }
+  }
+
+  void InsertQueryText(const std::wstring& text) {
+    DeleteSelection();
+    constexpr size_t kMaxQueryChars = 4096;
+    const size_t room = query_.size() < kMaxQueryChars ? kMaxQueryChars - query_.size() : 0;
+    const std::wstring clipped = text.substr(0, room);
+    query_.insert(caret_, clipped);
+    caret_ += clipped.size();
+    selectionAnchor_.reset();
   }
 
   void SetCaretFromSearchClick(float x) {
     ClampCaret();
     if (query_.empty() || !dwriteFactory_) {
       caret_ = query_.size();
+      selectionAnchor_.reset();
       return;
     }
 
@@ -4177,10 +4645,12 @@ class FeatherCastApp {
     const float textWidth = std::max(1.0f, width - 94.0f - textLeft);
     if (x <= textLeft) {
       caret_ = 0;
+      selectionAnchor_.reset();
       return;
     }
     if (x >= textLeft + textWidth) {
       caret_ = query_.size();
+      selectionAnchor_.reset();
       return;
     }
 
@@ -4194,6 +4664,7 @@ class FeatherCastApp {
         layout.GetAddressOf());
     if (FAILED(hr)) {
       caret_ = query_.size();
+      selectionAnchor_.reset();
       return;
     }
 
@@ -4203,6 +4674,7 @@ class FeatherCastApp {
     if (SUCCEEDED(layout->HitTestPoint(x - textLeft, 24.0f, &trailing, &inside, &metrics))) {
       caret_ = static_cast<size_t>(metrics.textPosition + (trailing ? metrics.length : 0));
       ClampCaret();
+      selectionAnchor_.reset();
     }
   }
 
@@ -4352,7 +4824,7 @@ class FeatherCastApp {
 
   void StartSelectionAnimationFrom(std::optional<float> previousY, int previousScroll, SelectionMotion motion) {
     const auto targetY = SelectedRowTop();
-    if (!settings_.animationsEnabled || !previousY || !targetY) {
+    if (!AnimationsAllowed() || !previousY || !targetY) {
       SyncSelectionAnimationToTarget();
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
       return;
@@ -4394,11 +4866,12 @@ class FeatherCastApp {
       SyncSelectionAnimationToTarget();
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
+    NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd_, OBJID_CLIENT, selected_ + 2);
   }
 
   void UpdateSelectionAnimation(double deltaTime) {
     const auto targetY = SelectedRowTop();
-    if (!settings_.animationsEnabled || !targetY) {
+    if (!AnimationsAllowed() || !targetY) {
       SyncSelectionAnimationToTarget();
       return;
     }
@@ -4421,7 +4894,7 @@ class FeatherCastApp {
   }
 
   bool HasRevealAnimation() const {
-    return visible_ && settings_.animationsEnabled && animating_;
+    return visible_ && AnimationsAllowed() && animating_;
   }
 
   void RequestAnimationFrame() {
@@ -4447,7 +4920,7 @@ class FeatherCastApp {
   }
 
   void StartSelectionAnimationTimer() {
-    if (!hwnd_ || selectionTimerActive_ || !visible_ || !settings_.animationsEnabled || !animatingSelection_) return;
+    if (!hwnd_ || selectionTimerActive_ || !visible_ || !AnimationsAllowed() || !animatingSelection_) return;
     selectionTimerActive_ = SetTimer(hwnd_, TIMER_SELECTION_ANIM, 8, nullptr) != 0;
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
@@ -4464,7 +4937,7 @@ class FeatherCastApp {
   }
 
   void OnSelectionAnimationTimer() {
-    if (!visible_ || !settings_.animationsEnabled || !animatingSelection_) {
+    if (!visible_ || !AnimationsAllowed() || !animatingSelection_) {
       StopSelectionAnimationTimer();
       return;
     }
@@ -4501,7 +4974,7 @@ class FeatherCastApp {
       ID2D1DeviceContext* dc = overlaySurface_.dc.Get();
       SetActiveTarget(dc);
       dc->BeginDraw();
-      dc->Clear(D2D1::ColorF(0.0f, 0.0f));  // fully transparent: desktop content shows through
+      dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));  // fully transparent: desktop content shows through
       hits_.clear();
 
       // Whole-panel open animation: scale up + rise + fade as one unit. The
@@ -4547,7 +5020,7 @@ class FeatherCastApp {
       ID2D1DeviceContext* dc = settingsSurface_.dc.Get();
       SetActiveTarget(dc);
       dc->BeginDraw();
-      dc->Clear(D2D1::ColorF(0.0f, 0.0f));
+      dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
       hits_.clear();
       DrawSettings();
       const HRESULT hr = dc->EndDraw();
@@ -4688,13 +5161,31 @@ class FeatherCastApp {
     DrawObsidianBackground(width, height, theme_.overlayRadius, ObsidianBackgroundKind::Overlay);
 
     DrawSearchIcon(18, 20, D2DColor(theme_.textMuted));
-    const std::wstring input = query_.empty() ? SearchPlaceholder() : query_;
-    DrawTextBlock(input, {52, 15, width - 94, 48}, inputFormat_.Get(), query_.empty() ? D2DColor(theme_.textMuted) : D2DColor(theme_.textPrimary));
+    std::wstring displayedQuery = query_;
+    if (!imeComposition_.empty()) {
+      displayedQuery.insert(std::min(caret_, displayedQuery.size()), imeComposition_);
+    }
+    const std::wstring input = displayedQuery.empty() ? SearchPlaceholder() : displayedQuery;
+    if (const auto range = SelectionRange()) {
+      const float selectionLeft = 52.0f + MeasureCaretOffset(query_.substr(0, range->first), width);
+      const float selectionRight = 52.0f + MeasureCaretOffset(query_.substr(0, range->second), width);
+      FillRound({selectionLeft, 17.0f, std::max(selectionLeft + 1.0f, selectionRight), 46.0f},
+                3.0f, Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.35f, 0.85f));
+    }
+    DrawTextBlock(input, {52, 15, width - 94, 48}, inputFormat_.Get(), displayedQuery.empty() ? D2DColor(theme_.textMuted) : D2DColor(theme_.textPrimary));
 
     float caretX = 52.0f;
-    if (!query_.empty()) {
+    if (!displayedQuery.empty()) {
       ClampCaret();
-      caretX = 52.0f + MeasureCaretOffset(query_.substr(0, caret_), width);
+      std::wstring caretPrefix = query_.substr(0, caret_);
+      caretPrefix += imeComposition_;
+      caretX = 52.0f + MeasureCaretOffset(caretPrefix, width);
+    }
+    if (!imeComposition_.empty()) {
+      const float compositionLeft = 52.0f + MeasureCaretOffset(query_.substr(0, caret_), width);
+      auto underline = Brush(D2DColor(accent));
+      activeRT_->DrawLine(D2D1::Point2F(compositionLeft, 44.0f),
+                          D2D1::Point2F(caretX, 44.0f), underline.Get(), 1.0f);
     }
     const bool showCaret = CaretPhase();
     if (showCaret) {
@@ -4784,7 +5275,8 @@ class FeatherCastApp {
     }
 
     if (sections_.empty()) {
-      DrawTextBlock(appsReady_ ? L"No results" : L"Loading apps...", {0, 170, width, 210}, centerFormat_.Get(), D2DColor(theme_.textMuted));
+      DrawTextBlock(appsReady_.load(std::memory_order_acquire) ? L"No results" : L"Loading apps...",
+                    {0, 170, width, 210}, centerFormat_.Get(), D2DColor(theme_.textMuted));
     }
 
     if (showFooter) {
@@ -4847,7 +5339,7 @@ class FeatherCastApp {
   void DrawSelectionPill(float width) {
     const auto targetY = SelectedRowTop();
     if (!targetY) return;
-    if (!settings_.animationsEnabled || visualSelectedY_ < 0.0f) {
+    if (!AnimationsAllowed() || visualSelectedY_ < 0.0f) {
       visualSelectedY_ = *targetY;
       animatingSelection_ = false;
     }
@@ -5015,6 +5507,8 @@ class FeatherCastApp {
     h += kSettSection + kSettShortcut;            // Shortcut
     h += kSettSection + 4 * kSettRow;             // General
     h += kSettSection + 4 * kSettRow;             // Results
+    h += kSettSection + 5 * kSettRow + 2 * kSettMaint; // Privacy & local data
+    h += kSettSection + kSettRow + kSettMaint;  // Extensions
     h += kSettSection + kSettRow + (settings_.syncAccentColor ? 0.0f : 48.0f);  // Appearance
     h += kSettSection + kSettMaint;               // Maintenance
     h += kSettBottom;
@@ -5022,6 +5516,58 @@ class FeatherCastApp {
   }
 
   bool SettHover(HitType type) const { return settingsHover_ == static_cast<int>(type); }
+  bool SettFocused(HitType type) const {
+    const auto order = SettingsFocusOrder();
+    return settingsFocusIndex_ >= 0 && settingsFocusIndex_ < static_cast<int>(order.size()) &&
+           order[static_cast<size_t>(settingsFocusIndex_)] == type;
+  }
+
+  std::vector<HitType> SettingsFocusOrder() const {
+    std::vector<HitType> order = {
+      HitType::RecordShortcut,
+      HitType::StartupToggle,
+      HitType::UpdateChecksToggle,
+      HitType::CompactToggle,
+      HitType::AnimationsToggle,
+      HitType::ShowWindowsToggle,
+      HitType::ShowStoreAppsToggle,
+      HitType::OverlayWidthDown,
+      HitType::OverlayWidthUp,
+      HitType::MaxResultsDown,
+      HitType::MaxResultsUp,
+      HitType::ClipboardHistoryToggle,
+      HitType::ClipboardLimitDown,
+      HitType::ClipboardLimitUp,
+      HitType::FileIndexToggle,
+      HitType::FileIndexLimitDown,
+      HitType::FileIndexLimitUp,
+      HitType::AddFileRoot,
+      HitType::ClearFileRoots,
+      HitType::DiagnosticsToggle,
+      HitType::ClearClipboardData,
+      HitType::ClearFileIndexData,
+      HitType::OpenLocalDataFolder,
+      HitType::ReloadExtensions,
+      HitType::OpenPluginsFolder,
+      HitType::AccentToggle,
+      HitType::ClearRecents,
+      HitType::ClearIconCache,
+      HitType::CheckUpdates,
+      HitType::CloseSettings,
+    };
+    auto shortcutAction = order.begin() + 1;
+    if (!pendingShortcut_.empty()) {
+      shortcutAction = order.insert(shortcutAction, HitType::SaveShortcut) + 1;
+    }
+    if (!settings_.shortcut.empty() && settings_.shortcut != L"none") {
+      order.insert(shortcutAction, HitType::ClearShortcut);
+    }
+    if (!settings_.syncAccentColor) {
+      const auto accent = std::find(order.begin(), order.end(), HitType::AccentToggle);
+      order.insert(accent + 1, HitType::AccentColor);
+    }
+    return order;
+  }
 
   D2D1_COLOR_F SettWhite() const { return D2DColor(theme_.textPrimary); }
   D2D1_COLOR_F SettGray() const { return D2DColor(theme_.textMuted); }
@@ -5047,9 +5593,10 @@ class FeatherCastApp {
     RectF track{left, top, right, top + h};
     const bool hover = SettHover(type);
     FillRound(track, 13, on ? D2DColor(accent) : (hover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface)));
+    if (SettFocused(type)) StrokeRound(track, 13, D2DColor(accent), 2.0f);
     const float knobX = on ? track.right - 22.0f : track.left + 4.0f;
     FillRound({knobX, top + 4, knobX + 18, top + 22}, 9, D2D1::ColorF(1, 1, 1));
-    hits_.push_back({track, type});
+    hits_.push_back({{16.0f, y, width - 16.0f, y + rowH}, type});
   }
 
   void DrawStepper(float y, float rowH, const std::wstring& value, HitType down, HitType up, float width) {
@@ -5108,6 +5655,9 @@ class FeatherCastApp {
       const bool recHover = SettHover(HitType::RecordShortcut);
       FillRound(record, theme_.controlRadius, recording_ ? Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.28f) : (recHover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface)));
       StrokeRound(record, theme_.controlRadius, recording_ ? D2DColor(accent) : D2DColor(theme_.border));
+      if (SettFocused(HitType::RecordShortcut)) {
+        StrokeRound(record, theme_.controlRadius, D2DColor(accent), 2.0f);
+      }
       hits_.push_back({record, HitType::RecordShortcut});
       const std::wstring recordText = recording_ ? L"Press a key..." : (!pendingShortcut_.empty() ? pendingShortcut_ : L"Record new shortcut");
       DrawTextBlock(recordText, {record.left + 12, record.top + 10, record.right - 12, record.bottom}, bodyFormat_.Get(), recording_ ? D2DColor(accent) : SettWhite());
@@ -5155,6 +5705,73 @@ class FeatherCastApp {
     DrawStepper(y, kSettRow, std::to_wstring(std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING)), HitType::MaxResultsDown, HitType::MaxResultsUp, width);
     y += kSettRow;
 
+    // ---- Privacy ----
+    y = DrawSettingsSection(y, L"PRIVACY", width);
+    DrawSettingRowLabel(y, kSettRow, L"Clipboard History",
+                        L"Store copied text locally for launcher search and paste.", width - 90);
+    DrawSwitch(y, kSettRow, settings_.clipboardHistoryEnabled, HitType::ClipboardHistoryToggle, width);
+    y += kSettRow;
+    DrawSettingRowLabel(y, kSettRow, L"Clipboard Retention",
+                        L"Maximum number of text entries retained locally.", width - 200);
+    DrawStepper(y, kSettRow, std::to_wstring(ClipboardHistoryLimit()),
+                HitType::ClipboardLimitDown, HitType::ClipboardLimitUp, width);
+    y += kSettRow;
+    DrawSettingRowLabel(y, kSettRow, L"Files & Folders Index",
+                        settings_.fileIndexRoots.empty()
+                            ? L"Using Desktop, Documents, and Downloads."
+                            : std::to_wstring(settings_.fileIndexRoots.size()) + L" custom folder(s).",
+                        width - 90);
+    DrawSwitch(y, kSettRow, settings_.fileIndexEnabled, HitType::FileIndexToggle, width);
+    y += kSettRow;
+    DrawSettingRowLabel(y, kSettRow, L"File Index Limit",
+                        L"Maximum number of files and folders stored locally.", width - 200);
+    DrawStepper(y, kSettRow, std::to_wstring(FileIndexLimit()),
+                HitType::FileIndexLimitDown, HitType::FileIndexLimitUp, width);
+    y += kSettRow;
+    DrawSettingRowLabel(y, kSettRow, L"Diagnostics",
+                        L"Write bounded troubleshooting logs without queries or clipboard text.", width - 90);
+    DrawSwitch(y, kSettRow, settings_.diagnosticsEnabled, HitType::DiagnosticsToggle, width);
+    y += kSettRow;
+    {
+      const float btnW = (width - 48 - 12) / 2.0f;
+      const float btnTop = y + (kSettMaint - 38) / 2.0f;
+      DrawSettingsButton({24, btnTop, 24 + btnW, btnTop + 38}, L"Add Indexed Folder", HitType::AddFileRoot);
+      DrawSettingsButton({36 + btnW, btnTop, width - 24, btnTop + 38}, L"Use Default Folders", HitType::ClearFileRoots);
+      y += kSettMaint;
+    }
+    {
+      const float btnW = (width - 48 - 24) / 3.0f;
+      const float btnTop = y + (kSettMaint - 38) / 2.0f;
+      DrawSettingsButton({24, btnTop, 24 + btnW, btnTop + 38}, L"Delete Clipboard Data", HitType::ClearClipboardData);
+      DrawSettingsButton({36 + btnW, btnTop, 24 + 2 * btnW + 12, btnTop + 38}, L"Delete File Index", HitType::ClearFileIndexData);
+      DrawSettingsButton({width - 24 - btnW, btnTop, width - 24, btnTop + 38}, L"Open Local Data", HitType::OpenLocalDataFolder);
+      y += kSettMaint;
+    }
+
+    // ---- Extensions ----
+    y = DrawSettingsSection(y, L"EXTENSIONS", width);
+    {
+      const auto health = extensions_.Health();
+      const size_t available = static_cast<size_t>(std::count_if(
+          health.begin(), health.end(),
+          [](const feathercast::extensions::PluginHealth& plugin) {
+            return plugin.available;
+          }));
+      DrawSettingRowLabel(
+          y, kSettRow, L"Installed Native Extensions",
+          std::to_wstring(available) + L" of " + std::to_wstring(health.size()) +
+              L" available. Only install extensions you trust.",
+          width - 24);
+      y += kSettRow;
+      const float btnW = (width - 48 - 12) / 2.0f;
+      const float btnTop = y + (kSettMaint - 38) / 2.0f;
+      DrawSettingsButton({24, btnTop, 24 + btnW, btnTop + 38},
+                         L"Reload Extensions", HitType::ReloadExtensions);
+      DrawSettingsButton({36 + btnW, btnTop, width - 24, btnTop + 38},
+                         L"Open Plugins Folder", HitType::OpenPluginsFolder);
+      y += kSettMaint;
+    }
+
     // ---- Appearance ----
     y = DrawSettingsSection(y, L"APPEARANCE", width);
     DrawSettingRowLabel(y, kSettRow, L"Sync Accent Color", settings_.syncAccentColor ? L"Match the Windows accent color automatically." : L"Using a custom accent color.", width - 90);
@@ -5198,7 +5815,10 @@ class FeatherCastApp {
   void DrawSettingsButton(RectF rect, const std::wstring& text, HitType type) {
     const bool hover = SettHover(type);
     FillRound(rect, theme_.controlRadius, hover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface));
-    StrokeRound(rect, theme_.controlRadius, hover ? D2DColor(theme_.textMuted) : D2DColor(theme_.border));
+    StrokeRound(rect, theme_.controlRadius,
+                SettFocused(type) ? D2DColor(ActiveAccent()) :
+                (hover ? D2DColor(theme_.textMuted) : D2DColor(theme_.border)),
+                SettFocused(type) ? 2.0f : 1.0f);
     DrawTextBlock(text, rect, centerFormat_.Get(), SettWhite());
     hits_.push_back({rect, type});
   }
@@ -5285,7 +5905,12 @@ class FeatherCastApp {
         std::lock_guard lock(iconQueueMutex_);
         pendingIcons_.erase(key);
       }
-      if (!stopThreads_ && !stopToken.stop_requested()) PostMessageW(hwnd_, WM_ICON_READY, 0, 0);
+      if (!stopThreads_ && !stopToken.stop_requested() &&
+          !iconReadyMessageQueued_.exchange(true, std::memory_order_acq_rel)) {
+        if (!PostMessageW(hwnd_, WM_ICON_READY, 0, 0)) {
+          iconReadyMessageQueued_.store(false, std::memory_order_release);
+        }
+      }
     }
     CoUninitialize();
   }
@@ -5310,7 +5935,18 @@ class FeatherCastApp {
     if (std::filesystem::exists(png, ec)) return true;
     UniqueBitmap bitmap(CreateShellBitmap(key));
     if (!bitmap) return false;
-    return SaveHBitmapPng(bitmap.get(), png);
+    auto temporary = png;
+    temporary += L".tmp-" + std::to_wstring(GetCurrentThreadId());
+    std::filesystem::remove(temporary, ec);
+    if (!SaveHBitmapPng(bitmap.get(), temporary)) {
+      std::filesystem::remove(temporary, ec);
+      return false;
+    }
+    if (!MoveFileExW(temporary.c_str(), png.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      std::filesystem::remove(temporary, ec);
+      return std::filesystem::exists(png, ec);
+    }
+    return true;
   }
 
   HBITMAP CreateShellBitmap(const std::wstring& key) {
@@ -5413,6 +6049,39 @@ class FeatherCastApp {
     }
 
     if (view_ != View::Search) return;
+    const bool control = ModifierPressed(VK_CONTROL);
+    const bool shift = ModifierPressed(VK_SHIFT);
+
+    if (control && vk == 'A') {
+      selectionAnchor_ = 0;
+      caret_ = query_.size();
+      InvalidateRect(hwnd_, nullptr, FALSE);
+      return;
+    }
+    if (control && vk == 'C') {
+      CopySelectionToClipboard();
+      return;
+    }
+    if (control && vk == 'X') {
+      CopySelectionToClipboard();
+      if (DeleteSelection()) {
+        selected_ = 0;
+        scroll_ = 0;
+        RequestSearch();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
+      return;
+    }
+    if (control && vk == 'V') {
+      if (const auto text = ReadClipboardText()) {
+        InsertQueryText(*text);
+        selected_ = 0;
+        scroll_ = 0;
+        RequestSearch();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
+      return;
+    }
 
     if (vk == 'K' && ModifierPressed(VK_CONTROL)) {
       if (!actionMode_ && browseView_ == BrowseView::None &&
@@ -5428,14 +6097,14 @@ class FeatherCastApp {
       SelectResult(selected_ - 1, true, true);
     } else if (vk == VK_HOME) {
       if (!query_.empty()) {
-        caret_ = 0;
+        MoveCaret(0, shift);
         InvalidateRect(hwnd_, nullptr, FALSE);
       } else {
         SelectResult(0, true, true);
       }
     } else if (vk == VK_END) {
       if (!query_.empty()) {
-        caret_ = query_.size();
+        MoveCaret(query_.size(), shift);
         InvalidateRect(hwnd_, nullptr, FALSE);
       } else {
         SelectResult(static_cast<int>(flatItems_.size()) - 1, true, true);
@@ -5446,7 +6115,10 @@ class FeatherCastApp {
       SelectResult(selected_ + 8, true, true);
     } else if (vk == VK_RIGHT) {
       if (caret_ < query_.size()) {
-        ++caret_;
+        MoveCaret(control
+                      ? feathercast::text_edit::NextWord(query_, caret_)
+                      : feathercast::text_edit::NextCodePoint(query_, caret_),
+                  shift);
         InvalidateRect(hwnd_, nullptr, FALSE);
       } else if (query_.empty() && browseView_ == BrowseView::None &&
                  selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size())) {
@@ -5457,7 +6129,10 @@ class FeatherCastApp {
         EnterActionMode(flatItems_[selected_]);
     } else if (vk == VK_LEFT) {
       if (caret_ > 0) {
-        --caret_;
+        MoveCaret(control
+                      ? feathercast::text_edit::PreviousWord(query_, caret_)
+                      : feathercast::text_edit::PreviousCodePoint(query_, caret_),
+                  shift);
         InvalidateRect(hwnd_, nullptr, FALSE);
       } else if (browseView_ != BrowseView::None) {
         ExitBrowseView();
@@ -5470,12 +6145,15 @@ class FeatherCastApp {
         Activate(flatItems_[selected_], admin);
       }
     } else if (vk == VK_BACK) {
-      if (!query_.empty() && caret_ > 0) {
-        if (ModifierPressed(VK_CONTROL)) {
-          while (caret_ > 0 && std::iswspace(query_[caret_ - 1])) query_.erase(--caret_, 1);
-          while (caret_ > 0 && !std::iswspace(query_[caret_ - 1])) query_.erase(--caret_, 1);
+      if (!query_.empty() && (caret_ > 0 || SelectionRange())) {
+        if (DeleteSelection()) {
+          // Selection deletion already updated the caret.
+        } else if (control) {
+          const size_t previous = feathercast::text_edit::PreviousWord(query_, caret_);
+          query_.erase(previous, caret_ - previous);
+          caret_ = previous;
         } else {
-          query_.erase(--caret_, 1);
+          feathercast::text_edit::ErasePrevious(query_, caret_);
         }
         selected_ = 0;
         scroll_ = 0;
@@ -5484,12 +6162,13 @@ class FeatherCastApp {
         InvalidateRect(hwnd_, nullptr, FALSE);
       }
     } else if (vk == VK_DELETE) {
-      if (!query_.empty() && caret_ < query_.size()) {
-        if (ModifierPressed(VK_CONTROL)) {
-          while (caret_ < query_.size() && std::iswspace(query_[caret_])) query_.erase(caret_, 1);
-          while (caret_ < query_.size() && !std::iswspace(query_[caret_])) query_.erase(caret_, 1);
+      if (!query_.empty() && (caret_ < query_.size() || SelectionRange())) {
+        if (DeleteSelection()) {
+          // Selection deletion already updated the caret.
+        } else if (control) {
+          query_.erase(caret_, feathercast::text_edit::NextWord(query_, caret_) - caret_);
         } else {
-          query_.erase(caret_, 1);
+          feathercast::text_edit::EraseNext(query_, caret_);
         }
         selected_ = 0;
         scroll_ = 0;
@@ -5504,8 +6183,7 @@ class FeatherCastApp {
     if (view_ != View::Search) return;
     if (ch >= 32 && ch != 127) {
       ClampCaret();
-      query_.insert(query_.begin() + static_cast<std::ptrdiff_t>(caret_), ch);
-      ++caret_;
+      InsertQueryText(std::wstring(1, ch));
       selected_ = 0;
       scroll_ = 0;
       SyncSelectionAnimationToTarget();
@@ -5632,20 +6310,93 @@ class FeatherCastApp {
     }
   }
 
+  void OnRightClick(float x, float y) {
+    if (actionMode_ || browseView_ != BrowseView::None) return;
+    for (const auto& hit : hits_) {
+      if (hit.type != HitType::Result || !PointInRect(hit.rect, x, y)) continue;
+      if (hit.index >= 0 && hit.index < static_cast<int>(flatItems_.size())) {
+        SelectResult(hit.index, false, true);
+        EnterActionMode(flatItems_[hit.index]);
+      }
+      return;
+    }
+  }
+
   void ResizeSettingsWindow() {
     if (!settingsHwnd_ || !IsWindowVisible(settingsHwnd_)) return;
     RECT rc{};
     GetWindowRect(settingsHwnd_, &rc);
     const float scale = GetWindowScale(settingsHwnd_);
-    const int width = static_cast<int>(SETTINGS_WIDTH * scale);
+    const int width = rc.right - rc.left;
     int height = SettingsContentHeight();
     HMONITOR monitor = MonitorFromWindow(settingsHwnd_, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
     height = std::min(height, static_cast<int>((mi.rcWork.bottom - mi.rcWork.top - 40) / scale));
     const int physicalHeight = static_cast<int>(height * scale);
-    SetWindowPos(settingsHwnd_, HWND_TOPMOST, rc.left, rc.top, width, physicalHeight, SWP_NOACTIVATE);
+    SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, rc.left, rc.top, width, physicalHeight, SWP_NOACTIVATE);
     // Visible corners are drawn by Direct2D; no window region, so DirectComposition alpha stays intact.
+  }
+
+  void EnsureSettingsFocusVisible() {
+    const auto order = SettingsFocusOrder();
+    if (settingsFocusIndex_ < 0 || settingsFocusIndex_ >= static_cast<int>(order.size())) return;
+    const HitType focused = order[static_cast<size_t>(settingsFocusIndex_)];
+    RECT client{};
+    GetClientRect(settingsHwnd_, &client);
+    const float height = static_cast<float>(client.bottom - client.top) / GetWindowScale(settingsHwnd_);
+    for (const auto& hit : hits_) {
+      if (hit.type != focused) continue;
+      if (hit.rect.top < 64.0f) settingsScroll_ = std::max(0.0f, settingsScroll_ - (64.0f - hit.rect.top));
+      else if (hit.rect.bottom > height - 8.0f) settingsScroll_ += hit.rect.bottom - (height - 8.0f);
+      settingsScroll_ = std::clamp(settingsScroll_, 0.0f, SettingsMaxScroll());
+      return;
+    }
+  }
+
+  void HandleSettingsKeyDown(UINT vk) {
+    if (recording_) return;
+    const auto order = SettingsFocusOrder();
+    if (order.empty()) return;
+    if (vk == VK_TAB) {
+      const int direction = ModifierPressed(VK_SHIFT) ? -1 : 1;
+      settingsFocusIndex_ = (settingsFocusIndex_ + direction + static_cast<int>(order.size())) %
+                            static_cast<int>(order.size());
+      EnsureSettingsFocusVisible();
+      InvalidateRect(settingsHwnd_, nullptr, FALSE);
+      NotifyWinEvent(EVENT_OBJECT_FOCUS, settingsHwnd_, OBJID_CLIENT, settingsFocusIndex_ + 1);
+      return;
+    }
+    if (vk == VK_RETURN || vk == VK_SPACE) {
+      const HitType focused = order[static_cast<size_t>(std::clamp(
+          settingsFocusIndex_, 0, static_cast<int>(order.size()) - 1))];
+      if (focused == HitType::CloseSettings) HideSettings();
+      else HandleSettingsHit(focused);
+      InvalidateRect(settingsHwnd_, nullptr, FALSE);
+    }
+  }
+
+  std::optional<std::wstring> PickIndexedFolder() {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog)))) {
+      return std::nullopt;
+    }
+    FILEOPENDIALOGOPTIONS options{};
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                       FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"Choose a folder for FeatherCast to index");
+    if (FAILED(dialog->Show(settingsHwnd_))) return std::nullopt;
+
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(&item))) return std::nullopt;
+    PWSTR rawPath = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath)) || !rawPath) {
+      return std::nullopt;
+    }
+    CoMemPtr<wchar_t> pathOwner(rawPath);
+    return std::wstring(rawPath);
   }
 
   void HandleSettingsHit(HitType type) {
@@ -5657,10 +6408,35 @@ class FeatherCastApp {
         break;
       case HitType::SaveShortcut:
         if (!pendingShortcut_.empty()) {
+          if (pendingShortcut_ == settings_.shortcut) {
+            pendingShortcut_.clear();
+            break;
+          }
+          const ShortcutSpec candidate = ParseShortcut(pendingShortcut_);
+          if (!CanActivateShortcut(candidate)) {
+            MessageBoxW(
+                settingsHwnd_,
+                L"That shortcut is already reserved by Windows or another application. "
+                L"The current FeatherCast shortcut was kept.",
+                L"FeatherCast Shortcut",
+                MB_OK | MB_ICONWARNING);
+            break;
+          }
+          const std::wstring previousText = settings_.shortcut;
+          const ShortcutSpec previousShortcut = shortcut_;
           settings_.shortcut = pendingShortcut_;
-          shortcut_ = ParseShortcut(settings_.shortcut);
+          shortcut_ = candidate;
           shortcutRuntime_ = ShortcutRuntime{};
-          RegisterShortcutHotKey();
+          const bool hotKeyReady = RegisterShortcutHotKey();
+          if (!hotKeyReady && !hook_) {
+            settings_.shortcut = previousText;
+            shortcut_ = previousShortcut;
+            RegisterShortcutHotKey();
+            MessageBoxW(settingsHwnd_,
+                        L"FeatherCast could not activate that shortcut. The previous shortcut was restored.",
+                        L"FeatherCast Shortcut", MB_OK | MB_ICONWARNING);
+            break;
+          }
           pendingShortcut_.clear();
           PersistSettings();
         }
@@ -5674,25 +6450,144 @@ class FeatherCastApp {
         PersistSettings();
         break;
       case HitType::StartupToggle:
-        settings_.startOnStartup = !settings_.startOnStartup;
-        SetStartOnStartup(settings_.startOnStartup);
-        PersistSettings();
+        if (const bool desired = !settings_.startOnStartup; SetStartOnStartup(desired)) {
+          settings_.startOnStartup = desired;
+          PersistSettings();
+        } else {
+          MessageBoxW(settingsHwnd_, L"Windows rejected the startup setting change.",
+                      L"FeatherCast Settings", MB_OK | MB_ICONWARNING);
+        }
         break;
       case HitType::UpdateChecksToggle:
         settings_.updateChecksEnabled = !settings_.updateChecksEnabled;
-        if (settings_.updateChecksEnabled) settings_.lastUpdateCheck = 0;
+        if (settings_.updateChecksEnabled) {
+          settings_.lastUpdateAttempt = 0;
+          settings_.lastUpdateCheck = 0;
+        }
         PersistSettings();
         break;
       case HitType::ShowWindowsToggle:
         settings_.showOpenWindows = !settings_.showOpenWindows;
         PersistSettings();
-        RefreshWindows();
+        RefreshWindowsAsync();
         RequestSearch();
         break;
       case HitType::ShowStoreAppsToggle:
         settings_.showStoreApps = !settings_.showStoreApps;
         PersistSettings();
         RequestSearch();
+        break;
+      case HitType::ClipboardHistoryToggle:
+        settings_.privacyConsentVersion = 1;
+        settings_.clipboardHistoryEnabled = !settings_.clipboardHistoryEnabled;
+        if (settings_.clipboardHistoryEnabled) {
+          std::lock_guard lock(storageMutex_);
+          ReloadClipboardHistoryFromStorage();
+        } else {
+          {
+            std::lock_guard lock(dataMutex_);
+            clipboardHistory_.clear();
+          }
+          if (browseView_ == BrowseView::Clipboard) ExitBrowseView();
+        }
+        UpdateClipboardListenerRegistration();
+        PersistSettings();
+        RequestSearch();
+        break;
+      case HitType::ClipboardLimitDown:
+        settings_.clipboardHistoryLimit = std::clamp(
+            settings_.clipboardHistoryLimit - 10,
+            MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT);
+        PersistSettings();
+        ApplyClipboardHistoryLimit();
+        break;
+      case HitType::ClipboardLimitUp:
+        settings_.clipboardHistoryLimit = std::clamp(
+            settings_.clipboardHistoryLimit + 10,
+            MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT);
+        PersistSettings();
+        ApplyClipboardHistoryLimit();
+        break;
+      case HitType::FileIndexToggle:
+        settings_.privacyConsentVersion = 1;
+        settings_.fileIndexEnabled = !settings_.fileIndexEnabled;
+        if (!settings_.fileIndexEnabled) {
+          std::lock_guard lock(dataMutex_);
+          fileIndex_.clear();
+        }
+        PersistSettings();
+        StartAppDiscovery();
+        RequestSearch();
+        break;
+      case HitType::FileIndexLimitDown:
+        settings_.fileIndexMaxEntries = std::clamp(
+            settings_.fileIndexMaxEntries - 1000,
+            MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
+        PersistSettings();
+        if (settings_.fileIndexEnabled) StartAppDiscovery();
+        break;
+      case HitType::FileIndexLimitUp:
+        settings_.fileIndexMaxEntries = std::clamp(
+            settings_.fileIndexMaxEntries + 1000,
+            MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
+        PersistSettings();
+        if (settings_.fileIndexEnabled) StartAppDiscovery();
+        break;
+      case HitType::AddFileRoot:
+        if (const auto folder = PickIndexedFolder()) {
+          const std::wstring normalized = Lower(*folder);
+          const bool exists = std::any_of(
+              settings_.fileIndexRoots.begin(), settings_.fileIndexRoots.end(),
+              [&](const std::wstring& root) { return Lower(root) == normalized; });
+          if (!exists) settings_.fileIndexRoots.push_back(*folder);
+          PersistSettings();
+          if (settings_.fileIndexEnabled) StartAppDiscovery();
+          ResizeSettingsWindow();
+        }
+        break;
+      case HitType::ClearFileRoots:
+        settings_.fileIndexRoots.clear();
+        PersistSettings();
+        if (settings_.fileIndexEnabled) StartAppDiscovery();
+        break;
+      case HitType::DiagnosticsToggle:
+        settings_.diagnosticsEnabled = !settings_.diagnosticsEnabled;
+        g_diagnosticsEnabled.store(settings_.diagnosticsEnabled,
+                                   std::memory_order_release);
+        PersistSettings();
+        break;
+      case HitType::ClearClipboardData:
+        ClearClipboardHistoryData();
+        break;
+      case HitType::ClearFileIndexData:
+        ClearFileIndexData();
+        break;
+      case HitType::OpenLocalDataFolder:
+        launchExecutor_.Submit([path = LocalDataPath()](std::stop_token) {
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr,
+                        SW_SHOWNORMAL);
+          CoUninitialize();
+        });
+        break;
+      case HitType::ReloadExtensions:
+        launchExecutor_.Submit([this](std::stop_token stopToken) {
+          if (stopToken.stop_requested()) return;
+          extensions_.Reload();
+          if (!stopToken.stop_requested() && !stopThreads_) {
+            PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+          }
+        });
+        break;
+      case HitType::OpenPluginsFolder:
+        launchExecutor_.Submit([path = UserDataPath() / L"plugins"](std::stop_token) {
+          std::error_code ec;
+          std::filesystem::create_directories(path, ec);
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr,
+                        SW_SHOWNORMAL);
+          CoUninitialize();
+        });
         break;
       case HitType::ClearRecents:
         settings_.recentApps.clear();
@@ -5801,9 +6696,77 @@ class FeatherCastApp {
   }
 
   void ActivateExtension(const DisplayItem& item) {
-    const auto response = extensions_.Activate(item.extension);
+    if (extensionActivationPending_) return;
+    extensionActivationPending_ = true;
+    const auto extensionItem = item.extension;
+    if (!launchExecutor_.Submit([this, extensionItem](std::stop_token stopToken) {
+          if (stopToken.stop_requested()) return;
+          ExtensionActivationResult result;
+          result.response = extensions_.Activate(extensionItem);
+          if (stopToken.stop_requested() || stopThreads_) return;
+          {
+            std::lock_guard lock(extensionActivationMutex_);
+            latestExtensionActivation_ = std::move(result);
+          }
+          PostMessageW(hwnd_, WM_EXTENSION_ACTIVATED, 0, 0);
+        })) {
+      extensionActivationPending_ = false;
+    }
+  }
+
+  void OnImeComposition(LPARAM flags) {
+    HIMC context = ImmGetContext(hwnd_);
+    if (!context) return;
+    ScopeExit releaseContext([&] { ImmReleaseContext(hwnd_, context); });
+
+    auto readComposition = [&](DWORD kind) {
+      const LONG bytes = ImmGetCompositionStringW(context, kind, nullptr, 0);
+      if (bytes <= 0) return std::wstring{};
+      std::wstring text(static_cast<size_t>(bytes) / sizeof(wchar_t), L'\0');
+      ImmGetCompositionStringW(context, kind, text.data(), bytes);
+      return text;
+    };
+
+    if ((flags & GCS_RESULTSTR) != 0) {
+      const std::wstring result = readComposition(GCS_RESULTSTR);
+      imeComposition_.clear();
+      if (!result.empty()) {
+        InsertQueryText(result);
+        selected_ = 0;
+        scroll_ = 0;
+        SyncSelectionAnimationToTarget();
+        RequestSearch();
+      }
+    } else if ((flags & GCS_COMPSTR) != 0) {
+      imeComposition_ = readComposition(GCS_COMPSTR);
+    }
+
+    CANDIDATEFORM candidate{};
+    candidate.dwIndex = 0;
+    candidate.dwStyle = CFS_CANDIDATEPOS;
+    candidate.ptCurrentPos.x = static_cast<LONG>((52.0f + MeasureCaretOffset(query_.substr(0, caret_), static_cast<float>(OverlayWidth()))) *
+                                                 GetWindowScale(hwnd_));
+    candidate.ptCurrentPos.y = static_cast<LONG>(48.0f * GetWindowScale(hwnd_));
+    ImmSetCandidateWindow(context, &candidate);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void OnExtensionActivationReady() {
+    ExtensionActivationResult result;
+    {
+      std::lock_guard lock(extensionActivationMutex_);
+      if (!latestExtensionActivation_) {
+        extensionActivationPending_ = false;
+        return;
+      }
+      result = std::move(*latestExtensionActivation_);
+      latestExtensionActivation_.reset();
+    }
+    extensionActivationPending_ = false;
+    const auto& response = result.response;
     if (!response || !response->handled) {
-      HideOverlay(false);
+      ShowTrayNotification(L"FeatherCast Extension",
+                           L"The extension did not complete the requested action.");
       return;
     }
 
@@ -5812,11 +6775,20 @@ class FeatherCastApp {
       case feathercast::extensions::HostActionType::OpenUrl:
       case feathercast::extensions::HostActionType::OpenPath:
         if (!response->value.empty()) {
-          ShellExecuteW(nullptr, L"open", response->value.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          const HINSTANCE opened =
+              ShellExecuteW(nullptr, L"open", response->value.c_str(), nullptr,
+                            nullptr, SW_SHOWNORMAL);
+          if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+            ShowTrayNotification(L"FeatherCast Extension",
+                                 L"Windows could not open the extension result.");
+          }
         }
         return;
       case feathercast::extensions::HostActionType::CopyText:
-        CopyTextToClipboard(response->value);
+        ShowTrayNotification(
+            L"FeatherCast",
+            CopyTextToClipboard(response->value) ? L"Copied to clipboard."
+                                                 : L"Could not copy to clipboard.");
         return;
       case feathercast::extensions::HostActionType::SetQuery:
         SetQueryText(response->value);
@@ -5858,7 +6830,7 @@ class FeatherCastApp {
 
     if (item.isRunCommand) {
       HideOverlay(false);
-      std::jthread([runCommand = item.runCommand]() {
+      launchExecutor_.Submit([runCommand = item.runCommand](std::stop_token) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         if (runCommand.kind == feathercast::run_command::Kind::OpenTarget) {
           ShellExecuteW(nullptr, L"open", runCommand.target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -5867,23 +6839,27 @@ class FeatherCastApp {
           ShellExecuteW(nullptr, L"open", L"cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
         }
         CoUninitialize();
-      }).detach();
+      });
       return;
     }
 
     if (item.isCalculator || item.isConversion) {
-      CopyTextToClipboard(item.calculationResult);
-      HideOverlay(false);
+      if (CopyTextToClipboard(item.calculationResult)) {
+        HideOverlay(false);
+        ShowTrayNotification(L"FeatherCast", L"Copied to clipboard.");
+      } else {
+        ShowTrayNotification(L"FeatherCast", L"Could not copy to clipboard.");
+      }
       return;
     }
 
     if (item.isWebSearch) {
       HideOverlay(false);
-      std::jthread([url = item.webSearchUrl]() {
+      launchExecutor_.Submit([url = item.webSearchUrl](std::stop_token) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         CoUninitialize();
-      }).detach();
+      });
       return;
     }
 
@@ -5910,23 +6886,82 @@ class FeatherCastApp {
 
     HideOverlay(false);
     auto appPtr = std::make_shared<AppEntry>(item.app);
-    std::jthread([this, appPtr, asAdmin, id = PrimaryAppId(item.app)]() {
+    if (!launchExecutor_.Submit([this, appPtr, asAdmin, id = PrimaryAppId(item.app)](std::stop_token stopToken) {
+      if (stopToken.stop_requested()) return;
       DebugLaunchLog(L"Lambda: name='" + appPtr->name + L"' target='" + appPtr->launchTarget + L"'");
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
       const bool ok = this->LaunchApp(*appPtr, asAdmin && appPtr->adminSupported);
-      if (ok) {
-        auto* pId = new std::wstring(id);
-        if (!PostMessageW(hwnd_, WM_TRACK_RECENT, 0, reinterpret_cast<LPARAM>(pId))) {
-          delete pId;
-        }
-      }
+      if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok);
       CoUninitialize();
-    }).detach();
+    })) {
+      ShowTrayNotification(L"FeatherCast Launch Failed",
+                           L"The background launch worker is unavailable.");
+    }
+  }
+
+  void NotifyLaunchCompleted(const std::wstring& id, const std::wstring& name,
+                             bool succeeded) {
+    if (stopThreads_) return;
+    {
+      std::lock_guard lock(completedLaunchMutex_);
+      completedLaunches_.push_back({id, name, succeeded});
+    }
+    if (!PostMessageW(hwnd_, WM_TRACK_RECENT, 0, 0)) {
+      std::lock_guard lock(completedLaunchMutex_);
+      completedLaunches_.clear();
+    }
+  }
+
+  void ClearClipboardHistoryData() {
+    const int choice = MessageBoxW(settingsHwnd_ ? settingsHwnd_ : hwnd_,
+                                   L"Delete all stored clipboard history?",
+                                   L"FeatherCast Privacy",
+                                   MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (choice != IDYES) return;
+    {
+      std::lock_guard lock(dataMutex_);
+      clipboardHistory_.clear();
+    }
+    {
+      std::lock_guard lock(storageMutex_);
+      if (storage_.IsOpen()) storage_.ClearClipboardHistory();
+    }
+    MarkSearchDataChanged();
+    RequestSearch();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void ClearFileIndexData() {
+    const int choice = MessageBoxW(settingsHwnd_ ? settingsHwnd_ : hwnd_,
+                                   L"Delete all stored file and folder index data?",
+                                   L"FeatherCast Privacy",
+                                   MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (choice != IDYES) return;
+    {
+      std::lock_guard lock(dataMutex_);
+      fileIndex_.clear();
+    }
+    {
+      std::lock_guard lock(storageMutex_);
+      if (storage_.IsOpen()) storage_.ClearFileIndex();
+    }
+    MarkSearchDataChanged();
+    RequestSearch();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  bool ConfirmSystemAction(const wchar_t* message) {
+    return MessageBoxW(hwnd_, message, L"FeatherCast System Action",
+                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
   }
 
   void ExecuteCommand(CommandKind command) {
     switch (command) {
       case CommandKind::ClipboardHistory:
+        if (!settings_.clipboardHistoryEnabled) {
+          OpenSettings();
+          return;
+        }
         EnterBrowseView(BrowseView::Clipboard);
         return;
       case CommandKind::EmojiPicker:
@@ -5962,54 +6997,63 @@ class FeatherCastApp {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::OpenDataFolder:
-        std::jthread([path = UserDataPath()]() {
+        launchExecutor_.Submit([path = UserDataPath()](std::stop_token) {
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
-        }).detach();
+        });
+        HideOverlay(false);
+        return;
+      case CommandKind::OpenLocalDataFolder:
+        launchExecutor_.Submit([path = LocalDataPath()](std::stop_token) {
+          CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+          ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          CoUninitialize();
+        });
         HideOverlay(false);
         return;
       case CommandKind::ReloadExtensions:
-        extensions_.Reload();
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        launchExecutor_.Submit([this](std::stop_token stopToken) {
+          if (stopToken.stop_requested()) return;
+          extensions_.Reload();
+          if (!stopToken.stop_requested() && !stopThreads_) {
+            PostMessageW(hwnd_, WM_REBUILD_RESULTS, 0, 0);
+          }
+        });
         return;
       case CommandKind::CheckForUpdates:
         HideOverlay(false);
         StartUpdateCheck(true);
         return;
       case CommandKind::ClearClipboardHistory:
-        clipboardHistory_.clear();
-        {
-          std::lock_guard lock(storageMutex_);
-          if (storage_.IsOpen()) storage_.ClearClipboardHistory();
-        }
-        snapshotDirty_ = true;
-        RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        ClearClipboardHistoryData();
         return;
       case CommandKind::OpenSnippetsFile:
         EnsureSnippetsFile();
-        std::jthread([path = SnippetsPath()]() {
+        launchExecutor_.Submit([path = SnippetsPath()](std::stop_token) {
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
-        }).detach();
+        });
         HideOverlay(false);
         return;
       case CommandKind::ReloadSnippets:
-        snippets_ = LoadSnippets();
-        snapshotDirty_ = true;
+        {
+          auto snippets = LoadSnippets();
+          std::lock_guard lock(dataMutex_);
+          snippets_ = std::move(snippets);
+        }
+        MarkSearchDataChanged();
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::OpenThemeFile:
         feathercast::theme::WriteDefaultTheme(ThemePath());
-        std::jthread([path = ThemePath()]() {
+        launchExecutor_.Submit([path = ThemePath()](std::stop_token) {
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
-        }).detach();
+        });
         HideOverlay(false);
         return;
       case CommandKind::ReloadTheme:
@@ -6022,6 +7066,7 @@ class FeatherCastApp {
         LockWorkStation();
         return;
       case CommandKind::SleepPC:
+        if (!ConfirmSystemAction(L"Put this computer to sleep now?")) return;
         HideOverlay(false);
         SetSuspendState(FALSE, FALSE, FALSE);
         return;
@@ -6030,18 +7075,21 @@ class FeatherCastApp {
         HideOverlay(false);
         return;
       case CommandKind::ShutDown:
+        if (!ConfirmSystemAction(L"Shut down this computer now?")) return;
         HideOverlay(false);
         if (EnableShutdownPrivilege()) {
           ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCEIFHUNG, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
         }
         return;
       case CommandKind::RestartPC:
+        if (!ConfirmSystemAction(L"Restart this computer now?")) return;
         HideOverlay(false);
         if (EnableShutdownPrivilege()) {
           ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
         }
         return;
       case CommandKind::EmptyRecycleBin:
+        if (!ConfirmSystemAction(L"Permanently delete all Recycle Bin contents?")) return;
         HideOverlay(false);
         SHEmptyRecycleBinW(nullptr, nullptr, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
         return;
@@ -6053,7 +7101,7 @@ class FeatherCastApp {
       HWND target = item.actionWindow.hwnd;
       if (!target || !IsWindow(target)) {
         actionMode_ = false;
-        RefreshWindows();
+        RefreshWindowsAsync();
         RequestSearch();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -6089,18 +7137,17 @@ class FeatherCastApp {
       case ActionKind::RunAsAdmin: {
         HideOverlay(false);
         auto appPtr = std::make_shared<AppEntry>(app);
-        std::jthread([this, appPtr, runAsAdmin = (item.action == ActionKind::RunAsAdmin), id]() {
+        if (!launchExecutor_.Submit([this, appPtr, runAsAdmin = (item.action == ActionKind::RunAsAdmin), id](std::stop_token stopToken) {
+          if (stopToken.stop_requested()) return;
           DebugLaunchLog(L"LambdaAction: name='" + appPtr->name + L"' target='" + appPtr->launchTarget + L"'");
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           const bool ok = this->LaunchApp(*appPtr, runAsAdmin && appPtr->adminSupported);
-          if (ok) {
-            auto* pId = new std::wstring(id);
-            if (!PostMessageW(hwnd_, WM_TRACK_RECENT, 0, reinterpret_cast<LPARAM>(pId))) {
-              delete pId;
-            }
-          }
+          if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok);
           CoUninitialize();
-        }).detach();
+        })) {
+          ShowTrayNotification(L"FeatherCast Launch Failed",
+                               L"The background launch worker is unavailable.");
+        }
         return;
       }
       case ActionKind::OpenLocation:
@@ -6173,37 +7220,56 @@ class FeatherCastApp {
   }
 
   void OnClipboardUpdate() {
+    if (!settings_.clipboardHistoryEnabled || settings_.privacyConsentVersion < 1) return;
     auto text = ReadClipboardText();
     if (!text || Trim(*text).empty()) return;
     if (internalClipboardText_ && *text == *internalClipboardText_) {
       internalClipboardText_.reset();
       return;
     }
-    if (!clipboardHistory_.empty() && clipboardHistory_.front().text == *text) return;
+    {
+      std::lock_guard lock(dataMutex_);
+      if (!clipboardHistory_.empty() && clipboardHistory_.front().text == *text) return;
+    }
 
     const long long capturedAt = UnixNow();
     const std::wstring preview = SingleLinePreview(*text);
     ClipboardEntry entry;
-    {
-      std::lock_guard lock(storageMutex_);
-      if (storage_.IsOpen()) {
-        if (const auto stored = storage_.AddClipboardEntry(*text, preview, capturedAt, CLIPBOARD_HISTORY_LIMIT)) {
-          entry.id = std::to_wstring(stored->id);
-          clipboardSerial_ = std::max<unsigned long long>(clipboardSerial_, static_cast<unsigned long long>(stored->id));
-        }
-      }
-    }
-    if (entry.id.empty()) entry.id = std::to_wstring(++clipboardSerial_);
+    entry.id = std::to_wstring(++clipboardSerial_);
     entry.text = *text;
     entry.preview = preview;
     entry.capturedAt = capturedAt;
-    clipboardHistory_.erase(
-        std::remove_if(clipboardHistory_.begin(), clipboardHistory_.end(),
-                       [&](const ClipboardEntry& existing) { return existing.text == entry.text; }),
-        clipboardHistory_.end());
-    clipboardHistory_.insert(clipboardHistory_.begin(), std::move(entry));
-    if (clipboardHistory_.size() > CLIPBOARD_HISTORY_LIMIT) clipboardHistory_.resize(CLIPBOARD_HISTORY_LIMIT);
-    snapshotDirty_ = true;  // clipboard history feeds the search corpus
+    {
+      std::lock_guard lock(dataMutex_);
+      clipboardHistory_.erase(
+          std::remove_if(clipboardHistory_.begin(), clipboardHistory_.end(),
+                         [&](const ClipboardEntry& existing) { return existing.text == entry.text; }),
+          clipboardHistory_.end());
+      clipboardHistory_.insert(clipboardHistory_.begin(), std::move(entry));
+      if (clipboardHistory_.size() > ClipboardHistoryLimit()) clipboardHistory_.resize(ClipboardHistoryLimit());
+    }
+    const std::wstring storedText = *text;
+    const size_t retention = ClipboardHistoryLimit();
+    if (!persistenceExecutor_.Submit(
+            [this, storedText, preview, capturedAt, retention](std::stop_token stopToken) {
+              if (stopToken.stop_requested()) return;
+              bool saved = true;
+              {
+                std::lock_guard lock(storageMutex_);
+                if (storage_.IsOpen()) {
+                  saved = storage_.AddClipboardEntry(storedText, preview, capturedAt,
+                                                     retention).has_value();
+                }
+              }
+              if (!saved && !stopThreads_ &&
+                  !persistenceErrorQueued_.exchange(true, std::memory_order_acq_rel)) {
+                PostMessageW(hwnd_, WM_PERSISTENCE_ERROR, 0, 0);
+              }
+            }) &&
+        !persistenceErrorQueued_.exchange(true, std::memory_order_acq_rel)) {
+      PostMessageW(hwnd_, WM_PERSISTENCE_ERROR, 0, 0);
+    }
+    MarkSearchDataChanged();  // clipboard history feeds the search corpus
     if (visible_) {
       RequestSearch();
       InvalidateRect(hwnd_, nullptr, FALSE);
@@ -6246,18 +7312,54 @@ class FeatherCastApp {
 
   void PasteTextToLastActiveWindow(const std::wstring& text) {
     HWND target = lastActiveWindow_;
+    const UINT existingFormats = CountClipboardFormats();
+    ComPtr<IDataObject> previousClipboard;
+    const HRESULT captureResult = OleGetClipboard(&previousClipboard);
+    if (existingFormats > 0 && FAILED(captureResult)) {
+      ShowTrayNotification(L"FeatherCast Paste",
+                           L"The current clipboard could not be preserved, so FeatherCast did not replace it.");
+      return;
+    }
+
     HideOverlay(false);
-    if (!CopyTextToClipboard(text)) return;
-    if (target && IsWindow(target)) {
-      FocusWindow(target);
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      SendPasteShortcut();
-      lastActiveWindow_ = nullptr;
+    if (!CopyTextToClipboard(text)) {
+      ShowTrayNotification(L"FeatherCast Paste", L"FeatherCast could not place the text on the clipboard.");
+      return;
+    }
+    const DWORD temporarySequence = GetClipboardSequenceNumber();
+    lastActiveWindow_ = nullptr;
+
+    if (!launchExecutor_.Submit(
+            [this, target, previousClipboard, existingFormats, temporarySequence](std::stop_token stopToken) {
+              CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+              ScopeExit uninitialize([] { CoUninitialize(); });
+              if (stopToken.stop_requested()) return;
+              if (target && IsWindow(target)) {
+                FocusWindow(target);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (stopToken.stop_requested()) return;
+                SendPasteShortcut();
+              }
+
+              std::this_thread::sleep_for(std::chrono::milliseconds(400));
+              if (stopToken.stop_requested() ||
+                  GetClipboardSequenceNumber() != temporarySequence) {
+                return;
+              }
+
+              if (existingFormats > 0 && previousClipboard) {
+                if (SUCCEEDED(OleSetClipboard(previousClipboard.Get()))) OleFlushClipboard();
+              } else if (OpenClipboard(hwnd_)) {
+                EmptyClipboard();
+                CloseClipboard();
+              }
+            })) {
+      ShowTrayNotification(L"FeatherCast Paste", L"FeatherCast could not send the paste operation.");
     }
   }
 
   void ClearIconCache() {
-    // Drain the queue but keep the persistent worker pool alive.
+    StopIconThreads();
     {
       std::lock_guard lock(iconQueueMutex_);
       iconJobs_.clear();
@@ -6267,6 +7369,7 @@ class FeatherCastApp {
     std::error_code ec;
     std::filesystem::remove_all(IconCacheDir(), ec);
     std::filesystem::create_directories(IconCacheDir(), ec);
+    if (!stopThreads_) StartIconWorkers();
     StartAppDiscovery();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -6294,7 +7397,6 @@ class FeatherCastApp {
   }
 
   bool LaunchApp(const AppEntry& app, bool asAdmin) {
-    // TEMP DEBUG
     DebugLaunchLog(L"LaunchApp name='" + app.name + L"' type=" +
                    std::to_wstring(static_cast<int>(app.launchType)) + L" target='" +
                    app.launchTarget + L"' targetPath='" + app.targetPath + L"' admin=" +
@@ -6302,7 +7404,7 @@ class FeatherCastApp {
 
     if (app.launchType == LaunchType::Shell) {
       HINSTANCE result = ShellExecuteW(nullptr, L"open", app.launchTarget.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-      DebugLaunchLog(L"  Shell result=" + std::to_wstring(reinterpret_cast<intptr_t>(result)));  // TEMP DEBUG
+      DebugLaunchLog(L"  Shell result=" + std::to_wstring(reinterpret_cast<intptr_t>(result)));
       return reinterpret_cast<intptr_t>(result) > 32;
     }
 
@@ -6331,8 +7433,8 @@ class FeatherCastApp {
         seiShell.nShow = SW_SHOWNORMAL;
         DebugLaunchLog(L"  AppsFolder admin fallback target='" + adminTarget + L"'");
         if (ShellExecuteExW(&seiShell)) return true;
-        // If runas on the shell item fails (e.g. MSIX app that can't elevate),
-        // fall through to the normal activation path below so the app still opens.
+        // Never silently downgrade an explicit elevated launch to a normal one.
+        return false;
       }
 
       // Prefer the activation manager: it launches packaged apps (Terminal,
@@ -6342,12 +7444,12 @@ class FeatherCastApp {
       ComPtr<IApplicationActivationManager> activator;
       HRESULT hrCreate = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
                                           CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&activator));
-      DebugLaunchLog(L"  AppsFolder CoCreate hr=0x" + ToHex(static_cast<unsigned>(hrCreate)));  // TEMP DEBUG
+      DebugLaunchLog(L"  AppsFolder CoCreate hr=0x" + ToHex(static_cast<unsigned>(hrCreate)));
       if (SUCCEEDED(hrCreate)) {
         DWORD pid = 0;
         HRESULT hrAct = activator->ActivateApplication(app.launchTarget.c_str(), nullptr, AO_NONE, &pid);
         DebugLaunchLog(L"  ActivateApplication hr=0x" + ToHex(static_cast<unsigned>(hrAct)) +
-                       L" pid=" + std::to_wstring(pid));  // TEMP DEBUG
+                       L" pid=" + std::to_wstring(pid));
         if (SUCCEEDED(hrAct)) {
           return true;
         }
@@ -6358,7 +7460,7 @@ class FeatherCastApp {
       const std::wstring target = L"shell:AppsFolder\\" + app.launchTarget;
       HINSTANCE result = ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
       DebugLaunchLog(L"  fallback ShellExecute target='" + target + L"' result=" +
-                     std::to_wstring(reinterpret_cast<intptr_t>(result)));  // TEMP DEBUG
+                     std::to_wstring(reinterpret_cast<intptr_t>(result)));
       return reinterpret_cast<intptr_t>(result) > 32;
     }
 
@@ -6386,7 +7488,7 @@ class FeatherCastApp {
     BOOL ok = ShellExecuteExW(&sei);
     DebugLaunchLog(L"  Shortcut/Exe file='" + file + L"' ok=" + std::to_wstring(ok) +
                    L" err=" + std::to_wstring(GetLastError()) +
-                   L" hInst=" + std::to_wstring(reinterpret_cast<intptr_t>(sei.hInstApp)));  // TEMP DEBUG
+                   L" hInst=" + std::to_wstring(reinterpret_cast<intptr_t>(sei.hInstApp)));
     return ok == TRUE;
   }
 
@@ -6433,11 +7535,15 @@ class FeatherCastApp {
   HHOOK hook_ = nullptr;
   bool hotKeyRegistered_ = false;
   bool clipboardListenerRegistered_ = false;
+  bool hadLegacyOperationalData_ = false;
+  UINT taskbarCreatedMessage_ = 0;
   ULONGLONG lastShortcutToggleTick_ = 0;
   Settings settings_;
   ShortcutSpec shortcut_;
   HWND lastActiveWindow_ = nullptr;
   bool visible_ = false;
+  bool highContrast_ = false;
+  bool systemAnimationsEnabled_ = true;
   bool suppressHide_ = false;
   LARGE_INTEGER qpcFrequency_{};
   LONGLONG animStartQpc_ = 0;
@@ -6452,37 +7558,64 @@ class FeatherCastApp {
   View view_ = View::Search;
   HMONITOR overlayMonitor_ = nullptr;
   std::wstring query_;
+  std::wstring imeComposition_;
   size_t caret_ = 0;
+  std::optional<size_t> selectionAnchor_;
   int selected_ = 0;
   int scroll_ = 0;
   bool actionMode_ = false;
   DisplayItem actionTarget_;
   BrowseView browseView_ = BrowseView::None;
+  std::vector<NavigationState> navigationStack_;
+  std::optional<NavigationState> pendingNavigationRestore_;
   bool recording_ = false;
   bool gearHovered_ = false;
   bool mouseTracking_ = false;
   bool ignoreMouseUntilMove_ = false;
   POINT mouseAnchor_ = {0, 0};
   int settingsHover_ = -1;
+  int settingsFocusIndex_ = 0;
   float settingsScroll_ = 0.0f;
   std::wstring pendingShortcut_;
   ShortcutRecorder shortcutRecorder_;
   ShortcutRuntime shortcutRuntime_;
   PressedModifiers hookModifiers_;
   std::atomic<bool> stopThreads_ = false;
+  std::atomic<bool> shutdownStarted_ = false;
   std::atomic<bool> caching_ = false;
-  bool appsReady_ = false;
+  std::atomic<bool> windowRefreshPending_ = false;
+  feathercast::background::Executor launchExecutor_;
+  feathercast::background::Executor persistenceExecutor_;
+  std::mutex settingsPersistenceMutex_;
+  std::optional<Settings> pendingSettingsSave_;
+  bool settingsSaveScheduled_ = false;
+  std::atomic<bool> persistenceErrorQueued_ = false;
+  std::mutex completedLaunchMutex_;
+  std::deque<LaunchCompletion> completedLaunches_;
+  std::atomic<bool> appsReady_ = false;
   std::jthread discoveryThread_;
+  std::mutex discoveryMutex_;
+  std::condition_variable discoveryCv_;
+  std::optional<DiscoveryRequest> pendingDiscovery_;
+  std::atomic<uint64_t> latestDiscoveryGeneration_ = 0;
   std::jthread searchThread_;
+  std::jthread snapshotThread_;
   std::mutex searchMutex_;
   std::condition_variable searchCv_;
   std::optional<QueryRequest> pendingRequest_;
   ResultsCollection latestResult_;
+  std::mutex snapshotMutex_;
+  std::condition_variable snapshotCv_;
+  std::optional<SnapshotBuildRequest> pendingSnapshotBuild_;
+  std::optional<SnapshotBuildResult> latestSnapshotBuild_;
+  uint64_t snapshotScheduledRevision_ = 0;
   unsigned long long searchGeneration_ = 0;
-  // Cached query-independent search corpus, rebuilt lazily when marked dirty.
-  // Dirtied from background discovery threads, so the flag is atomic.
+  std::atomic<unsigned long long> latestRequestedSearchGeneration_ = 0;
+  // Cached query-independent search corpus, rebuilt when the published data
+  // revision changes. Revisions cannot lose a concurrent invalidation.
   std::shared_ptr<const SearchSnapshot> snapshot_;
-  std::atomic<bool> snapshotDirty_ = true;
+  std::atomic<uint64_t> dataRevision_ = 1;
+  uint64_t snapshotRevision_ = 0;
   std::mutex workerThreadsMutex_;
   std::vector<std::jthread> iconThreads_;
   std::mutex dataMutex_;
@@ -6505,11 +7638,15 @@ class FeatherCastApp {
   std::mutex updateMutex_;
   std::optional<UpdateTaskResult> latestUpdateResult_;
   feathercast::extensions::ExtensionManager extensions_;
+  std::mutex extensionActivationMutex_;
+  std::optional<ExtensionActivationResult> latestExtensionActivation_;
+  bool extensionActivationPending_ = false;
   std::vector<Section> sections_;
   std::vector<DisplayItem> flatItems_;
   std::vector<HitTarget> hits_;
   std::mutex iconQueueMutex_;
   std::condition_variable iconCv_;
+  std::atomic<bool> iconReadyMessageQueued_ = false;
   std::set<std::wstring> pendingIcons_;
   std::deque<std::wstring> iconJobs_;
   // LRU-bounded in-memory bitmap cache. iconLru_ holds keys most-recent-first;
@@ -6560,9 +7697,20 @@ class FeatherCastApp {
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
   UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
   if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-    HWND existing = FindWindowW(kWindowClass, L"FeatherCast");
-    if (existing) PostMessageW(existing, WM_SHOW_SEARCH, 0, 0);
-    return 0;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+      HWND existing = FindWindowW(kWindowClass, L"FeatherCast");
+      if (existing) {
+        DWORD_PTR acknowledged = 0;
+        if (SendMessageTimeoutW(existing, WM_SHOW_SEARCH, 0, 0,
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &acknowledged)) {
+          return 0;
+        }
+      }
+      Sleep(50);
+    }
+    MessageBoxW(nullptr, L"FeatherCast is already running but could not be activated.",
+                L"FeatherCast", MB_OK | MB_ICONWARNING);
+    return 1;
   }
 
   std::wstring cmdLineStr = cmdLine ? cmdLine : L"";

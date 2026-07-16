@@ -1,9 +1,9 @@
 #include "extension_manager.hpp"
+#include "test_framework.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -37,8 +37,10 @@ class HostSession {
     HANDLE parentStdinWrite = nullptr;
     HANDLE parentStdoutRead = nullptr;
     HANDLE childStdoutWrite = nullptr;
-    assert(CreatePipe(&childStdinRead, &parentStdinWrite, &inheritable, 0));
-    assert(CreatePipe(&parentStdoutRead, &childStdoutWrite, &inheritable, 0));
+    const BOOL inputPipeCreated = CreatePipe(&childStdinRead, &parentStdinWrite, &inheritable, 0);
+    assert(inputPipeCreated);
+    const BOOL outputPipeCreated = CreatePipe(&parentStdoutRead, &childStdoutWrite, &inheritable, 0);
+    assert(outputPipeCreated);
     SetHandleInformation(parentStdinWrite, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(parentStdoutRead, HANDLE_FLAG_INHERIT, 0);
 
@@ -50,8 +52,10 @@ class HostSession {
     startup.hStdError = childStdoutWrite;
 
     std::wstring command = Quote(hostPath) + L" " + Quote(dllPath);
-    assert(CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, TRUE,
-                          CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process_));
+    const BOOL processCreated =
+        CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, TRUE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process_);
+    assert(processCreated);
 
     CloseHandleIfSet(childStdinRead);
     CloseHandleIfSet(childStdoutWrite);
@@ -75,18 +79,23 @@ class HostSession {
   std::string Send(const std::string& request, std::chrono::milliseconds timeout) {
     const std::string line = request + "\n";
     DWORD written = 0;
-    assert(WriteFile(stdinWrite_, line.data(), static_cast<DWORD>(line.size()), &written, nullptr));
+    const BOOL writeSucceeded =
+        WriteFile(stdinWrite_, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    assert(writeSucceeded);
     assert(written == line.size());
 
     std::string buffer;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
       DWORD available = 0;
-      assert(PeekNamedPipe(stdoutRead_, nullptr, 0, nullptr, &available, nullptr));
+      const BOOL peekSucceeded = PeekNamedPipe(stdoutRead_, nullptr, 0, nullptr, &available, nullptr);
+      assert(peekSucceeded);
       if (available > 0) {
         char chunk[4096]{};
         DWORD read = 0;
-        assert(ReadFile(stdoutRead_, chunk, std::min<DWORD>(available, sizeof(chunk)), &read, nullptr));
+        const BOOL readSucceeded =
+            ReadFile(stdoutRead_, chunk, std::min<DWORD>(available, sizeof(chunk)), &read, nullptr);
+        assert(readSucceeded);
         buffer.append(chunk, chunk + read);
         if (const size_t newline = buffer.find('\n'); newline != std::string::npos) {
           std::string response = buffer.substr(0, newline);
@@ -110,8 +119,10 @@ DWORD RunAndWait(const std::wstring& hostPath, const std::wstring& dllPath) {
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
   std::wstring command = Quote(hostPath) + L" " + Quote(dllPath);
-  assert(CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process));
+  const BOOL processCreated =
+      CreateProcessW(hostPath.c_str(), command.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+  assert(processCreated);
   CloseHandleIfSet(process.hThread);
   WaitForSingleObject(process.hProcess, 5000);
   DWORD exitCode = 0;
@@ -204,6 +215,33 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   {
+    const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastParallelExtensionTests";
+    std::error_code ec;
+    std::filesystem::remove_all(tempRoot, ec);
+    const auto dataDir = tempRoot / L"data";
+    for (const auto& id : {L"fast", L"slow-one", L"slow-two", L"slow-three"}) {
+      const auto pluginDir = dataDir / L"plugins" / id;
+      std::filesystem::create_directories(pluginDir, ec);
+      const auto dll = pluginDir / L"plugin.dll";
+      const BOOL copied = CopyFileW(pluginPath.c_str(), dll.c_str(), FALSE);
+      assert(copied);
+      WriteUtf8(pluginDir / L"plugin.json",
+                "{\"id\":\"" + feathercast::extensions::WideToUtf8(id) + "\",\"name\":\"Parallel Test\","
+                "\"version\":\"1.0\",\"dll\":\"plugin.dll\"}");
+    }
+
+    feathercast::extensions::ExtensionManager manager;
+    manager.Initialize(dataDir, std::filesystem::path(hostPath).parent_path(), nullptr, 0);
+    const auto start = std::chrono::steady_clock::now();
+    manager.RequestQuery(L"parallel", 1);
+    assert(WaitForPluginResult(manager, L"parallel", L"Demo Result", std::chrono::seconds(2)));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    assert(elapsed < std::chrono::milliseconds(700));
+    manager.Shutdown();
+    std::filesystem::remove_all(tempRoot, ec);
+  }
+
+  {
     const auto tempRoot = std::filesystem::temp_directory_path() / L"FeatherCastExtensionManagerTests";
     std::error_code ec;
     std::filesystem::remove_all(tempRoot, ec);
@@ -212,7 +250,8 @@ int wmain(int argc, wchar_t** argv) {
     const auto pluginDir = dataDir / L"plugins" / L"manager";
     std::filesystem::create_directories(pluginDir, ec);
     const auto managerDll = pluginDir / L"manager.dll";
-    assert(CopyFileW(pluginPath.c_str(), managerDll.c_str(), FALSE));
+    const BOOL pluginCopied = CopyFileW(pluginPath.c_str(), managerDll.c_str(), FALSE);
+    assert(pluginCopied);
     WriteUtf8(pluginDir / L"plugin.json",
               "{\"id\":\"manager\",\"name\":\"Manager Test\",\"version\":\"1.0\",\"dll\":\"manager.dll\"}");
 

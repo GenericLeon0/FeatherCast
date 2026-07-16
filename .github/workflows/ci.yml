@@ -1,0 +1,203 @@
+name: CI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feathercast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: ${{ startsWith(github.ref, 'refs/tags/v') && 'write' || 'read' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}
+          SIGNER_THUMBPRINTS: ${{ vars.FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS }}
+        run: |
+          cmake -S . -B build-native -A x64 `
+            -DFEATHERCAST_WARNINGS_AS_ERRORS=ON `
+            "-DFEATHERCAST_EXPECTED_PUBLISHER=$env:EXPECTED_PUBLISHER" `
+            "-DFEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS=$env:SIGNER_THUMBPRINTS"
+
+      - name: Build Debug
+        run: cmake --build build-native --config Debug
+
+      - name: Test Debug
+        run: ctest --test-dir build-native -C Debug --output-on-failure
+
+      - name: Build Release
+        run: cmake --build build-native --config Release
+
+      - name: Test Release
+        run: ctest --test-dir build-native -C Release --output-on-failure
+
+      - name: Verify search performance
+        run: build-native\Release\FeatherCastSearchBenchmarks.exe
+
+      - name: Validate tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $cmake = Get-Content CMakeLists.txt -Raw
+          if ($cmake -notmatch 'project\(FeatherCastNative VERSION ([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw "Unable to read the CMake project version."
+          }
+          $projectVersion = $Matches[1]
+          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          if ($projectVersion -ne $tagVersion) {
+            throw "Tag version $tagVersion does not match CMake project version $projectVersion."
+          }
+
+      - name: Prepare signing certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}
+          SIGNER_THUMBPRINTS: ${{ vars.FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) {
+            throw "WINDOWS_CERTIFICATE_BASE64 is required for release tags."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER)) {
+            throw "FEATHERCAST_EXPECTED_PUBLISHER repository variable is required for release tags."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNER_THUMBPRINTS)) {
+            throw "FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS repository variable is required for release tags."
+          }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\feathercast-signing.pfx",
+            [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+
+      - name: Sign application binaries
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificate = "$env:RUNNER_TEMP\feathercast-signing.pfx"
+          foreach ($file in @(
+            "build-native\Release\FeatherCast.exe",
+            "build-native\Release\FeatherCastPluginHost.exe"
+          )) {
+            signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+              /f $certificate /p $env:CERTIFICATE_PASSWORD $file
+            signtool verify /pa /v $file
+          }
+
+      - name: Retain release symbols
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeatherCast-${{ github.ref_name }}-symbols
+          if-no-files-found: error
+          retention-days: 365
+          path: |
+            build-native/Release/FeatherCast.pdb
+            build-native/Release/FeatherCastPluginHost.pdb
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cpack --config build-native/CPackConfig.cmake -C Release
+
+      - name: Sign installer
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificate = "$env:RUNNER_TEMP\feathercast-signing.pfx"
+          $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
+          signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+            /f $certificate /p $env:CERTIFICATE_PASSWORD $installer.FullName
+          signtool verify /pa /v $installer.FullName
+
+      - name: Smoke-test installer
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer was not generated." }
+
+          # Exercise a real in-place upgrade when a published predecessor exists.
+          $releases = gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName |
+            ConvertFrom-Json
+          $previousTag = $releases |
+            Where-Object tagName -ne '${{ github.ref_name }}' |
+            Select-Object -ExpandProperty tagName -First 1
+          if ($previousTag) {
+            $previousDirectory = Join-Path $env:RUNNER_TEMP 'previous-release'
+            New-Item -ItemType Directory -Force $previousDirectory | Out-Null
+            gh release download $previousTag --pattern 'FeatherCast-*-win64.exe' --dir $previousDirectory
+            $previousInstaller = Get-ChildItem $previousDirectory -Filter 'FeatherCast-*-win64.exe' |
+              Select-Object -First 1
+            if ($previousInstaller) {
+              $previousProcess = Start-Process $previousInstaller.FullName -ArgumentList '/S' -PassThru -Wait
+              if ($previousProcess.ExitCode -ne 0) {
+                throw "Previous installer failed with exit code $($previousProcess.ExitCode)."
+              }
+            }
+          }
+
+          $settingsRoot = Join-Path $env:APPDATA 'FeatherCast'
+          New-Item -ItemType Directory -Force $settingsRoot | Out-Null
+          $upgradeMarker = Join-Path $settingsRoot 'installer-upgrade-marker.txt'
+          Set-Content -Encoding ascii $upgradeMarker 'preserve'
+
+          $process = Start-Process $installer.FullName -ArgumentList '/S' -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Installer failed with exit code $($process.ExitCode)." }
+          $installRoot = Join-Path $env:ProgramFiles 'FeatherCast'
+          $app = Join-Path $installRoot 'bin\FeatherCast.exe'
+          $uninstaller = Join-Path $installRoot 'Uninstall.exe'
+          if (-not (Test-Path $app)) { throw "Installed FeatherCast.exe was not found." }
+          if (-not (Test-Path $uninstaller)) { throw "Uninstaller was not found." }
+          if (-not (Test-Path $upgradeMarker)) { throw "Upgrade removed roaming user data." }
+
+          $identities = @(
+            Get-ChildItem 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+              Where-Object PSChildName -eq 'FeatherCast'
+            Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+              Where-Object PSChildName -eq 'FeatherCast'
+          )
+          if ($identities.Count -ne 1) {
+            throw "Expected one FeatherCast uninstall identity after upgrade; found $($identities.Count)."
+          }
+
+          $uninstall = Start-Process $uninstaller -ArgumentList '/S' -PassThru -Wait
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)." }
+          if (Test-Path $installRoot) { throw "Installation directory remains after uninstall." }
+          if (-not (Test-Path $upgradeMarker)) { throw "Uninstall removed roaming user data." }
+
+      - name: Generate SHA-256 sidecars
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          foreach ($f in Get-ChildItem FeatherCast-*-win64.exe, FeatherCast-*-win64.zip) {
+            "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant())  $($f.Name)" |
+              Set-Content -Encoding ascii "$($f.FullName).sha256"
+          }
+
+      # Draft release: the in-app updater ignores drafts; publish manually after verifying.
+      - name: Create draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem FeatherCast-*-win64.exe, FeatherCast-*-win64.zip, FeatherCast-*-win64.*.sha256 | ForEach-Object { $_.FullName }
+          gh release create ${{ github.ref_name }} --draft --generate-notes @assets
