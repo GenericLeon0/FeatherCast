@@ -17,8 +17,6 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 45
-    permissions:
-      contents: ${{ startsWith(github.ref, 'refs/tags/v') && 'write' || 'read' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -192,12 +190,36 @@ jobs:
               Set-Content -Encoding ascii "$($f.FullName).sha256"
           }
 
+      - name: Retain release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeatherCast-${{ github.ref_name }}-release
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            FeatherCast-*-win64.exe
+            FeatherCast-*-win64.zip
+            FeatherCast-*-win64.*.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: FeatherCast-${{ github.ref_name }}-release
+          path: release-assets
+
       # Draft release: the in-app updater ignores drafts; publish manually after verifying.
       - name: Create draft release
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $assets = Get-ChildItem FeatherCast-*-win64.exe, FeatherCast-*-win64.zip, FeatherCast-*-win64.*.sha256 | ForEach-Object { $_.FullName }
+          $assets = Get-ChildItem release-assets -File | ForEach-Object { $_.FullName }
           gh release create ${{ github.ref_name }} --draft --generate-notes @assets
