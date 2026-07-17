@@ -139,8 +139,14 @@ target_link_libraries(FeatherCast PRIVATE
 )
 
 if(MSVC)
-  target_compile_options(FeatherCast PRIVATE /bigobj)
-  target_link_options(FeatherCast PRIVATE "/MANIFEST:EMBED" "/MANIFESTINPUT:${FEATHERCAST_MANIFEST}")
+  target_compile_options(FeatherCast PRIVATE /bigobj "$<$<CONFIG:Release>:/Zi>")
+  target_compile_options(FeatherCastPluginHost PRIVATE "$<$<CONFIG:Release>:/Zi>")
+  target_link_options(FeatherCast PRIVATE
+    "/MANIFEST:EMBED"
+    "/MANIFESTINPUT:${FEATHERCAST_MANIFEST}"
+    "$<$<CONFIG:Release>:/DEBUG:FULL>"
+  )
+  target_link_options(FeatherCastPluginHost PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>")
 endif()
 
 add_executable(FeatherCastCoreTests
