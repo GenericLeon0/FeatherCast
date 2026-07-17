@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <stop_token>
@@ -15,6 +16,7 @@ class Executor {
  public:
   using Task = std::function<void(std::stop_token)>;
   using Completion = std::function<void()>;
+  using ErrorHandler = std::function<void(std::exception_ptr)>;
 
   Executor() = default;
   ~Executor() { Shutdown(); }
@@ -22,11 +24,12 @@ class Executor {
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
-  void Start(size_t workerCount = 2) {
+  void Start(size_t workerCount = 2, ErrorHandler errorHandler = {}) {
     std::lock_guard lock(mutex_);
     if (!workers_.empty()) return;
     stopping_ = false;
     drainOnShutdown_ = false;
+    errorHandler_ = std::move(errorHandler);
     workerCount = std::max<size_t>(1, workerCount);
     workers_.reserve(workerCount);
     for (size_t i = 0; i < workerCount; ++i) {
@@ -68,9 +71,29 @@ class Executor {
       if (worker.joinable()) worker.join();
     }
     workers_.clear();
+    {
+      std::lock_guard lock(mutex_);
+      errorHandler_ = {};
+    }
   }
 
  private:
+  void ReportFailure(std::exception_ptr failure) noexcept {
+    ErrorHandler handler;
+    try {
+      std::lock_guard lock(mutex_);
+      handler = errorHandler_;
+    } catch (...) {
+      return;
+    }
+    if (!handler) return;
+    try {
+      handler(std::move(failure));
+    } catch (...) {
+      // Error reporting must never terminate a worker.
+    }
+  }
+
   void WorkerLoop(std::stop_token stopToken) {
     for (;;) {
       Task task;
@@ -84,7 +107,13 @@ class Executor {
         task = std::move(tasks_.front());
         tasks_.pop_front();
       }
-      task(stopToken);
+      try {
+        task(stopToken);
+      } catch (const std::exception&) {
+        ReportFailure(std::current_exception());
+      } catch (...) {
+        ReportFailure(std::current_exception());
+      }
     }
   }
 
@@ -92,6 +121,7 @@ class Executor {
   std::condition_variable cv_;
   std::deque<Task> tasks_;
   std::vector<std::jthread> workers_;
+  ErrorHandler errorHandler_;
   bool stopping_ = false;
   bool drainOnShutdown_ = false;
 };

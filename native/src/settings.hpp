@@ -6,7 +6,9 @@
 
 #include <map>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -15,6 +17,8 @@
 #include "json.hpp"
 
 namespace feathercast::settings {
+
+inline constexpr int kCurrentSettingsSchemaVersion = 1;
 
 // A user-defined keyword that opens a URL, file, or folder directly.
 struct Quicklink {
@@ -83,6 +87,19 @@ struct Settings {
   }
 };
 
+enum class ParseStatus {
+  Missing,
+  Valid,
+  Invalid,
+  UnsupportedVersion,
+};
+
+struct ParseResult {
+  Settings value;
+  ParseStatus status = ParseStatus::Missing;
+  int documentVersion = 0;
+};
+
 inline std::string JsonEscape(const std::wstring& value) {
   const std::string in = feathercast::extensions::WideToUtf8(value);
   std::string out;
@@ -111,6 +128,59 @@ namespace detail {
 
 using feathercast::extensions::Utf8ToWide;
 using feathercast::json::Value;
+
+inline bool IsValidUtf8(std::string_view text) {
+  const auto continuation = [](unsigned char ch) {
+    return ch >= 0x80 && ch <= 0xBF;
+  };
+
+  for (size_t i = 0; i < text.size();) {
+    const auto first = static_cast<unsigned char>(text[i]);
+    if (first <= 0x7F) {
+      ++i;
+      continue;
+    }
+
+    if (first >= 0xC2 && first <= 0xDF) {
+      if (i + 1 >= text.size() ||
+          !continuation(static_cast<unsigned char>(text[i + 1]))) {
+        return false;
+      }
+      i += 2;
+      continue;
+    }
+
+    if (first >= 0xE0 && first <= 0xEF) {
+      if (i + 2 >= text.size()) return false;
+      const auto second = static_cast<unsigned char>(text[i + 1]);
+      const auto third = static_cast<unsigned char>(text[i + 2]);
+      bool validSecond = continuation(second);
+      if (first == 0xE0) validSecond = second >= 0xA0 && second <= 0xBF;
+      else if (first == 0xED) validSecond = second >= 0x80 && second <= 0x9F;
+      if (!validSecond || !continuation(third)) return false;
+      i += 3;
+      continue;
+    }
+
+    if (first >= 0xF0 && first <= 0xF4) {
+      if (i + 3 >= text.size()) return false;
+      const auto second = static_cast<unsigned char>(text[i + 1]);
+      const auto third = static_cast<unsigned char>(text[i + 2]);
+      const auto fourth = static_cast<unsigned char>(text[i + 3]);
+      bool validSecond = continuation(second);
+      if (first == 0xF0) validSecond = second >= 0x90 && second <= 0xBF;
+      else if (first == 0xF4) validSecond = second >= 0x80 && second <= 0x8F;
+      if (!validSecond || !continuation(third) || !continuation(fourth)) {
+        return false;
+      }
+      i += 4;
+      continue;
+    }
+
+    return false;
+  }
+  return true;
+}
 
 inline void ReadString(const Value& root, std::string_view key, std::wstring& out) {
   if (const Value* value = root.Find(key); value && value->type == Value::Type::String) {
@@ -166,65 +236,99 @@ inline std::map<std::wstring, std::wstring> ReadStringObject(const Value& root, 
   return out;
 }
 
-}  // namespace detail
-
 // Missing or malformed fields keep their defaults (same lenient behavior as
 // the previous scanner, but keys inside string values can no longer match).
-inline Settings ParseSettings(const std::string& text) {
+inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   Settings settings;
-  const auto root = feathercast::json::Parse(text);
-  if (!root || root->type != feathercast::json::Value::Type::Object) return settings;
-  using detail::Utf8ToWide;
-  using feathercast::json::Value;
+  if (!root || root->type != Value::Type::Object) return settings;
 
-  detail::ReadString(*root, "shortcut", settings.shortcut);
-  settings.recentApps = detail::ReadStringArray(*root, "recentApps");
-  settings.pinnedApps = detail::ReadStringArray(*root, "pinnedApps");
-  settings.hiddenApps = detail::ReadStringArray(*root, "hiddenApps");
-  settings.appAliases = detail::ReadStringObject(*root, "appAliases");
+  ReadString(*root, "shortcut", settings.shortcut);
+  settings.recentApps = ReadStringArray(*root, "recentApps");
+  settings.pinnedApps = ReadStringArray(*root, "pinnedApps");
+  settings.hiddenApps = ReadStringArray(*root, "hiddenApps");
+  settings.appAliases = ReadStringObject(*root, "appAliases");
   if (const Value* stats = root->Find("usageStats"); stats && stats->type == Value::Type::Object) {
     for (const auto& member : stats->object) {
       if (member.value.type != Value::Type::Object) continue;
       Settings::UsageStat stat;
-      detail::ReadInt(member.value, "launches", stat.launches);
-      detail::ReadLongLong(member.value, "lastUsed", stat.lastUsed);
+      ReadInt(member.value, "launches", stat.launches);
+      ReadLongLong(member.value, "lastUsed", stat.lastUsed);
       settings.usageStats[Utf8ToWide(member.key)] = stat;
     }
   }
-  detail::ReadBool(*root, "compactMode", settings.compactMode);
-  detail::ReadBool(*root, "animationsEnabled", settings.animationsEnabled);
-  detail::ReadBool(*root, "syncAccentColor", settings.syncAccentColor);
-  detail::ReadString(*root, "customAccentColor", settings.customAccentColor);
-  detail::ReadBool(*root, "startOnStartup", settings.startOnStartup);
-  detail::ReadBool(*root, "updateChecksEnabled", settings.updateChecksEnabled);
-  detail::ReadLongLong(*root, "lastUpdateAttempt", settings.lastUpdateAttempt);
-  detail::ReadLongLong(*root, "lastUpdateCheck", settings.lastUpdateCheck);
-  detail::ReadString(*root, "dismissedUpdateVersion", settings.dismissedUpdateVersion);
-  detail::ReadInt(*root, "overlayWidth", settings.overlayWidth);
-  detail::ReadInt(*root, "maxResults", settings.maxResults);
-  detail::ReadBool(*root, "showOpenWindows", settings.showOpenWindows);
-  detail::ReadBool(*root, "showStoreApps", settings.showStoreApps);
-  detail::ReadInt(*root, "privacyConsentVersion", settings.privacyConsentVersion);
-  detail::ReadBool(*root, "clipboardHistoryEnabled", settings.clipboardHistoryEnabled);
-  detail::ReadInt(*root, "clipboardHistoryLimit", settings.clipboardHistoryLimit);
-  detail::ReadBool(*root, "fileIndexEnabled", settings.fileIndexEnabled);
-  detail::ReadInt(*root, "fileIndexMaxEntries", settings.fileIndexMaxEntries);
-  settings.fileIndexRoots = detail::ReadStringArray(*root, "fileIndexRoots");
-  detail::ReadBool(*root, "diagnosticsEnabled", settings.diagnosticsEnabled);
-  if (auto engines = detail::ReadStringObject(*root, "searchEngines"); !engines.empty()) {
+  ReadBool(*root, "compactMode", settings.compactMode);
+  ReadBool(*root, "animationsEnabled", settings.animationsEnabled);
+  ReadBool(*root, "syncAccentColor", settings.syncAccentColor);
+  ReadString(*root, "customAccentColor", settings.customAccentColor);
+  ReadBool(*root, "startOnStartup", settings.startOnStartup);
+  ReadBool(*root, "updateChecksEnabled", settings.updateChecksEnabled);
+  ReadLongLong(*root, "lastUpdateAttempt", settings.lastUpdateAttempt);
+  ReadLongLong(*root, "lastUpdateCheck", settings.lastUpdateCheck);
+  ReadString(*root, "dismissedUpdateVersion", settings.dismissedUpdateVersion);
+  ReadInt(*root, "overlayWidth", settings.overlayWidth);
+  ReadInt(*root, "maxResults", settings.maxResults);
+  ReadBool(*root, "showOpenWindows", settings.showOpenWindows);
+  ReadBool(*root, "showStoreApps", settings.showStoreApps);
+  ReadInt(*root, "privacyConsentVersion", settings.privacyConsentVersion);
+  ReadBool(*root, "clipboardHistoryEnabled", settings.clipboardHistoryEnabled);
+  ReadInt(*root, "clipboardHistoryLimit", settings.clipboardHistoryLimit);
+  ReadBool(*root, "fileIndexEnabled", settings.fileIndexEnabled);
+  ReadInt(*root, "fileIndexMaxEntries", settings.fileIndexMaxEntries);
+  settings.fileIndexRoots = ReadStringArray(*root, "fileIndexRoots");
+  ReadBool(*root, "diagnosticsEnabled", settings.diagnosticsEnabled);
+  if (auto engines = ReadStringObject(*root, "searchEngines"); !engines.empty()) {
     settings.searchEngines = std::move(engines);
   }
   if (const Value* links = root->Find("quicklinks"); links && links->type == Value::Type::Array) {
     for (const auto& element : links->array) {
       if (element.type != Value::Type::Object) continue;
       Quicklink link;
-      detail::ReadString(element, "keyword", link.keyword);
-      detail::ReadString(element, "name", link.name);
-      detail::ReadString(element, "target", link.target);
+      ReadString(element, "keyword", link.keyword);
+      ReadString(element, "name", link.name);
+      ReadString(element, "target", link.target);
       if (!link.keyword.empty() && !link.target.empty()) settings.quicklinks.push_back(std::move(link));
     }
   }
   return settings;
+}
+
+}  // namespace detail
+
+inline ParseResult ParseSettingsDocument(const std::string& text) {
+  if (text.empty()) return {};
+  if (!detail::IsValidUtf8(text)) {
+    return {Settings{}, ParseStatus::Invalid, 0};
+  }
+
+  const auto root = feathercast::json::Parse(text);
+  if (!root || root->type != feathercast::json::Value::Type::Object) {
+    return {Settings{}, ParseStatus::Invalid, 0};
+  }
+
+  int documentVersion = 0;
+  if (const auto* version = root->Find("schemaVersion")) {
+    if (version->type != feathercast::json::Value::Type::Number ||
+        !std::isfinite(version->number) ||
+        std::floor(version->number) != version->number ||
+        version->number < 0 ||
+        version->number >
+            static_cast<double>(std::numeric_limits<int>::max())) {
+      return {Settings{}, ParseStatus::Invalid, 0};
+    }
+    documentVersion = static_cast<int>(version->number);
+  }
+
+  if (documentVersion > kCurrentSettingsSchemaVersion) {
+    return {Settings{}, ParseStatus::UnsupportedVersion, documentVersion};
+  }
+  return {detail::ParseSettingsRoot(root), ParseStatus::Valid,
+          documentVersion};
+}
+
+// Compatibility wrapper for callers that intentionally want defaults for a
+// missing or invalid document.
+inline Settings ParseSettings(const std::string& text) {
+  return ParseSettingsDocument(text).value;
 }
 
 namespace detail {
@@ -254,6 +358,7 @@ inline void WriteStringObject(std::ostringstream& out, const std::map<std::wstri
 inline std::string SerializeSettings(const Settings& settings) {
   std::ostringstream out;
   out << "{\n";
+  out << "  \"schemaVersion\": " << kCurrentSettingsSchemaVersion << ",\n";
   out << "  \"shortcut\": \"" << JsonEscape(settings.shortcut) << "\",\n";
   out << "  \"recentApps\": ";
   detail::WriteStringArray(out, settings.recentApps);

@@ -11,6 +11,7 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 - Token-aware fuzzy search ranked for launcher usage
 - Optional local file/folder indexing and clipboard history
 - Calculator, unit/currency conversion, emoji, symbols, snippets, quicklinks, and web-search prefixes
+- Searchable “Discover FeatherCast” guide with feature examples and shortcuts
 - Native out-of-process plugin host with timeouts and crash isolation
 - Lazy shell icon loading with a native PNG icon cache
 - Keyboard-first controls: Up/Down, Enter, Ctrl+Shift+Enter, Esc
@@ -33,6 +34,7 @@ AI chat and AI provider settings were removed in the native remake.
 | Return from actions or a browse view | `Left` or `Esc` |
 | Close overlay | `Esc` |
 | Open Settings | Gear button or tray menu |
+| Browse feature guide | Search for `help` or `Discover FeatherCast` |
 
 The tray icon runs in the background. Left-click opens search; right-click opens the menu.
 
