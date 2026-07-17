@@ -17,7 +17,8 @@ may mutate live window state.
   orderly shutdown.
 - `DiscoveryService` coalesces refreshes and suppresses stale generations.
 - `SearchCoordinator` coalesces queries; `SnapshotCoordinator` prepares
-  immutable corpus snapshots by revision.
+  immutable corpus snapshots by revision. `search_pipeline::ComputeResults`
+  is the pure query-to-sections engine shared by the app and headless tests.
 - `LaunchService`, `IconResolver`, `CurrencyService`, and `UpdateService` own
   their workers and cancellation. WinHTTP implementation details live in the
   runtime network adapter.
@@ -25,6 +26,9 @@ may mutate live window state.
   availability metadata, focus order, and confirmation policy.
 - The capability catalog describes built-in feature discovery, examples, and
   typed guide actions without changing search-provider or plugin contracts.
+- Result actions carry a typed app, window, or text payload. Window geometry,
+  local clock answers, UUID formatting, and Windows Settings targets stay in
+  narrow deterministic helpers outside the Win32 composition root.
 
 `FeatherCastUi` owns UI-thread-only overlay/settings state and controllers. UI
 state transitions and descriptor projections are pure and unit tested. Direct2D

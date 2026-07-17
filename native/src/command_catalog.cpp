@@ -26,9 +26,20 @@ app::DisplayItem ActionItem(app::ActionKind kind, std::wstring label,
   item.commandKeywords = {label, detail};
   item.commandName = std::move(label);
   item.commandDetail = std::move(detail);
-  item.actionTargetIsWindow = target.isWindow;
-  item.actionApp = target.app;
-  item.actionWindow = target.window;
+  item.actionTarget = target.isWindow ? app::ActionTarget{target.window}
+                                      : app::ActionTarget{target.app};
+  return item;
+}
+
+app::DisplayItem TextActionItem(app::ActionKind kind, std::wstring label,
+                                std::wstring detail, std::wstring value) {
+  app::DisplayItem item;
+  item.isAction = true;
+  item.action = kind;
+  item.commandKeywords = {label, detail};
+  item.commandName = std::move(label);
+  item.commandDetail = std::move(detail);
+  item.actionTarget = app::TextActionPayload{std::move(value)};
   return item;
 }
 
@@ -122,6 +133,29 @@ const std::vector<CommandDescriptor>& Catalog() {
        ConfirmationDescriptor{L"Empty the Recycle Bin?",
                               L"This permanently deletes everything in the Recycle Bin.",
                               L"Empty Recycle Bin"}},
+      {L"volume-control", app::CommandKind::VolumeControl, L"Volume Control",
+       L"Adjust the default audio output volume",
+       {L"audio", L"sound", L"speaker", L"volume", L"level"}},
+      {L"volume-up", app::CommandKind::VolumeUp, L"Volume Up",
+       L"Increase the default audio output volume",
+       {L"audio", L"sound", L"speaker", L"louder"}},
+      {L"volume-down", app::CommandKind::VolumeDown, L"Volume Down",
+       L"Decrease the default audio output volume",
+       {L"audio", L"sound", L"speaker", L"quieter"}},
+      {L"media-play-pause", app::CommandKind::MediaPlayPause,
+       L"Play or Pause Media", L"Toggle playback in the active media session",
+       {L"media", L"music", L"play", L"pause"}},
+      {L"media-next", app::CommandKind::MediaNext, L"Next Media Track",
+       L"Skip to the next media track", {L"media", L"music", L"next", L"skip"}},
+      {L"media-previous", app::CommandKind::MediaPrevious,
+       L"Previous Media Track", L"Return to the previous media track",
+       {L"media", L"music", L"previous", L"back"}},
+      {L"show-desktop", app::CommandKind::ShowDesktop, L"Show Desktop",
+       L"Toggle all windows to reveal the desktop",
+       {L"desktop", L"windows", L"minimize", L"hide"}},
+      {L"generate-uuid", app::CommandKind::GenerateUuid, L"Generate UUID",
+       L"Create and copy a new UUID v4",
+       {L"uuid", L"guid", L"developer", L"random identifier"}},
   };
   return commands;
 }
@@ -147,7 +181,7 @@ std::vector<app::DisplayItem> BuildActions(
     const app::DisplayItem& target, const app::Settings& settings) {
   std::vector<app::DisplayItem> actions;
   if (target.isCommand || target.isAction || target.isExtension ||
-      target.isSnippet || target.isClipboard || target.isCapability) {
+      target.isCapability || target.isRunCommand || target.isWebSearch) {
     return actions;
   }
   if (target.isWindow) {
@@ -158,8 +192,52 @@ std::vector<app::DisplayItem> BuildActions(
     actions.push_back(ActionItem(app::ActionKind::MaximizeRestore,
                                  L"Maximize or Restore Window",
                                  L"Toggle window state", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowLeftHalf,
+                                 L"Move to Left Half",
+                                 L"Fill the left half of the work area", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowRightHalf,
+                                 L"Move to Right Half",
+                                 L"Fill the right half of the work area", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowTopHalf,
+                                 L"Move to Top Half",
+                                 L"Fill the top half of the work area", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowBottomHalf,
+                                 L"Move to Bottom Half",
+                                 L"Fill the bottom half of the work area", target));
+    actions.push_back(ActionItem(app::ActionKind::CenterWindow,
+                                 L"Center Window",
+                                 L"Center the window without enlarging it", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowNextDisplay,
+                                 L"Move to Next Display",
+                                 L"Move the window to the next monitor", target));
     actions.push_back(ActionItem(app::ActionKind::CloseWindow, L"Close Window",
                                  L"Send close request", target));
+    return actions;
+  }
+  if (target.isCalculator || target.isConversion) {
+    actions.push_back(TextActionItem(app::ActionKind::CopyText, L"Copy Result",
+                                     L"Copy the result to the clipboard",
+                                     target.calculationResult));
+    actions.push_back(TextActionItem(
+        app::ActionKind::CopyText, L"Copy Expression and Result",
+        L"Copy the complete calculation",
+        target.calculationExpression + L" = " + target.calculationResult));
+    actions.push_back(TextActionItem(app::ActionKind::PasteText, L"Paste Result",
+                                     L"Paste the result into the previous app",
+                                     target.calculationResult));
+    return actions;
+  }
+  if (target.isSnippet || target.isClipboard || target.isSymbol ||
+      target.utility) {
+    std::wstring value;
+    if (target.isSnippet) value = target.snippet.text;
+    else if (target.isClipboard) value = target.clipboard.text;
+    else if (target.isSymbol) value = target.symbol.value;
+    else value = target.utility->value;
+    actions.push_back(TextActionItem(app::ActionKind::CopyText, L"Copy",
+                                     L"Copy this value to the clipboard", value));
+    actions.push_back(TextActionItem(app::ActionKind::PasteText, L"Paste",
+                                     L"Paste this value into the previous app", value));
     return actions;
   }
   actions.push_back(ActionItem(app::ActionKind::Open, L"Open",

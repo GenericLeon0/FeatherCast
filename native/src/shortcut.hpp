@@ -33,6 +33,7 @@ struct HookResult {
   bool consume = false;
   bool toggle = false;
   bool suppressWinStart = false;
+  bool deferToggleUntilWinRelease = false;
 };
 
 struct HotKeySpec {
@@ -380,6 +381,7 @@ class ShortcutRuntime {
           result.toggle = true;
           result.suppressWinStart = shortcut.singleModifierVk == VK_LWIN;
           result.consume = !result.suppressWinStart;
+          result.deferToggleUntilWinRelease = result.suppressWinStart;
         }
         singleModifierDown_ = false;
         singleModifierChord_ = false;
@@ -394,7 +396,8 @@ class ShortcutRuntime {
                          modifiers.shift == shortcut.shift &&
                          modifiers.win == shortcut.win;
       if (exact) {
-        HookResult result{true, !targetKeyDown_, shortcut.win && !targetKeyDown_};
+        HookResult result{true, !targetKeyDown_,
+                          shortcut.win && !targetKeyDown_, false};
         targetKeyDown_ = true;
         shortcutActive_ = true;
         return result;
@@ -403,7 +406,7 @@ class ShortcutRuntime {
       if (shortcutActive_) {
         targetKeyDown_ = false;
         shortcutActive_ = false;
-        return HookResult{true, false, false};
+        return HookResult{true, false, false, false};
       }
       targetKeyDown_ = false;
     }

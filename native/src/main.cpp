@@ -1,6 +1,7 @@
 #include "calculator.hpp"
 #include "accessibility.hpp"
 #include "app_types.hpp"
+#include "audio_volume.hpp"
 #include "background_executor.hpp"
 #include "background_services.hpp"
 #include "capability_catalog.hpp"
@@ -17,6 +18,7 @@
 #include "persistence_service.hpp"
 #include "run_command.hpp"
 #include "search_coordinator.hpp"
+#include "search_pipeline.hpp"
 #include "settings.hpp"
 #include "settings_catalog.hpp"
 #include "settings_io.hpp"
@@ -24,13 +26,17 @@
 #include "snippets.hpp"
 #include "storage.hpp"
 #include "symbols.hpp"
+#include "system_settings.hpp"
 #include "theme.hpp"
 #include "text_edit.hpp"
 #include "updater.hpp"
+#include "uuid_utilities.hpp"
 #include "ui_event_queue.hpp"
 #include "ui_renderer.hpp"
+#include "result_icons.hpp"
 #include "ui_state.hpp"
 #include "version.hpp"
+#include "window_layout.hpp"
 
 #include <windows.h>
 #include <malloc.h>
@@ -45,9 +51,7 @@
 #include <dwmapi.h>
 #include <imm.h>
 #include <dxgi1_2.h>
-#include <endpointvolume.h>
 #include <knownfolders.h>
-#include <mmdeviceapi.h>
 #include <powrprof.h>
 #include <propidl.h>
 #include <propkey.h>
@@ -96,6 +100,7 @@ using feathercast::shortcut::PressedModifiers;
 using feathercast::shortcut::ShortcutRecorder;
 using feathercast::shortcut::ShortcutRuntime;
 using feathercast::ui::NavigationState;
+using feathercast::ui::ResultIcon;
 using feathercast::shortcut::ShortcutSpec;
 using feathercast::shortcut::ShouldHandleInLowLevelHook;
 using feathercast::shortcut::ToHotKeySpec;
@@ -106,6 +111,7 @@ namespace {
 constexpr int IDI_APP_ICON = 101;
 constexpr wchar_t kWindowClass[] = L"FeatherCastNativeWindow";
 constexpr wchar_t kSettingsWindowClass[] = L"FeatherCastSettingsWindow";
+constexpr wchar_t kVolumeWindowClass[] = L"FeatherCastVolumeWindow";
 constexpr wchar_t kMutexName[] = L"FeatherCastNativeSingleInstance";
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_SHOW_SEARCH = WM_APP + 2;
@@ -121,6 +127,8 @@ constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr int HOTKEY_VALIDATE_SHORTCUT = 0x4C44;
 constexpr UINT TIMER_MEM_TRIM = 3;
 constexpr UINT TIMER_SELECTION_ANIM = 4;
+constexpr UINT TIMER_VOLUME_REFRESH = 5;
+constexpr UINT TIMER_SHORTCUT_TOGGLE = 6;
 
 constexpr int WIN_WIDTH = 720;
 constexpr int WIN_HEIGHT = 470;
@@ -131,6 +139,8 @@ constexpr int MIN_OVERLAY_WIDTH = 560;
 constexpr int MAX_OVERLAY_WIDTH = 980;
 constexpr int SETTINGS_WIDTH = 760;
 constexpr int SETTINGS_HEIGHT = 560;
+constexpr int VOLUME_WIDTH = 440;
+constexpr int VOLUME_HEIGHT = 170;
 constexpr int MIN_RESULTS = 25;
 constexpr int MAX_RESULT_SETTING = 400;
 constexpr int MIN_CLIPBOARD_HISTORY_LIMIT = 1;
@@ -336,62 +346,6 @@ DisplayItem WindowDisplay(const WindowEntry& window) {
   return item;
 }
 
-DisplayItem CalculatorDisplay(const feathercast::calculator::Result& result) {
-  DisplayItem item;
-  item.isCalculator = true;
-  item.calculationExpression = result.expression;
-  item.calculationResult = result.display;
-  item.commandDetail = L"Calculator result - " + result.expression;
-  item.commandKeywords = {L"calculator", L"calc", result.expression, result.display};
-  return item;
-}
-
-DisplayItem ConversionDisplay(const std::wstring& expression, const std::wstring& display) {
-  DisplayItem item;
-  item.isConversion = true;
-  item.calculationExpression = expression;
-  item.calculationResult = display;
-  item.commandDetail = L"Conversion - " + expression;
-  item.commandKeywords = {L"convert", L"conversion", expression, display};
-  return item;
-}
-
-// Percent-encodes a query for use in a URL (UTF-8 octets, RFC 3986 unreserved set).
-std::string UrlEncode(const std::wstring& text) {
-  static const char* kHex = "0123456789ABCDEF";
-  const std::string utf8 = WideToUtf8(text);
-  std::string out;
-  for (const unsigned char ch : utf8) {
-    if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
-      out.push_back(static_cast<char>(ch));
-    } else if (ch == ' ') {
-      out.push_back('+');
-    } else {
-      out.push_back('%');
-      out.push_back(kHex[ch >> 4]);
-      out.push_back(kHex[ch & 0x0F]);
-    }
-  }
-  return out;
-}
-
-DisplayItem WebSearchDisplay(const std::wstring& keyword, const std::wstring& engineTemplate, const std::wstring& terms) {
-  std::wstring url = engineTemplate;
-  const std::wstring encoded = Utf8ToWide(UrlEncode(terms));
-  if (const size_t pos = url.find(L"%s"); pos != std::wstring::npos) {
-    url.replace(pos, 2, encoded);
-  } else {
-    url += encoded;
-  }
-  DisplayItem item;
-  item.isWebSearch = true;
-  item.webSearchUrl = url;
-  item.webSearchLabel = L"Search " + keyword + L" for \"" + terms + L"\"";
-  item.commandDetail = url;
-  item.commandKeywords = {L"web", L"search", keyword, terms};
-  return item;
-}
-
 DisplayItem ExtensionDisplay(const feathercast::extensions::QueryResultItem& result) {
   DisplayItem item;
   item.isExtension = true;
@@ -429,26 +383,6 @@ DisplayItem ClipboardDisplay(const ClipboardEntry& entry) {
   item.clipboard = entry;
   item.commandDetail = L"Clipboard History";
   item.commandKeywords = {L"clipboard", L"history", L"paste", entry.text};
-  return item;
-}
-
-DisplayItem RunCommandDisplay(const feathercast::run_command::Command& command) {
-  DisplayItem item;
-  item.isRunCommand = true;
-  item.runCommand = command;
-  item.commandDetail = command.detail;
-  item.commandKeywords = {L"run", L"command", L"shell", L"url", command.input, command.target};
-  return item;
-}
-
-DisplayItem SymbolDisplay(const feathercast::symbols::Symbol& symbol) {
-  DisplayItem item;
-  item.isSymbol = true;
-  item.symbol = symbol;
-  item.commandDetail = L"Symbol - " + symbol.value;
-  item.commandKeywords = symbol.keywords;
-  item.commandKeywords.push_back(symbol.label);
-  item.commandKeywords.push_back(symbol.value);
   return item;
 }
 
@@ -513,6 +447,14 @@ AppEntry SystemPathFolder(std::wstring id, std::wstring name, std::wstring path,
   return app;
 }
 
+std::optional<std::wstring> GenerateUuidText() {
+  GUID guid{};
+  if (FAILED(CoCreateGuid(&guid))) return std::nullopt;
+  guid.Data3 = static_cast<unsigned short>((guid.Data3 & 0x0fffU) | 0x4000U);
+  guid.Data4[0] = static_cast<unsigned char>((guid.Data4[0] & 0x3fU) | 0x80U);
+  return feathercast::uuid_utilities::Format(guid);
+}
+
 std::vector<AppEntry> SystemFolderEntries() {
   std::vector<AppEntry> out;
   std::set<std::wstring> seen;
@@ -537,6 +479,9 @@ std::vector<AppEntry> SystemFolderEntries() {
   add(SystemShellFolder(L"recycle-bin", L"Recycle Bin", L"shell:RecycleBinFolder", {L"trash", L"deleted", L"bin"}));
   add(SystemShellFolder(L"control-panel", L"Control Panel", L"shell:ControlPanelFolder", {L"settings", L"system"}));
   add(SystemShellFolder(L"network", L"Network", L"shell:NetworkPlacesFolder", {L"network places", L"shares"}));
+  for (auto entry : feathercast::system_settings::Catalog()) {
+    add(std::move(entry));
+  }
   addKnown(FOLDERID_Profile, L"profile", L"User Profile", {L"home", L"user folder"});
   addKnown(FOLDERID_Desktop, L"desktop", L"Desktop", {L"desktop folder"});
   addKnown(FOLDERID_Documents, L"documents", L"Documents", {L"docs", L"files"});
@@ -794,29 +739,6 @@ bool EnableShutdownPrivilege() {
   return GetLastError() == ERROR_SUCCESS;
 }
 
-bool ToggleDefaultAudioMute() {
-  ComPtr<IMMDeviceEnumerator> enumerator;
-  if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                              IID_PPV_ARGS(enumerator.GetAddressOf())))) {
-    return false;
-  }
-
-  ComPtr<IMMDevice> device;
-  if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.GetAddressOf()))) {
-    return false;
-  }
-
-  ComPtr<IAudioEndpointVolume> volume;
-  if (FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
-                              reinterpret_cast<void**>(volume.GetAddressOf())))) {
-    return false;
-  }
-
-  BOOL muted = FALSE;
-  if (FAILED(volume->GetMute(&muted))) return false;
-  return SUCCEEDED(volume->SetMute(!muted, nullptr));
-}
-
 bool SetStartOnStartup(bool enable) {
   HKEY hKey = nullptr;
   LSTATUS status = RegOpenKeyExW(
@@ -1040,14 +962,30 @@ void ReleaseWinModifierState() {
   SendInput(static_cast<UINT>(sizeof(inputs) / sizeof(inputs[0])), inputs, sizeof(INPUT));
 }
 
-void SendVirtualKeyTap(UINT vk) {
+bool SendVirtualKeyTap(UINT vk) {
   INPUT inputs[2]{};
   inputs[0].type = INPUT_KEYBOARD;
   inputs[0].ki.wVk = static_cast<WORD>(vk);
   inputs[1].type = INPUT_KEYBOARD;
   inputs[1].ki.wVk = static_cast<WORD>(vk);
   inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-  SendInput(static_cast<UINT>(sizeof(inputs) / sizeof(inputs[0])), inputs, sizeof(INPUT));
+  return SendInput(static_cast<UINT>(sizeof(inputs) / sizeof(inputs[0])), inputs,
+                   sizeof(INPUT)) == std::size(inputs);
+}
+
+bool ToggleDesktop() {
+  ReleaseWinModifierState();
+  INPUT inputs[4]{};
+  inputs[0].type = INPUT_KEYBOARD;
+  inputs[0].ki.wVk = VK_LWIN;
+  inputs[1].type = INPUT_KEYBOARD;
+  inputs[1].ki.wVk = 'D';
+  inputs[2] = inputs[1];
+  inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+  inputs[3] = inputs[0];
+  inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+  return SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT)) ==
+         std::size(inputs);
 }
 
 std::wstring FindWindowsAppAlias(const std::wstring& fileName) {
@@ -1132,6 +1070,82 @@ void FocusWindow(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) return;
   if (IsIconic(hwnd)) ShowWindowAsync(hwnd, SW_RESTORE);
   SetForegroundWindow(hwnd);
+}
+
+feathercast::window_layout::Rect LayoutRect(const RECT& rect) {
+  return {rect.left, rect.top, rect.right, rect.bottom};
+}
+
+struct MonitorRecord {
+  HMONITOR handle = nullptr;
+  RECT bounds{};
+  RECT work{};
+};
+
+BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+  auto* records = reinterpret_cast<std::vector<MonitorRecord>*>(data);
+  MONITORINFO info{sizeof(info)};
+  if (GetMonitorInfoW(monitor, &info)) {
+    records->push_back({monitor, info.rcMonitor, info.rcWork});
+  }
+  return TRUE;
+}
+
+bool ApplyWindowLayout(HWND target, feathercast::window_layout::Layout layout) {
+  if (!target || !IsWindow(target)) return false;
+
+  WINDOWPLACEMENT placement{sizeof(placement)};
+  if (!GetWindowPlacement(target, &placement)) return false;
+  if (IsIconic(target) || IsZoomed(target)) {
+    placement.showCmd = SW_SHOWNORMAL;
+    if (!SetWindowPlacement(target, &placement)) return false;
+  }
+
+  // rcNormalPosition uses workspace coordinates for ordinary top-level
+  // windows. GetWindowRect after restoring gives the screen coordinates that
+  // MonitorFromRect and SetWindowPos require.
+  RECT normal{};
+  if (!GetWindowRect(target, &normal) || normal.right <= normal.left ||
+      normal.bottom <= normal.top) {
+    return false;
+  }
+
+  const HMONITOR sourceMonitor =
+      MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO sourceInfo{sizeof(sourceInfo)};
+  if (!GetMonitorInfoW(sourceMonitor, &sourceInfo)) return false;
+
+  RECT targetWork = sourceInfo.rcWork;
+  if (layout == feathercast::window_layout::Layout::NextDisplay) {
+    std::vector<MonitorRecord> monitors;
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitor,
+                        reinterpret_cast<LPARAM>(&monitors));
+    if (monitors.empty()) return false;
+    std::sort(monitors.begin(), monitors.end(), [](const auto& left,
+                                                   const auto& right) {
+      return feathercast::window_layout::PositionLess(
+          LayoutRect(left.bounds), LayoutRect(right.bounds));
+    });
+    const auto current = std::find_if(
+        monitors.begin(), monitors.end(), [&](const MonitorRecord& record) {
+          return record.handle == sourceMonitor;
+        });
+    const std::size_t index =
+        current == monitors.end()
+            ? 0
+            : feathercast::window_layout::NextIndex(
+                  static_cast<std::size_t>(
+                      std::distance(monitors.begin(), current)),
+                  monitors.size());
+    targetWork = monitors[index].work;
+  }
+
+  const auto destination = feathercast::window_layout::Compute(
+      layout, LayoutRect(normal), LayoutRect(sourceInfo.rcWork),
+      LayoutRect(targetWork));
+  return SetWindowPos(target, nullptr, destination.left, destination.top,
+                      destination.Width(), destination.Height(),
+                      SWP_NOACTIVATE | SWP_NOZORDER) != FALSE;
 }
 
 enum class UpdateTaskKind {
@@ -1283,7 +1297,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       g_app = nullptr;
       return 1;
     }
-    if (!InitializeFactories() || !RegisterWindowClass() || !CreateMainWindow() || !CreateSettingsWindow()) {
+    if (!InitializeFactories() || !RegisterWindowClass() || !CreateMainWindow() ||
+        !CreateSettingsWindow() || !CreateVolumeWindow()) {
       MessageBoxW(nullptr, L"FeatherCast could not initialize its native windows or graphics factories.",
                   L"FeatherCast Startup", MB_OK | MB_ICONERROR);
       ReleaseComResources();
@@ -1380,7 +1395,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         SendVirtualKeyTap(0xE8);
       }
       if (result.toggle && hwnd_) {
-        PostMessageW(hwnd_, WM_SHORTCUT_TOGGLE, result.suppressWinStart && shortcut_.singleModifier ? 1 : 0, 0);
+        PostMessageW(hwnd_, WM_SHORTCUT_TOGGLE,
+                     result.deferToggleUntilWinRelease ? 1 : 0, 0);
       }
       if (result.consume) return 1;
     }
@@ -1388,7 +1404,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   std::wstring AccessibleWindowName(HWND hwnd) const override {
-    return hwnd == settingsHwnd_ ? L"FeatherCast Settings" : L"FeatherCast Launcher";
+    if (hwnd == settingsHwnd_) return L"FeatherCast Settings";
+    if (hwnd == volumeHwnd_) return L"FeatherCast Volume Control";
+    return L"FeatherCast Launcher";
   }
 
   std::vector<feathercast::accessibility::Item> AccessibleItems(HWND hwnd) const override {
@@ -1407,6 +1425,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         origin.y + static_cast<LONG>(rect.bottom * scale),
       };
     };
+
+    if (hwnd == volumeHwnd_) {
+      const float width = static_cast<float>(client.right) / scale;
+      Item slider;
+      slider.name = L"Volume";
+      slider.value = std::to_wstring(volumePercent_) + L"%";
+      slider.description = volumeStatus_.empty()
+                               ? L"Use arrow keys to adjust the default output volume"
+                               : volumeStatus_;
+      slider.role = ROLE_SYSTEM_SLIDER;
+      slider.state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_FOCUSED;
+      slider.screenRect = screenRect(VolumeTrackHitRect(width));
+      items.push_back(std::move(slider));
+      return items;
+    }
 
     if (hwnd == hwnd_) {
       if (confirmation_) {
@@ -1573,6 +1606,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   int AccessibleFocusedChild(HWND hwnd) const override {
+    if (hwnd == volumeHwnd_) return 1;
     if (hwnd == hwnd_) {
       if (confirmation_) return confirmationFocus_ + 1;
       return flatItems_.empty() || SearchPending() ? 1 : selected_ + 2;
@@ -1581,6 +1615,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void AccessibleFocusChild(HWND hwnd, int child) override {
+    if (hwnd == volumeHwnd_) {
+      if (child == 1) SetFocus(volumeHwnd_);
+      return;
+    }
     if (hwnd == hwnd_) {
       if (confirmation_) {
         confirmationFocus_ = std::clamp(child - 1, 0, 1);
@@ -1606,6 +1644,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void AccessibleInvokeChild(HWND hwnd, int child) override {
+    if (hwnd == volumeHwnd_) {
+      if (child == 1) SetFocus(volumeHwnd_);
+      return;
+    }
     if (hwnd == hwnd_) {
       if (confirmation_) {
         confirmationFocus_ = std::clamp(child - 1, 0, 1);
@@ -1643,6 +1685,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (hwnd == settingsHwnd_) return SettingsWndProc(hwnd, msg, wParam, lParam);
+    if (hwnd == volumeHwnd_) return VolumeWndProc(hwnd, msg, wParam, lParam);
     if (taskbarCreatedMessage_ && msg == taskbarCreatedMessage_) {
       RemoveTray();
       CreateTray();
@@ -1672,6 +1715,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         } else if (wParam == TIMER_SELECTION_ANIM) {
           OnSelectionAnimationTimer();
+        } else if (wParam == TIMER_SHORTCUT_TOGGLE) {
+          if (!pendingShortcutToggle_) {
+            KillTimer(hwnd_, TIMER_SHORTCUT_TOGGLE);
+          } else if (!ModifierPressed(VK_LWIN)) {
+            pendingShortcutToggle_ = false;
+            KillTimer(hwnd_, TIMER_SHORTCUT_TOGGLE);
+            if (!recording_) TriggerShortcutToggle();
+          }
         }
         return 0;
       case WM_CREATE:
@@ -1701,8 +1752,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         break;
       case WM_SHORTCUT_TOGGLE:
-        if (wParam) ReleaseWinModifierState();
-        if (!recording_) TriggerShortcutToggle();
+        if (wParam) {
+          pendingShortcutToggle_ = true;
+          if (!SetTimer(hwnd_, TIMER_SHORTCUT_TOGGLE, 1, nullptr)) {
+            pendingShortcutToggle_ = false;
+            if (!recording_) TriggerShortcutToggle();
+          }
+        } else if (!recording_) {
+          TriggerShortcutToggle();
+        }
         return 0;
       case WM_DESTROY:
         UnregisterShortcutHotKey();
@@ -1710,6 +1768,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           HWND settings = settingsHwnd_;
           settingsHwnd_ = nullptr;
           DestroyWindow(settings);
+        }
+        if (volumeHwnd_) {
+          HWND volume = volumeHwnd_;
+          volumeHwnd_ = nullptr;
+          DestroyWindow(volume);
         }
         PostQuitMessage(0);
         return 0;
@@ -2037,6 +2100,105 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
+  LRESULT VolumeWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+      case WM_ERASEBKGND:
+        return 1;
+      case WM_GETOBJECT:
+        if (static_cast<LONG>(lParam) == OBJID_CLIENT) {
+          return feathercast::accessibility::HandleGetObject(this, hwnd, wParam,
+                                                              lParam);
+        }
+        break;
+      case WM_DWMCOMPOSITIONCHANGED:
+      case WM_THEMECHANGED:
+      case WM_SETTINGCHANGE:
+      case WM_DISPLAYCHANGE:
+        RefreshSystemPreferences();
+        ApplyGlass(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_PAINT:
+        PaintVolumeControl();
+        return 0;
+      case WM_SIZE:
+        ResizeGlassSurface(volumeSurface_, hwnd, LOWORD(lParam),
+                           HIWORD(lParam));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      case WM_DPICHANGED: {
+        auto* rect = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(hwnd, nullptr, rect->left, rect->top,
+                     rect->right - rect->left, rect->bottom - rect->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        if (volumeSurface_.dc) {
+          const float dpi = static_cast<float>(LOWORD(wParam));
+          volumeSurface_.dc->SetDpi(dpi, dpi);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      case WM_TIMER:
+        if (wParam == TIMER_VOLUME_REFRESH) RefreshVolumeFromSystem();
+        return 0;
+      case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE && volumeVisible_) {
+          HideVolumeControl(false);
+        }
+        return 0;
+      case WM_KILLFOCUS:
+        if (volumeVisible_) HideVolumeControl(false);
+        return 0;
+      case WM_KEYDOWN:
+        HandleVolumeKeyDown(static_cast<UINT>(wParam));
+        return 0;
+      case WM_LBUTTONDOWN: {
+        const float scale = GetWindowScale(hwnd);
+        const float x = static_cast<float>(GET_X_LPARAM(lParam)) / scale;
+        const float y = static_cast<float>(GET_Y_LPARAM(lParam)) / scale;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const float width = static_cast<float>(client.right) / scale;
+        if (PointInRect(VolumeTrackHitRect(width), x, y)) {
+          volumeDragging_ = true;
+          SetCapture(hwnd);
+          SetVolumeFromTrack(x, width);
+        }
+        return 0;
+      }
+      case WM_MOUSEMOVE:
+        if (volumeDragging_ && GetCapture() == hwnd) {
+          const float scale = GetWindowScale(hwnd);
+          RECT client{};
+          GetClientRect(hwnd, &client);
+          SetVolumeFromTrack(
+              static_cast<float>(GET_X_LPARAM(lParam)) / scale,
+              static_cast<float>(client.right) / scale);
+        }
+        return 0;
+      case WM_LBUTTONUP:
+        if (volumeDragging_) {
+          const float scale = GetWindowScale(hwnd);
+          RECT client{};
+          GetClientRect(hwnd, &client);
+          SetVolumeFromTrack(
+              static_cast<float>(GET_X_LPARAM(lParam)) / scale,
+              static_cast<float>(client.right) / scale);
+          volumeDragging_ = false;
+          if (GetCapture() == hwnd) ReleaseCapture();
+        }
+        return 0;
+      case WM_CANCELMODE:
+      case WM_CAPTURECHANGED:
+        volumeDragging_ = false;
+        return 0;
+      case WM_CLOSE:
+        HideVolumeControl(true);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+  }
+
   LRESULT SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
       case WM_DESTROY:
@@ -2161,7 +2323,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
     wc.lpszClassName = kSettingsWindowClass;
-    return RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      return false;
+    }
+
+    wc.lpszClassName = kVolumeWindowClass;
+    return RegisterClassExW(&wc) != 0 ||
+           GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
   }
 
   // (Re)applies the transparent window treatment. Direct2D keeps drawing the dark,
@@ -2189,6 +2357,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (hwnd == settingsHwnd_) {
       settingsBlurApplied_ = blurApplied;
+    } else if (hwnd == volumeHwnd_) {
+      volumeBlurApplied_ = blurApplied;
     } else if (hwnd == hwnd_) {
       overlayBlurApplied_ = blurApplied;
     }
@@ -2237,6 +2407,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!settingsHwnd_) return false;
     // Settings uses the same transparent DirectComposition background as the launcher.
     ApplyGlass(settingsHwnd_);
+    return true;
+  }
+
+  bool CreateVolumeWindow() {
+    volumeHwnd_ = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+        kVolumeWindowClass, L"FeatherCast Volume Control", WS_POPUP, -32000,
+        -32000, VOLUME_WIDTH, VOLUME_HEIGHT, nullptr, nullptr, instance_, this);
+    if (!volumeHwnd_) return false;
+    ApplyGlass(volumeHwnd_);
     return true;
   }
 
@@ -2302,6 +2482,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void DiscardGlassDevice() {
     overlaySurface_.Reset();
     settingsSurface_.Reset();
+    volumeSurface_.Reset();
     dcompDevice_.Reset();
     dxgiFactory_.Reset();
     d2dDevice_.Reset();
@@ -2391,6 +2572,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     buttonFormat_.Reset();
     centerFormat_.Reset();
     emojiFormat_.Reset();
+    volumeValueFormat_.Reset();
   }
 
   static feathercast::theme::Color ThemeColorFromSystem(COLORREF color) {
@@ -2457,6 +2639,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (emojiFormat_) {
       emojiFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
       emojiFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    CreateTextFormat(28.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                     volumeValueFormat_);
+    if (volumeValueFormat_) {
+      volumeValueFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
   }
 
@@ -3387,6 +3574,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void RequestSearch() {
+    overlayStatus_.reset();
     QueryRequest req = GatherRequest();
     CancelResultPointerPress();
     if (visible_) NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 1);
@@ -3419,6 +3607,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     req.recentIds = std::set<std::wstring>(settings_.recentApps.begin(), settings_.recentApps.end());
     req.limit = std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING);
     req.now = UnixNow();
+    {
+      const std::time_t captured = static_cast<std::time_t>(req.now);
+      std::tm local{};
+      if (localtime_s(&local, &captured) == 0) {
+        req.clock.localDate =
+            std::chrono::year{local.tm_year + 1900} /
+            std::chrono::month{static_cast<unsigned>(local.tm_mon + 1)} /
+            std::chrono::day{static_cast<unsigned>(local.tm_mday)};
+        req.clock.localHour = local.tm_hour;
+        req.clock.localMinute = local.tm_min;
+        req.clock.localSecond = local.tm_sec;
+      }
+      req.clock.epochSeconds = req.now;
+    }
     req.searchEngines = settings_.searchEngines;
     {
       std::lock_guard lock(dataMutex_);
@@ -3575,184 +3777,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // Pure engine: QueryRequest -> ResultsCollection. No member/UI state access,
   // so it is safe to run on the search worker thread.
   static ResultsCollection ComputeResults(const QueryRequest& req) {
-    ResultsCollection result;
-    result.generation = req.generation;
-
-    std::vector<Section> sections;
-    std::set<std::wstring> used;
-    auto take = [&](const std::vector<DisplayItem>& items, size_t limit = SIZE_MAX) {
-      std::vector<DisplayItem> out;
-      for (const auto& item : items) {
-        const auto key = item.Key();
-        if (key.empty() || used.contains(key)) continue;
-        used.insert(key);
-        out.push_back(item);
-        if (out.size() >= limit) break;
-      }
-      return out;
-    };
-    auto addSection = [&](std::wstring title, std::vector<DisplayItem> items) {
-      if (!items.empty()) sections.push_back({std::move(title), std::move(items)});
-    };
-
-    if (req.compactClear) {
-      // Render nothing.
-    } else if (req.browseView == BrowseView::Clipboard) {
-      if (req.empty) {
-        addSection(L"Clipboard History", take(req.snapshot->clipboardItems));
-      } else {
-        auto order = feathercast::core::Search(req.query, req.snapshot->clipboardSearchItems);
-        std::vector<DisplayItem> hits;
-        for (const auto index : order) hits.push_back(req.snapshot->clipboardItems[index]);
-        addSection(L"Clipboard History", take(hits));
-      }
-    } else if (req.browseView == BrowseView::Emoji) {
-      std::vector<DisplayItem> emojiItems;
-      for (const auto& emoji : feathercast::emoji::SearchEmoji(req.query, 300)) {
-        emojiItems.push_back(SymbolDisplay(emoji));
-      }
-      addSection(L"Emoji", take(emojiItems));
-    } else if (req.browseView == BrowseView::Capabilities) {
-      std::map<std::wstring, std::vector<DisplayItem>> grouped;
-      std::vector<std::wstring> categoryOrder;
-      for (const auto* capability :
-           feathercast::capabilities::Search(req.query)) {
-        if (!grouped.contains(capability->category)) {
-          categoryOrder.push_back(capability->category);
-        }
-        grouped[capability->category].push_back(
-            feathercast::capabilities::Display(*capability));
-      }
-      for (const auto& category : categoryOrder) {
-        addSection(category, take(grouped[category]));
-      }
-    } else if (req.actionMode) {
-      if (req.empty) {
-        addSection(L"Actions", take(req.actions));
-      } else {
-        auto order = feathercast::core::Search(req.query, req.actionSearchItems);
-        std::vector<DisplayItem> hits;
-        for (const auto index : order) hits.push_back(req.actions[index]);
-        addSection(L"Actions", take(hits));
-      }
-    } else if (req.empty) {
-      addSection(L"Pinned", take(req.snapshot->pinned, 12));
-      addSection(L"Recently used", take(req.snapshot->recent, 8));
-      addSection(L"Open windows", take(req.snapshot->windowItems));
-      addSection(L"Snippets", take(req.snapshot->snippetItems, 8));
-      addSection(L"Clipboard History", take(req.snapshot->clipboardItems, 5));
-      addSection(L"System Folders", take(req.snapshot->systemFolders, 12));
-      addSection(L"System essentials", take(req.snapshot->system, 8));
-      addSection(L"Commands", take(req.snapshot->commandItems, 8));
-      const auto discover = std::find_if(
-          req.snapshot->commandItems.begin(), req.snapshot->commandItems.end(),
-          [](const DisplayItem& item) {
-            return item.isCommand &&
-                   item.command == CommandKind::DiscoverFeatherCast;
-          });
-      if (discover != req.snapshot->commandItems.end()) {
-        addSection(L"Explore", take({*discover}, 1));
-      }
-    } else {
-      const std::wstring trimmed = Trim(req.query);
-      if (StartsWith(trimmed, L">")) {
-        if (const auto command = feathercast::run_command::Classify(trimmed)) {
-          addSection(command->kind == feathercast::run_command::Kind::OpenTarget ? L"Open" : L"Run",
-                     take({RunCommandDisplay(*command)}, 1));
-        }
-      } else if (StartsWith(trimmed, L":")) {
-        std::vector<DisplayItem> symbolItems;
-        for (const auto& symbol : feathercast::symbols::SearchSymbols(trimmed, 40)) {
-          symbolItems.push_back(SymbolDisplay(symbol));
-        }
-        addSection(L"Symbols", take(symbolItems, 40));
-      } else {
-      // Web search: "<keyword> <terms>" where the keyword is a configured engine.
-      if (!trimmed.empty()) {
-        const size_t space = trimmed.find_first_of(L" \t");
-        if (space != std::wstring::npos) {
-          const std::wstring keyword = Lower(trimmed.substr(0, space));
-          const std::wstring terms = Trim(trimmed.substr(space + 1));
-          if (!terms.empty()) {
-            if (auto engine = req.searchEngines.find(keyword); engine != req.searchEngines.end()) {
-              addSection(L"Web Search", take({WebSearchDisplay(keyword, engine->second, terms)}, 1));
-            }
-          }
-        }
-      }
-
-      if (const auto calculation = feathercast::calculator::TryEvaluate(req.query)) {
-        addSection(L"Calculator", take({CalculatorDisplay(*calculation)}, 1));
-      }
-
-      if (const auto conversion = feathercast::converter::TryConvert(req.query, req.currencyRates, req.defaultCurrency)) {
-        addSection(L"Conversion", take({ConversionDisplay(conversion->expression, conversion->display)}, 1));
-      }
-
-      addSection(L"Extensions", take(req.extensionItems, 20));
-
-      feathercast::core::SearchOptions searchOptions;
-      searchOptions.limit = static_cast<size_t>(req.limit);
-      searchOptions.now = req.now;
-      searchOptions.generation = req.generation;
-      searchOptions.latestGeneration = req.latestGeneration;
-      auto order = feathercast::core::SearchPrepared(
-          req.query, req.snapshot->searchItems, req.recentIds, searchOptions);
-
-      std::vector<DisplayItem> hits;
-      hits.reserve(order.size());
-      for (const auto index : order) hits.push_back(req.snapshot->pool[index]);
-
-      if (!hits.empty()) addSection(L"Best match", take({hits.front()}, 1));
-
-      std::vector<DisplayItem> rest(hits.size() > 1 ? hits.begin() + 1 : hits.end(), hits.end());
-      std::vector<DisplayItem> recent;
-      std::vector<DisplayItem> appsOnly;
-      std::vector<DisplayItem> open;
-      std::vector<DisplayItem> system;
-      std::vector<DisplayItem> commands;
-      std::vector<DisplayItem> quicklinks;
-      std::vector<DisplayItem> snippets;
-      std::vector<DisplayItem> clipboard;
-      std::vector<DisplayItem> files;
-      std::vector<DisplayItem> systemFolders;
-      std::vector<DisplayItem> other;
-      for (const auto& item : rest) {
-        const bool plainApp = !item.isWindow && !item.isCommand && !item.isSnippet && !item.isClipboard;
-        if (item.isSnippet) snippets.push_back(item);
-        if (item.isClipboard) clipboard.push_back(item);
-        if (item.isCommand) commands.push_back(item);
-        if (plainApp && item.app.source == L"quicklink") quicklinks.push_back(item);
-        if (plainApp && item.app.source == L"file") files.push_back(item);
-        if (plainApp && item.app.source == L"system-folder") systemFolders.push_back(item);
-        if (plainApp && item.app.source != L"file" && req.recentIds.contains(PrimaryAppId(item.app))) recent.push_back(item);
-        if (plainApp && item.app.source == L"shortcut") appsOnly.push_back(item);
-        if (item.isWindow) open.push_back(item);
-        if (plainApp && item.app.source != L"shortcut" && item.app.source != L"quicklink" &&
-            item.app.source != L"file" && item.app.source != L"system-folder") {
-          system.push_back(item);
-        }
-        other.push_back(item);
-      }
-      addSection(L"Commands", take(commands, 20));
-      addSection(L"Quicklinks", take(quicklinks, 20));
-      addSection(L"Snippets", take(snippets, 20));
-      addSection(L"Clipboard History", take(clipboard, 20));
-      addSection(L"Recently used", take(recent, 8));
-      addSection(L"Apps", take(appsOnly, 80));
-      addSection(L"Files & Folders", take(files, 40));
-      addSection(L"System Folders", take(systemFolders, 30));
-      addSection(L"Open windows", take(open, 40));
-      addSection(L"System & Store apps", take(system, 80));
-      addSection(L"Other matches", take(other, 40));
-      }
-    }
-
-    for (const auto& section : sections) {
-      result.flatItems.insert(result.flatItems.end(), section.items.begin(), section.items.end());
-    }
-    result.sections = std::move(sections);
-    return result;
+    return feathercast::search_pipeline::ComputeResults(req);
   }
 
   // UI thread: commit a freshly computed result set to the rendered state.
@@ -3833,6 +3858,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       out.name = item.symbol.label;
       out.keywords = item.commandKeywords;
       out.systemEssential = true;
+    } else if (item.utility) {
+      out.id = item.Key();
+      out.kind = L"utility";
+      out.source = L"utility";
+      out.name = item.utility->title;
+      out.keywords = item.utility->keywords;
+      out.keywords.push_back(item.utility->value);
+      out.systemEssential = true;
     } else if (item.isCommand) {
       out.id = item.Key();
       out.kind = L"command";
@@ -3904,7 +3937,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void UpdateBackgroundState() {
-    bool isForeground = visible_ || (settingsHwnd_ && IsWindowVisible(settingsHwnd_));
+    const bool isForeground =
+        visible_ || volumeVisible_ ||
+        (settingsHwnd_ && IsWindowVisible(settingsHwnd_));
     if (isForeground) {
       KillTimer(hwnd_, TIMER_MEM_TRIM);
       SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
@@ -3977,6 +4012,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void ShowOverlay(View view) {
     CancelPointerPress();
+    if (volumeVisible_) HideVolumeControl(false);
     if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
       HideSettings();
     }
@@ -3988,7 +4024,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // temporarily missing foreground window must not make Escape reactivate
       // an unrelated stale app.
       lastActiveWindow_ =
-          foreground && foreground != hwnd_ && foreground != settingsHwnd_
+          foreground && foreground != hwnd_ && foreground != settingsHwnd_ &&
+                  foreground != volumeHwnd_
               ? foreground
               : nullptr;
     }
@@ -4066,8 +4103,159 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (restoreTarget) FocusWindow(restoreTarget);
   }
 
+  static RectF VolumeTrackRect(float width) {
+    return {28.0f, 82.0f, width - 28.0f, 94.0f};
+  }
+
+  static RectF VolumeTrackHitRect(float width) {
+    const RectF track = VolumeTrackRect(width);
+    return {track.left - 4.0f, track.top - 16.0f, track.right + 4.0f,
+            track.bottom + 16.0f};
+  }
+
+  void NotifyVolumeValueChanged() {
+    if (!volumeHwnd_) return;
+    InvalidateRect(volumeHwnd_, nullptr, FALSE);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, volumeHwnd_, OBJID_CLIENT, 1);
+  }
+
+  void SetVolumeStatus(std::wstring status) {
+    if (volumeStatus_ == status) return;
+    volumeStatus_ = std::move(status);
+    if (volumeHwnd_) InvalidateRect(volumeHwnd_, nullptr, FALSE);
+  }
+
+  void RefreshVolumeFromSystem() {
+    if (!volumeVisible_ || volumeDragging_) return;
+    const auto current = feathercast::audio::ReadDefaultOutputVolumePercent();
+    if (!current) {
+      SetVolumeStatus(L"Could not read the default output volume.");
+      return;
+    }
+    SetVolumeStatus({});
+    if (*current == volumePercent_) return;
+    volumePercent_ = *current;
+    NotifyVolumeValueChanged();
+  }
+
+  void ApplyVolumePercent(int percent) {
+    const int next = feathercast::audio::ClampPercent(percent);
+    if (next == volumePercent_) return;
+    if (!feathercast::audio::SetDefaultOutputVolumePercent(next)) {
+      SetVolumeStatus(L"Could not change the default output volume.");
+      return;
+    }
+    volumePercent_ = next;
+    SetVolumeStatus({});
+    NotifyVolumeValueChanged();
+  }
+
+  void SetVolumeFromTrack(float x, float width) {
+    const RectF track = VolumeTrackRect(width);
+    ApplyVolumePercent(
+        feathercast::audio::PercentFromTrack(x, track.left, track.right));
+  }
+
+  void HandleVolumeKeyDown(UINT vk) {
+    switch (vk) {
+      case VK_ESCAPE:
+        HideVolumeControl(true);
+        return;
+      case VK_LEFT:
+      case VK_DOWN:
+        ApplyVolumePercent(
+            feathercast::audio::AdjustPercent(volumePercent_, -1));
+        return;
+      case VK_RIGHT:
+      case VK_UP:
+        ApplyVolumePercent(
+            feathercast::audio::AdjustPercent(volumePercent_, 1));
+        return;
+      case VK_NEXT:
+        ApplyVolumePercent(
+            feathercast::audio::AdjustPercent(volumePercent_, -10));
+        return;
+      case VK_PRIOR:
+        ApplyVolumePercent(
+            feathercast::audio::AdjustPercent(volumePercent_, 10));
+        return;
+      case VK_HOME:
+        ApplyVolumePercent(0);
+        return;
+      case VK_END:
+        ApplyVolumePercent(100);
+        return;
+      default:
+        return;
+    }
+  }
+
+  void PositionVolumeWindow(HMONITOR monitor) {
+    if (!monitor) monitor = ResolveOverlayMonitor(GetForegroundWindow());
+    MONITORINFO info{sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info)) return;
+    const float scale = GetMonitorScale(monitor);
+    const int width = static_cast<int>(VOLUME_WIDTH * scale);
+    const int height = static_cast<int>(VOLUME_HEIGHT * scale);
+    const int x = info.rcWork.left +
+                  ((info.rcWork.right - info.rcWork.left) - width) / 2;
+    const int y = info.rcWork.top + static_cast<int>(
+                                      (info.rcWork.bottom - info.rcWork.top) *
+                                      0.22f);
+    SetWindowPos(volumeHwnd_, HWND_TOPMOST, x, y, width, height,
+                 SWP_NOACTIVATE);
+  }
+
+  void ShowVolumeControl() {
+    const auto current = feathercast::audio::ReadDefaultOutputVolumePercent();
+    if (!current) {
+      SetOverlayStatus(StatusSeverity::Error,
+                       L"Could not read the default output volume.");
+      return;
+    }
+
+    HMONITOR monitor = overlayMonitor_;
+    if (!monitor) monitor = ResolveOverlayMonitor(GetForegroundWindow());
+    volumeRestoreWindow_ = lastActiveWindow_;
+    HideOverlay(false);
+
+    volumePercent_ = *current;
+    volumeStatus_.clear();
+    volumeMonitor_ = monitor;
+    volumeVisible_ = true;
+    PositionVolumeWindow(monitor);
+    ApplyGlass(volumeHwnd_);
+    RedrawWindow(volumeHwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    ShowWindow(volumeHwnd_, SW_SHOWNORMAL);
+    SetWindowPos(volumeHwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(volumeHwnd_);
+    SetActiveWindow(volumeHwnd_);
+    SetFocus(volumeHwnd_);
+    SetTimer(volumeHwnd_, TIMER_VOLUME_REFRESH, 250, nullptr);
+    UpdateBackgroundState();
+    NotifyWinEvent(EVENT_OBJECT_FOCUS, volumeHwnd_, OBJID_CLIENT, 1);
+  }
+
+  void HideVolumeControl(bool restoreFocus) {
+    if (!volumeVisible_) return;
+    HWND restoreTarget = restoreFocus ? volumeRestoreWindow_ : nullptr;
+    volumeRestoreWindow_ = nullptr;
+    volumeVisible_ = false;
+    volumeDragging_ = false;
+    KillTimer(volumeHwnd_, TIMER_VOLUME_REFRESH);
+    if (GetCapture() == volumeHwnd_) ReleaseCapture();
+    ShowWindow(volumeHwnd_, SW_HIDE);
+    volumeMonitor_ = nullptr;
+    volumeStatus_.clear();
+    UpdateBackgroundState();
+    if (restoreTarget) FocusWindow(restoreTarget);
+  }
+
   void ToggleOverlay() {
-    if (visible_) HideOverlay(true);
+    if (volumeVisible_) HideVolumeControl(true);
+    else if (visible_) HideOverlay(true);
     else ShowOverlay(View::Search);
   }
 
@@ -4080,6 +4268,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void OpenSettings() {
     CancelPointerPress();
+    if (volumeVisible_) HideVolumeControl(false);
     HideOverlay(false);
     const auto effects = feathercast::ui::SettingsController::Open(
         settingsState_, SettingsCategoryIndex(settingsCategory_));
@@ -4126,9 +4315,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void EnterActionMode(const DisplayItem& target) {
-    if (target.isCommand || target.isAction || target.isExtension || target.isSnippet ||
-        target.isClipboard || target.isRunCommand || target.isSymbol ||
-        target.isCapability) return;
+    if (target.isCommand || target.isAction || target.isExtension ||
+        target.isRunCommand || target.isWebSearch || target.isCapability) {
+      return;
+    }
     const std::wstring selectedKey =
         selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size())
             ? flatItems_[selected_].Key()
@@ -4644,6 +4834,65 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     EndPaint(settingsHwnd_, &ps);
   }
 
+  void PaintVolumeControl() {
+    PAINTSTRUCT paint{};
+    BeginPaint(volumeHwnd_, &paint);
+    if (CreateGlassSurface(volumeSurface_, volumeHwnd_)) {
+      ID2D1DeviceContext* dc = volumeSurface_.dc.Get();
+      SetActiveTarget(dc);
+      const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
+        RECT client{};
+        GetClientRect(volumeHwnd_, &client);
+        const float scale = GetWindowScale(volumeHwnd_);
+        const float width = static_cast<float>(client.right) / scale;
+        const float height = static_cast<float>(client.bottom) / scale;
+        DrawObsidianBackground(width, height, theme_.overlayRadius,
+                               ObsidianBackgroundKind::Volume);
+
+        DrawTextBlock(L"Volume Control", {24.0f, 18.0f, width - 150.0f, 46.0f},
+                      titleFormat_.Get(), D2DColor(theme_.textPrimary));
+        DrawTextBlock(std::to_wstring(volumePercent_) + L"%",
+                      {width - 145.0f, 10.0f, width - 24.0f, 52.0f},
+                      volumeValueFormat_.Get(), D2DColor(theme_.textPrimary));
+
+        const RectF track = VolumeTrackRect(width);
+        FillRound(track, 6.0f, D2DColor(theme_.surface));
+        const float progress = static_cast<float>(volumePercent_) / 100.0f;
+        const float knobX = track.left + (track.right - track.left) * progress;
+        if (knobX > track.left) {
+          FillRound({track.left, track.top, knobX, track.bottom}, 6.0f,
+                    D2DColor(ActiveAccent()));
+        }
+        auto knob = Brush(D2DColor(ActiveAccent()));
+        activeRT_->FillEllipse(
+            D2D1::Ellipse(D2D1::Point2F(knobX, (track.top + track.bottom) / 2.0f),
+                          9.0f, 9.0f),
+            knob.Get());
+        auto knobBorder = Brush(D2DColor(theme_.textPrimary));
+        activeRT_->DrawEllipse(
+            D2D1::Ellipse(D2D1::Point2F(knobX, (track.top + track.bottom) / 2.0f),
+                          9.0f, 9.0f),
+            knobBorder.Get(), 1.0f);
+
+        const bool error = !volumeStatus_.empty();
+        DrawTextBlock(error ? volumeStatus_
+                            : L"Arrow keys 1%  |  Page Up/Down 10%  |  Home/End",
+                      {24.0f, 122.0f, width - 24.0f, height - 18.0f},
+                      bodyFormat_.Get(),
+                      error ? D2DColor(theme_.danger)
+                            : D2DColor(theme_.textMuted));
+      });
+      activeRT_ = nullptr;
+      activeDC_.Reset();
+      if (frame.recreateTarget) {
+        DiscardGlassDevice();
+      } else {
+        volumeSurface_.swapChain->Present(1, 0);
+      }
+    }
+    EndPaint(volumeHwnd_, &paint);
+  }
+
   static uint32_t ColorKey(const D2D1_COLOR_F& color) {
     auto clamp8 = [](float v) -> uint32_t {
       const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
@@ -4709,12 +4958,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   enum class ObsidianBackgroundKind {
     Overlay,
     Settings,
+    Volume,
   };
 
   void DrawObsidianBackground(float width, float height, float radius, ObsidianBackgroundKind kind) {
     const RectF panel{0.5f, 0.5f, width - 0.5f, height - 0.5f};
     const bool settings = kind == ObsidianBackgroundKind::Settings;
-    const bool blurApplied = settings ? settingsBlurApplied_ : overlayBlurApplied_;
+    const bool volume = kind == ObsidianBackgroundKind::Volume;
+    const bool blurApplied = settings   ? settingsBlurApplied_
+                             : volume ? volumeBlurApplied_
+                                      : overlayBlurApplied_;
     feathercast::theme::Color background = settings ? theme_.settingsBackground : theme_.overlayBackground;
     background.a = std::min(background.a, blurApplied ? 0.72f : 0.85f);
 
@@ -4749,6 +5002,506 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     activeRT_->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format, ToD2D(rect), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+  }
+
+  ID2D1StrokeStyle* ResultIconStrokeStyle() {
+    if (resultIconStroke_) return resultIconStroke_.Get();
+    ComPtr<ID2D1Factory> factory;
+    activeRT_->GetFactory(factory.GetAddressOf());
+    if (!factory) return nullptr;
+    const D2D1_STROKE_STYLE_PROPERTIES properties = {
+        D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+        D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND,
+        10.0f, D2D1_DASH_STYLE_SOLID, 0.0f};
+    factory->CreateStrokeStyle(properties, nullptr, 0,
+                               resultIconStroke_.GetAddressOf());
+    return resultIconStroke_.Get();
+  }
+
+  void DrawResultIcon(ResultIcon icon, RectF tile, D2D1_COLOR_F color) {
+    auto brush = Brush(color);
+    ID2D1StrokeStyle* stroke = ResultIconStrokeStyle();
+    constexpr float sw = 1.65f;
+    const float ox = tile.left + 4.0f;
+    const float oy = tile.top + 4.0f;
+    auto point = [&](float x, float y) { return D2D1::Point2F(ox + x, oy + y); };
+    auto line = [&](float x1, float y1, float x2, float y2) {
+      activeRT_->DrawLine(point(x1, y1), point(x2, y2), brush.Get(), sw, stroke);
+    };
+    auto rect = [&](float left, float top, float right, float bottom,
+                    float radius = 1.5f) {
+      activeRT_->DrawRoundedRectangle(
+          D2D1::RoundedRect(D2D1::RectF(ox + left, oy + top, ox + right,
+                                        oy + bottom),
+                            radius, radius),
+          brush.Get(), sw, stroke);
+    };
+    auto ellipse = [&](float cx, float cy, float rx, float ry) {
+      activeRT_->DrawEllipse(D2D1::Ellipse(point(cx, cy), rx, ry),
+                             brush.Get(), sw, stroke);
+    };
+    auto dot = [&](float cx, float cy, float radius = 1.0f) {
+      activeRT_->FillEllipse(D2D1::Ellipse(point(cx, cy), radius, radius),
+                             brush.Get());
+    };
+    auto cross = [&](float cx, float cy, float radius = 2.0f) {
+      line(cx - radius, cy - radius, cx + radius, cy + radius);
+      line(cx + radius, cy - radius, cx - radius, cy + radius);
+    };
+    auto plus = [&](float cx, float cy, float radius = 2.0f) {
+      line(cx - radius, cy, cx + radius, cy);
+      line(cx, cy - radius, cx, cy + radius);
+    };
+    auto refresh = [&] {
+      line(3.0f, 6.0f, 4.2f, 3.8f);
+      line(4.2f, 3.8f, 6.5f, 3.2f);
+      line(4.2f, 3.8f, 4.4f, 6.3f);
+      line(6.5f, 3.2f, 10.8f, 4.2f);
+      line(10.8f, 4.2f, 12.5f, 7.0f);
+      line(13.0f, 10.0f, 11.8f, 12.2f);
+      line(11.8f, 12.2f, 9.5f, 12.8f);
+      line(11.8f, 12.2f, 11.6f, 9.7f);
+      line(9.5f, 12.8f, 5.2f, 11.8f);
+      line(5.2f, 11.8f, 3.5f, 9.0f);
+    };
+    auto document = [&] {
+      line(3.5f, 1.8f, 9.8f, 1.8f);
+      line(9.8f, 1.8f, 12.7f, 4.7f);
+      line(12.7f, 4.7f, 12.7f, 14.2f);
+      line(12.7f, 14.2f, 3.5f, 14.2f);
+      line(3.5f, 14.2f, 3.5f, 1.8f);
+      line(9.8f, 1.8f, 9.8f, 4.7f);
+      line(9.8f, 4.7f, 12.7f, 4.7f);
+      line(5.7f, 7.5f, 10.5f, 7.5f);
+      line(5.7f, 10.3f, 9.5f, 10.3f);
+    };
+    auto clipboard = [&] {
+      rect(3.0f, 3.0f, 13.0f, 14.5f, 1.7f);
+      rect(5.5f, 1.5f, 10.5f, 4.5f, 1.2f);
+      line(5.5f, 7.2f, 10.5f, 7.2f);
+      line(5.5f, 10.2f, 9.5f, 10.2f);
+    };
+    auto folder = [&] {
+      line(1.7f, 4.2f, 6.0f, 4.2f);
+      line(6.0f, 4.2f, 7.5f, 6.0f);
+      line(7.5f, 6.0f, 14.3f, 6.0f);
+      line(14.3f, 6.0f, 13.2f, 13.3f);
+      line(13.2f, 13.3f, 2.8f, 13.3f);
+      line(2.8f, 13.3f, 1.7f, 4.2f);
+    };
+    auto monitor = [&] {
+      rect(1.7f, 2.5f, 14.3f, 11.5f, 1.5f);
+      line(8.0f, 11.5f, 8.0f, 14.0f);
+      line(5.3f, 14.0f, 10.7f, 14.0f);
+    };
+    auto speaker = [&] {
+      line(1.7f, 6.2f, 4.7f, 6.2f);
+      line(4.7f, 6.2f, 8.3f, 3.4f);
+      line(8.3f, 3.4f, 8.3f, 12.6f);
+      line(8.3f, 12.6f, 4.7f, 9.8f);
+      line(4.7f, 9.8f, 1.7f, 9.8f);
+      line(1.7f, 9.8f, 1.7f, 6.2f);
+      line(10.5f, 6.0f, 11.5f, 7.0f);
+      line(11.5f, 7.0f, 11.5f, 9.0f);
+      line(11.5f, 9.0f, 10.5f, 10.0f);
+    };
+    auto windowFrame = [&] {
+      rect(2.0f, 2.5f, 14.0f, 13.5f, 1.5f);
+      line(2.0f, 5.3f, 14.0f, 5.3f);
+      dot(4.0f, 3.9f, 0.65f);
+    };
+    auto pane = [&](ResultIcon paneIcon) {
+      rect(2.0f, 2.0f, 14.0f, 14.0f, 1.5f);
+      switch (paneIcon) {
+        case ResultIcon::WindowLeft:
+          line(8.0f, 2.0f, 8.0f, 14.0f);
+          line(6.5f, 8.0f, 4.2f, 8.0f);
+          line(4.2f, 8.0f, 5.5f, 6.7f);
+          line(4.2f, 8.0f, 5.5f, 9.3f);
+          break;
+        case ResultIcon::WindowRight:
+          line(8.0f, 2.0f, 8.0f, 14.0f);
+          line(9.5f, 8.0f, 11.8f, 8.0f);
+          line(11.8f, 8.0f, 10.5f, 6.7f);
+          line(11.8f, 8.0f, 10.5f, 9.3f);
+          break;
+        case ResultIcon::WindowTop:
+          line(2.0f, 8.0f, 14.0f, 8.0f);
+          line(8.0f, 6.5f, 8.0f, 4.2f);
+          line(8.0f, 4.2f, 6.7f, 5.5f);
+          line(8.0f, 4.2f, 9.3f, 5.5f);
+          break;
+        case ResultIcon::WindowBottom:
+          line(2.0f, 8.0f, 14.0f, 8.0f);
+          line(8.0f, 9.5f, 8.0f, 11.8f);
+          line(8.0f, 11.8f, 6.7f, 10.5f);
+          line(8.0f, 11.8f, 9.3f, 10.5f);
+          break;
+        default: break;
+      }
+    };
+
+    switch (icon) {
+      case ResultIcon::App:
+        windowFrame();
+        plus(8.0f, 9.2f, 2.0f);
+        break;
+      case ResultIcon::AppGrid:
+        rect(2.0f, 2.0f, 6.5f, 6.5f, 1.0f);
+        rect(9.5f, 2.0f, 14.0f, 6.5f, 1.0f);
+        rect(2.0f, 9.5f, 6.5f, 14.0f, 1.0f);
+        rect(9.5f, 9.5f, 14.0f, 14.0f, 1.0f);
+        break;
+      case ResultIcon::Windows:
+        rect(1.8f, 4.5f, 11.5f, 13.8f, 1.3f);
+        rect(4.5f, 1.8f, 14.2f, 11.1f, 1.3f);
+        line(4.5f, 4.7f, 14.2f, 4.7f);
+        break;
+      case ResultIcon::WindowLayout:
+        rect(1.8f, 2.0f, 14.2f, 14.0f, 1.4f);
+        line(7.2f, 2.0f, 7.2f, 14.0f);
+        line(7.2f, 8.0f, 14.2f, 8.0f);
+        break;
+      case ResultIcon::Actions:
+        for (int row = 0; row < 3; ++row) {
+          const float y = 4.0f + row * 4.0f;
+          dot(3.0f, y, 0.9f);
+          line(6.0f, y, 13.0f, y);
+        }
+        break;
+      case ResultIcon::Calculator:
+        rect(2.0f, 1.5f, 14.0f, 14.5f, 1.7f);
+        line(4.0f, 5.0f, 12.0f, 5.0f);
+        plus(5.0f, 9.0f, 1.4f);
+        line(9.5f, 9.0f, 12.0f, 9.0f);
+        cross(5.0f, 12.2f, 1.2f);
+        line(9.5f, 11.5f, 12.0f, 11.5f);
+        line(9.5f, 13.0f, 12.0f, 13.0f);
+        break;
+      case ResultIcon::Convert:
+        line(2.0f, 5.0f, 12.5f, 5.0f);
+        line(12.5f, 5.0f, 10.3f, 2.8f);
+        line(12.5f, 5.0f, 10.3f, 7.2f);
+        line(14.0f, 11.0f, 3.5f, 11.0f);
+        line(3.5f, 11.0f, 5.7f, 8.8f);
+        line(3.5f, 11.0f, 5.7f, 13.2f);
+        break;
+      case ResultIcon::Clock:
+        ellipse(8.0f, 8.0f, 6.2f, 6.2f);
+        line(8.0f, 4.5f, 8.0f, 8.0f);
+        line(8.0f, 8.0f, 10.6f, 9.5f);
+        break;
+      case ResultIcon::Calendar:
+      case ResultIcon::CalendarWeek:
+        rect(2.0f, 3.0f, 14.0f, 14.0f, 1.5f);
+        line(2.0f, 6.2f, 14.0f, 6.2f);
+        line(5.0f, 1.8f, 5.0f, 4.2f);
+        line(11.0f, 1.8f, 11.0f, 4.2f);
+        if (icon == ResultIcon::CalendarWeek) {
+          line(5.0f, 9.0f, 11.0f, 9.0f);
+          line(5.0f, 11.7f, 9.0f, 11.7f);
+        } else {
+          dot(5.2f, 9.2f, 0.75f);
+          dot(8.0f, 9.2f, 0.75f);
+          dot(10.8f, 9.2f, 0.75f);
+        }
+        break;
+      case ResultIcon::Code:
+        line(6.0f, 3.2f, 2.0f, 8.0f);
+        line(2.0f, 8.0f, 6.0f, 12.8f);
+        line(10.0f, 3.2f, 14.0f, 8.0f);
+        line(14.0f, 8.0f, 10.0f, 12.8f);
+        line(9.0f, 2.5f, 7.0f, 13.5f);
+        break;
+      case ResultIcon::WebSearch:
+        ellipse(6.8f, 6.8f, 5.0f, 5.0f);
+        ellipse(6.8f, 6.8f, 2.2f, 5.0f);
+        line(2.2f, 6.8f, 11.4f, 6.8f);
+        line(10.4f, 10.4f, 14.0f, 14.0f);
+        break;
+      case ResultIcon::Smile:
+        ellipse(8.0f, 8.0f, 6.2f, 6.2f);
+        dot(5.6f, 6.3f, 0.8f);
+        dot(10.4f, 6.3f, 0.8f);
+        line(5.2f, 10.0f, 7.0f, 11.4f);
+        line(7.0f, 11.4f, 9.0f, 11.4f);
+        line(9.0f, 11.4f, 10.8f, 10.0f);
+        break;
+      case ResultIcon::Symbols:
+        plus(4.0f, 4.0f, 2.0f);
+        ellipse(11.7f, 4.0f, 2.0f, 2.0f);
+        line(2.0f, 12.0f, 5.0f, 8.5f);
+        line(5.0f, 8.5f, 8.0f, 12.0f);
+        line(8.0f, 12.0f, 5.0f, 14.0f);
+        line(5.0f, 14.0f, 2.0f, 12.0f);
+        line(10.0f, 10.0f, 14.0f, 14.0f);
+        line(14.0f, 10.0f, 10.0f, 14.0f);
+        break;
+      case ResultIcon::FolderSearch:
+        folder();
+        ellipse(10.8f, 10.5f, 2.2f, 2.2f);
+        line(12.3f, 12.0f, 14.4f, 14.1f);
+        break;
+      case ResultIcon::Clipboard:
+        clipboard();
+        break;
+      case ResultIcon::ClipboardOff:
+        clipboard();
+        line(2.0f, 2.0f, 14.0f, 14.0f);
+        break;
+      case ResultIcon::Document:
+        document();
+        break;
+      case ResultIcon::DocumentRefresh:
+        document();
+        refresh();
+        break;
+      case ResultIcon::Link:
+        ellipse(5.2f, 9.8f, 3.8f, 2.7f);
+        ellipse(10.8f, 6.2f, 3.8f, 2.7f);
+        line(5.8f, 9.5f, 10.2f, 6.5f);
+        break;
+      case ResultIcon::Terminal:
+        rect(1.5f, 2.0f, 14.5f, 14.0f, 1.8f);
+        line(1.5f, 5.0f, 14.5f, 5.0f);
+        line(4.0f, 8.0f, 6.0f, 10.0f);
+        line(6.0f, 10.0f, 4.0f, 12.0f);
+        line(8.0f, 12.0f, 11.5f, 12.0f);
+        break;
+      case ResultIcon::Gear:
+        ellipse(8.0f, 8.0f, 4.3f, 4.3f);
+        ellipse(8.0f, 8.0f, 1.5f, 1.5f);
+        for (int i = 0; i < 8; ++i) {
+          const float angle = static_cast<float>(i) * 3.14159265f / 4.0f;
+          line(8.0f + std::cos(angle) * 4.5f, 8.0f + std::sin(angle) * 4.5f,
+               8.0f + std::cos(angle) * 6.4f, 8.0f + std::sin(angle) * 6.4f);
+        }
+        break;
+      case ResultIcon::Puzzle:
+      case ResultIcon::PuzzleRefresh:
+        line(3.0f, 3.0f, 6.0f, 3.0f);
+        ellipse(8.0f, 3.0f, 2.0f, 2.0f);
+        line(10.0f, 3.0f, 13.0f, 3.0f);
+        line(13.0f, 3.0f, 13.0f, 7.0f);
+        ellipse(13.0f, 9.0f, 2.0f, 2.0f);
+        line(13.0f, 11.0f, 13.0f, 13.0f);
+        line(13.0f, 13.0f, 3.0f, 13.0f);
+        line(3.0f, 13.0f, 3.0f, 3.0f);
+        if (icon == ResultIcon::PuzzleRefresh) refresh();
+        break;
+      case ResultIcon::Keyboard:
+        rect(1.5f, 3.0f, 14.5f, 13.0f, 1.7f);
+        for (int row = 0; row < 2; ++row) {
+          for (int col = 0; col < 4; ++col) {
+            dot(4.0f + col * 2.7f, 6.0f + row * 2.7f, 0.65f);
+          }
+        }
+        line(5.0f, 11.0f, 11.0f, 11.0f);
+        break;
+      case ResultIcon::Compass:
+        ellipse(8.0f, 8.0f, 6.2f, 6.2f);
+        line(10.7f, 5.3f, 9.2f, 9.2f);
+        line(9.2f, 9.2f, 5.3f, 10.7f);
+        line(5.3f, 10.7f, 6.8f, 6.8f);
+        line(6.8f, 6.8f, 10.7f, 5.3f);
+        break;
+      case ResultIcon::Exit:
+        line(8.0f, 2.0f, 3.0f, 2.0f);
+        line(3.0f, 2.0f, 3.0f, 14.0f);
+        line(3.0f, 14.0f, 8.0f, 14.0f);
+        line(6.0f, 8.0f, 14.0f, 8.0f);
+        line(14.0f, 8.0f, 11.5f, 5.5f);
+        line(14.0f, 8.0f, 11.5f, 10.5f);
+        break;
+      case ResultIcon::Refresh:
+        refresh();
+        break;
+      case ResultIcon::Trash:
+        rect(3.5f, 5.0f, 12.5f, 14.0f, 1.2f);
+        line(2.0f, 4.0f, 14.0f, 4.0f);
+        line(6.0f, 2.0f, 10.0f, 2.0f);
+        line(6.3f, 7.0f, 6.3f, 11.8f);
+        line(9.7f, 7.0f, 9.7f, 11.8f);
+        break;
+      case ResultIcon::HistoryOff:
+        ellipse(8.0f, 8.0f, 6.0f, 6.0f);
+        line(8.0f, 4.5f, 8.0f, 8.0f);
+        line(8.0f, 8.0f, 5.5f, 9.2f);
+        line(2.0f, 2.0f, 14.0f, 14.0f);
+        break;
+      case ResultIcon::Folder:
+        folder();
+        break;
+      case ResultIcon::FolderGear:
+        folder();
+        ellipse(10.8f, 10.7f, 2.2f, 2.2f);
+        dot(10.8f, 10.7f, 0.7f);
+        break;
+      case ResultIcon::File:
+        document();
+        break;
+      case ResultIcon::Database:
+        ellipse(8.0f, 4.0f, 5.5f, 2.2f);
+        line(2.5f, 4.0f, 2.5f, 12.0f);
+        line(13.5f, 4.0f, 13.5f, 12.0f);
+        line(2.5f, 8.0f, 4.0f, 9.3f);
+        line(4.0f, 9.3f, 8.0f, 10.0f);
+        line(8.0f, 10.0f, 12.0f, 9.3f);
+        line(12.0f, 9.3f, 13.5f, 8.0f);
+        ellipse(8.0f, 12.0f, 5.5f, 2.2f);
+        break;
+      case ResultIcon::Download:
+        line(8.0f, 2.0f, 8.0f, 10.0f);
+        line(8.0f, 10.0f, 5.0f, 7.0f);
+        line(8.0f, 10.0f, 11.0f, 7.0f);
+        line(3.0f, 13.5f, 13.0f, 13.5f);
+        break;
+      case ResultIcon::Lock:
+        rect(3.0f, 7.0f, 13.0f, 14.0f, 1.5f);
+        line(5.0f, 7.0f, 5.0f, 5.2f);
+        line(5.0f, 5.2f, 6.0f, 3.0f);
+        line(6.0f, 3.0f, 10.0f, 3.0f);
+        line(10.0f, 3.0f, 11.0f, 5.2f);
+        line(11.0f, 5.2f, 11.0f, 7.0f);
+        dot(8.0f, 10.5f, 1.0f);
+        break;
+      case ResultIcon::Moon:
+        ellipse(7.5f, 8.0f, 5.7f, 6.0f);
+        line(9.0f, 2.5f, 11.0f, 5.0f);
+        line(11.0f, 5.0f, 11.5f, 8.5f);
+        line(11.5f, 8.5f, 10.0f, 11.3f);
+        break;
+      case ResultIcon::Power:
+        line(8.0f, 1.5f, 8.0f, 7.5f);
+        line(4.5f, 4.0f, 2.7f, 6.5f);
+        line(2.7f, 6.5f, 2.7f, 10.0f);
+        line(2.7f, 10.0f, 5.0f, 13.2f);
+        line(5.0f, 13.2f, 11.0f, 13.2f);
+        line(11.0f, 13.2f, 13.3f, 10.0f);
+        line(13.3f, 10.0f, 13.3f, 6.5f);
+        line(13.3f, 6.5f, 11.5f, 4.0f);
+        break;
+      case ResultIcon::PowerRefresh:
+        line(8.0f, 1.5f, 8.0f, 7.0f);
+        refresh();
+        break;
+      case ResultIcon::Speaker:
+      case ResultIcon::SpeakerOff:
+      case ResultIcon::SpeakerPlus:
+      case ResultIcon::SpeakerMinus:
+        speaker();
+        if (icon == ResultIcon::SpeakerOff) cross(13.2f, 8.0f, 2.0f);
+        if (icon == ResultIcon::SpeakerPlus) plus(13.0f, 8.0f, 2.0f);
+        if (icon == ResultIcon::SpeakerMinus) line(11.0f, 8.0f, 15.0f, 8.0f);
+        break;
+      case ResultIcon::Sliders:
+        line(3.0f, 2.0f, 3.0f, 14.0f);
+        line(8.0f, 2.0f, 8.0f, 14.0f);
+        line(13.0f, 2.0f, 13.0f, 14.0f);
+        ellipse(3.0f, 6.0f, 1.5f, 1.5f);
+        ellipse(8.0f, 10.0f, 1.5f, 1.5f);
+        ellipse(13.0f, 5.0f, 1.5f, 1.5f);
+        break;
+      case ResultIcon::PlayPause:
+        line(2.5f, 3.0f, 2.5f, 13.0f);
+        line(2.5f, 3.0f, 9.0f, 8.0f);
+        line(9.0f, 8.0f, 2.5f, 13.0f);
+        line(11.5f, 3.0f, 11.5f, 13.0f);
+        line(14.0f, 3.0f, 14.0f, 13.0f);
+        break;
+      case ResultIcon::NextTrack:
+      case ResultIcon::PreviousTrack: {
+        const bool next = icon == ResultIcon::NextTrack;
+        const float left = next ? 2.0f : 14.0f;
+        const float tip = next ? 11.0f : 5.0f;
+        line(left, 3.0f, tip, 8.0f);
+        line(tip, 8.0f, left, 13.0f);
+        line(next ? 14.0f : 2.0f, 3.0f, next ? 14.0f : 2.0f, 13.0f);
+        break;
+      }
+      case ResultIcon::Monitor:
+        monitor();
+        break;
+      case ResultIcon::Palette:
+      case ResultIcon::PaletteRefresh:
+        ellipse(7.5f, 8.0f, 6.0f, 5.8f);
+        dot(5.0f, 5.3f, 0.9f);
+        dot(8.0f, 4.2f, 0.9f);
+        dot(10.8f, 6.0f, 0.9f);
+        ellipse(9.8f, 10.8f, 2.2f, 1.6f);
+        if (icon == ResultIcon::PaletteRefresh) refresh();
+        break;
+      case ResultIcon::ExternalLink:
+        rect(2.0f, 4.5f, 11.5f, 14.0f, 1.4f);
+        line(7.0f, 9.0f, 14.0f, 2.0f);
+        line(9.5f, 2.0f, 14.0f, 2.0f);
+        line(14.0f, 2.0f, 14.0f, 6.5f);
+        break;
+      case ResultIcon::Shield:
+        line(8.0f, 1.5f, 13.0f, 3.5f);
+        line(13.0f, 3.5f, 12.2f, 10.5f);
+        line(12.2f, 10.5f, 8.0f, 14.5f);
+        line(8.0f, 14.5f, 3.8f, 10.5f);
+        line(3.8f, 10.5f, 3.0f, 3.5f);
+        line(3.0f, 3.5f, 8.0f, 1.5f);
+        line(8.0f, 3.5f, 8.0f, 12.0f);
+        break;
+      case ResultIcon::Copy:
+        rect(2.0f, 4.5f, 11.5f, 14.0f, 1.4f);
+        rect(4.5f, 2.0f, 14.0f, 11.5f, 1.4f);
+        break;
+      case ResultIcon::Pin:
+      case ResultIcon::PinOff:
+        line(5.0f, 2.0f, 11.0f, 2.0f);
+        line(6.0f, 2.0f, 6.0f, 6.0f);
+        line(10.0f, 2.0f, 10.0f, 6.0f);
+        line(4.0f, 8.0f, 12.0f, 8.0f);
+        line(6.0f, 6.0f, 4.0f, 8.0f);
+        line(10.0f, 6.0f, 12.0f, 8.0f);
+        line(8.0f, 8.0f, 8.0f, 14.0f);
+        if (icon == ResultIcon::PinOff) line(2.0f, 2.0f, 14.0f, 14.0f);
+        break;
+      case ResultIcon::Eye:
+      case ResultIcon::EyeOff:
+        line(1.5f, 8.0f, 4.5f, 4.7f);
+        line(4.5f, 4.7f, 8.0f, 3.5f);
+        line(8.0f, 3.5f, 11.5f, 4.7f);
+        line(11.5f, 4.7f, 14.5f, 8.0f);
+        line(14.5f, 8.0f, 11.5f, 11.3f);
+        line(11.5f, 11.3f, 8.0f, 12.5f);
+        line(8.0f, 12.5f, 4.5f, 11.3f);
+        line(4.5f, 11.3f, 1.5f, 8.0f);
+        ellipse(8.0f, 8.0f, 2.0f, 2.0f);
+        if (icon == ResultIcon::EyeOff) line(2.0f, 2.0f, 14.0f, 14.0f);
+        break;
+      case ResultIcon::Minimize:
+        line(3.0f, 12.0f, 13.0f, 12.0f);
+        break;
+      case ResultIcon::Maximize:
+        rect(2.0f, 4.5f, 11.5f, 14.0f, 1.2f);
+        rect(4.5f, 2.0f, 14.0f, 11.5f, 1.2f);
+        break;
+      case ResultIcon::Close:
+        cross(8.0f, 8.0f, 5.0f);
+        break;
+      case ResultIcon::WindowLeft:
+      case ResultIcon::WindowRight:
+      case ResultIcon::WindowTop:
+      case ResultIcon::WindowBottom:
+        pane(icon);
+        break;
+      case ResultIcon::Center:
+        rect(2.0f, 2.0f, 14.0f, 14.0f, 1.5f);
+        rect(5.0f, 5.0f, 11.0f, 11.0f, 1.0f);
+        break;
+      case ResultIcon::MultiMonitor:
+        rect(1.0f, 2.0f, 10.5f, 9.5f, 1.2f);
+        rect(5.5f, 6.5f, 15.0f, 14.0f, 1.2f);
+        line(9.0f, 4.0f, 12.0f, 4.0f);
+        line(12.0f, 4.0f, 10.5f, 2.5f);
+        line(12.0f, 4.0f, 10.5f, 5.5f);
+        break;
+    }
   }
 
   void DrawSearchIcon(float x, float y, D2D1_COLOR_F color) {
@@ -4943,11 +5696,39 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     D2DColor(theme_.textMuted));
     }
 
+    if (!showFooter && overlayStatus_) {
+      const RectF statusRect{16.0f, height - 36.0f, width - 16.0f,
+                             height - 8.0f};
+      D2D1_COLOR_F background = D2DColor(theme_.surface);
+      background.a = 0.96f;
+      FillRound(statusRect, 12.0f, background);
+      StrokeRound(statusRect, 12.0f, D2DColor(theme_.border));
+      DrawTextBlock(
+          overlayStatus_->text, statusRect, centerFormat_.Get(),
+          overlayStatus_->severity == StatusSeverity::Error
+              ? D2DColor(theme_.danger)
+              : D2DColor(theme_.textMuted));
+    }
+
     if (showFooter) {
       auto border = Brush(D2DColor(theme_.divider));
       activeRT_->DrawLine(D2D1::Point2F(0, height - 40.0f), D2D1::Point2F(width, height - 40.0f), border.Get(), 1.0f);
       DrawTextBlock(L"FeatherCast", {16, height - 28.0f, 160, height - 12.0f}, footerFormat_.Get(), D2DColor(theme_.textPrimary));
-      DrawTextBlock(L"Up/Down Navigate | Enter Open | Tab Actions | Esc Close", {200, height - 28.0f, width - 16.0f, height - 12.0f}, footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+      if (overlayStatus_) {
+        const D2D1_COLOR_F statusColor =
+            overlayStatus_->severity == StatusSeverity::Error
+                ? D2DColor(theme_.danger)
+                : D2DColor(theme_.textMuted);
+        DrawTextBlock(overlayStatus_->text,
+                      {200, height - 28.0f, width - 16.0f,
+                       height - 12.0f},
+                      footerRightFormat_.Get(), statusColor);
+      } else {
+        DrawTextBlock(
+            L"Up/Down Navigate | Enter Open | Tab Actions | Esc Close",
+            {200, height - 28.0f, width - 16.0f, height - 12.0f},
+            footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+      }
     }
   }
 
@@ -5181,8 +5962,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       activeRT_->DrawBitmap(bitmap.Get(), D2D1::RectF(iconX, iconY, iconX + 24, iconY + 24), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     } else {
       FillRound({iconX, iconY, iconX + 24, iconY + 24}, 6, D2DColor(theme_.iconTile));
-      std::wstring letter = item.Name().empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(std::towupper(item.Name()[0])));
-      DrawTextBlock(letter, {iconX, iconY + 1, iconX + 24, iconY + 24}, centerFormat_.Get(), D2DColor(theme_.textMuted));
+      DrawResultIcon(feathercast::ui::ResolveResultIcon(item),
+                     {iconX, iconY, iconX + 24, iconY + 24},
+                     D2DColor(ActiveAccent()));
     }
 
     // Unified text start at +52px (was +50 for icon path) to eliminate horizontal jitter.
@@ -5207,12 +5989,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isClipboard) return L"Clipboard History";
     if (item.isRunCommand) return item.commandDetail;
     if (item.isSymbol) return L"Symbol - paste";
+    if (item.utility) return L"Local utility - " + item.utility->value;
     if (item.isCommand || item.isAction) return item.commandDetail;
     if (item.isWindow) return item.window.processName.empty() ? L"Open window" : L"Open window - " + item.window.processName;
     if (item.app.source == L"shortcut") return L"Desktop app";
     if (item.app.source == L"quicklink") return L"Quicklink";
     if (item.app.source == L"file") return item.app.path.empty() ? L"File or folder" : item.app.path;
     if (item.app.source == L"system-folder") return item.app.path.empty() ? L"System folder" : item.app.path;
+    if (item.app.source == L"windows-settings") return L"Windows Settings";
     if (item.app.source == L"alias") return L"System app";
     if (item.app.source == L"appx") return L"Store/System app";
     return L"Start menu app";
@@ -5233,6 +6017,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isSnippet || item.isClipboard) return L"Enter Paste";
     if (item.isRunCommand) return item.runCommand.kind == feathercast::run_command::Kind::OpenTarget ? L"Enter Open" : L"Enter Run";
     if (item.isSymbol) return L"Enter Paste";
+    if (item.utility) return L"Enter Copy";
     if (item.isCommand) return L"Enter Run";
     if (item.isAction) return L"Enter Apply";
     if (item.isWindow) return L"Enter Switch";
@@ -5294,6 +6079,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (settingsHwnd_) {
       InvalidateRect(settingsHwnd_, nullptr, FALSE);
       NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, settingsHwnd_, OBJID_CLIENT,
+                     CHILDID_SELF);
+    }
+  }
+
+  void SetOverlayStatus(StatusSeverity severity, std::wstring text) {
+    overlayStatus_ = StatusMessage{severity, std::move(text)};
+    if (hwnd_) {
+      InvalidateRect(hwnd_, nullptr, FALSE);
+      NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, hwnd_, OBJID_CLIENT,
                      CHILDID_SELF);
     }
   }
@@ -7047,6 +7841,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                    L" isSymbol=" + std::to_wstring(item.isSymbol) +
                    L" isRunCommand=" + std::to_wstring(item.isRunCommand) +
                    L" isCalculator=" + std::to_wstring(item.isCalculator) +
+                   L" isUtility=" + std::to_wstring(item.utility.has_value()) +
                    L" isWebSearch=" + std::to_wstring(item.isWebSearch) +
                    L" isExtension=" + std::to_wstring(item.isExtension) +
                    L" isCommand=" + std::to_wstring(item.isCommand) +
@@ -7074,6 +7869,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (item.isSymbol) {
       PasteTextToLastActiveWindow(item.symbol.value);
+      return;
+    }
+
+    if (item.utility) {
+      if (CopyTextToClipboard(item.utility->value)) {
+        HideOverlay(false);
+      } else {
+        SetOverlayStatus(StatusSeverity::Error,
+                         L"Could not copy the utility result.");
+      }
       return;
     }
 
@@ -7182,6 +7987,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                         L"The storage worker is unavailable. Data was not deleted.");
     }
     if (settingsHwnd_) InvalidateRect(settingsHwnd_, nullptr, FALSE);
+    if (volumeHwnd_) InvalidateRect(volumeHwnd_, nullptr, FALSE);
   }
 
   void OnStorageOperationReady(StorageOperationResult result) {
@@ -7421,8 +8227,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case CommandKind::SleepPC:
         return;
       case CommandKind::MuteAudio:
-        ToggleDefaultAudioMute();
-        HideOverlay(false);
+        if (feathercast::audio::ToggleDefaultOutputMute()) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not toggle audio mute.");
+        }
         return;
       case CommandKind::ShutDown:
         return;
@@ -7430,17 +8240,79 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::EmptyRecycleBin:
         return;
+      case CommandKind::VolumeControl:
+        ShowVolumeControl();
+        return;
+      case CommandKind::VolumeUp:
+        if (feathercast::audio::StepDefaultOutputVolume(true)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not increase the volume.");
+        }
+        return;
+      case CommandKind::VolumeDown:
+        if (feathercast::audio::StepDefaultOutputVolume(false)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not decrease the volume.");
+        }
+        return;
+      case CommandKind::MediaPlayPause:
+        if (SendVirtualKeyTap(VK_MEDIA_PLAY_PAUSE)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not send the media command.");
+        }
+        return;
+      case CommandKind::MediaNext:
+        if (SendVirtualKeyTap(VK_MEDIA_NEXT_TRACK)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not send the media command.");
+        }
+        return;
+      case CommandKind::MediaPrevious:
+        if (SendVirtualKeyTap(VK_MEDIA_PREV_TRACK)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not send the media command.");
+        }
+        return;
+      case CommandKind::ShowDesktop:
+        if (ToggleDesktop()) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not show the desktop.");
+        }
+        return;
+      case CommandKind::GenerateUuid:
+        if (const auto uuid = GenerateUuidText();
+            uuid && CopyTextToClipboard(*uuid)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not generate or copy the UUID.");
+        }
+        return;
     }
   }
 
   void ExecuteAction(DisplayItem item) {
-    if (item.actionTargetIsWindow) {
-      HWND target = item.actionWindow.hwnd;
+    if (const auto* windowTarget =
+            std::get_if<WindowEntry>(&item.actionTarget)) {
+      HWND target = windowTarget->hwnd;
       if (!target || !IsWindow(target)) {
         actionMode_ = false;
         RefreshWindowsAsync();
         RequestSearch();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        SetOverlayStatus(StatusSeverity::Error,
+                         L"The selected window is no longer available.");
         return;
       }
 
@@ -7458,6 +8330,42 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           else ShowWindowAsync(target, SW_MAXIMIZE);
           HideOverlay(false);
           return;
+        case ActionKind::MoveWindowLeftHalf:
+        case ActionKind::MoveWindowRightHalf:
+        case ActionKind::MoveWindowTopHalf:
+        case ActionKind::MoveWindowBottomHalf:
+        case ActionKind::CenterWindow:
+        case ActionKind::MoveWindowNextDisplay: {
+          feathercast::window_layout::Layout layout =
+              feathercast::window_layout::Layout::Center;
+          switch (item.action) {
+            case ActionKind::MoveWindowLeftHalf:
+              layout = feathercast::window_layout::Layout::LeftHalf;
+              break;
+            case ActionKind::MoveWindowRightHalf:
+              layout = feathercast::window_layout::Layout::RightHalf;
+              break;
+            case ActionKind::MoveWindowTopHalf:
+              layout = feathercast::window_layout::Layout::TopHalf;
+              break;
+            case ActionKind::MoveWindowBottomHalf:
+              layout = feathercast::window_layout::Layout::BottomHalf;
+              break;
+            case ActionKind::MoveWindowNextDisplay:
+              layout = feathercast::window_layout::Layout::NextDisplay;
+              break;
+            default:
+              break;
+          }
+          if (ApplyWindowLayout(target, layout)) {
+            HideOverlay(false);
+            FocusWindow(target);
+          } else {
+            SetOverlayStatus(StatusSeverity::Error,
+                             L"Could not arrange the selected window.");
+          }
+          return;
+        }
         case ActionKind::CloseWindow:
           PostMessageW(target, WM_CLOSE, 0, 0);
           HideOverlay(false);
@@ -7467,7 +8375,24 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
     }
 
-    const AppEntry& app = item.actionApp;
+    if (const auto* textTarget =
+            std::get_if<TextActionPayload>(&item.actionTarget)) {
+      if (item.action == ActionKind::CopyText) {
+        if (CopyTextToClipboard(textTarget->value)) {
+          HideOverlay(false);
+        } else {
+          SetOverlayStatus(StatusSeverity::Error,
+                           L"Could not copy the selected text.");
+        }
+      } else if (item.action == ActionKind::PasteText) {
+        PasteTextToLastActiveWindow(textTarget->value);
+      }
+      return;
+    }
+
+    const auto* appTarget = std::get_if<AppEntry>(&item.actionTarget);
+    if (!appTarget) return;
+    const AppEntry& app = *appTarget;
     const std::wstring id = PrimaryAppId(app);
     switch (item.action) {
       case ActionKind::Open:
@@ -7854,6 +8779,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::wstring cmdLine_;
   HWND hwnd_ = nullptr;
   HWND settingsHwnd_ = nullptr;
+  HWND volumeHwnd_ = nullptr;
   NOTIFYICONDATAW tray_{};
   HHOOK hook_ = nullptr;
   bool hotKeyRegistered_ = false;
@@ -7861,6 +8787,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool hadLegacyOperationalData_ = false;
   UINT taskbarCreatedMessage_ = 0;
   ULONGLONG lastShortcutToggleTick_ = 0;
+  bool pendingShortcutToggle_ = false;
   Settings settings_;
   bool settingsPersistenceBlocked_ = false;
   bool settingsRecoveredFromInvalidFile_ = false;
@@ -7868,7 +8795,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::optional<StatusMessage> settingsStatus_;
   ShortcutSpec shortcut_;
   HWND lastActiveWindow_ = nullptr;
+  HWND volumeRestoreWindow_ = nullptr;
   bool visible_ = false;
+  bool volumeVisible_ = false;
+  bool volumeDragging_ = false;
+  int volumePercent_ = 0;
+  std::wstring volumeStatus_;
+  HMONITOR volumeMonitor_ = nullptr;
   bool highContrast_ = false;
   bool systemAnimationsEnabled_ = true;
   bool suppressHide_ = false;
@@ -7895,6 +8828,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   DisplayItem& actionTarget_ = overlayState_.actionTarget;
   BrowseView& browseView_ = overlayState_.browseView;
   std::optional<ConfirmationDialog>& confirmation_ = overlayState_.confirmation;
+  std::optional<StatusMessage>& overlayStatus_ = overlayState_.status;
   int& confirmationFocus_ = overlayState_.confirmationFocus;
   int& confirmationHover_ = overlayState_.confirmationHover;
   bool suppressNextChar_ = false;
@@ -7974,8 +8908,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   GlassSurface overlaySurface_;
   GlassSurface settingsSurface_;
+  GlassSurface volumeSurface_;
   bool overlayBlurApplied_ = false;
   bool settingsBlurApplied_ = false;
+  bool volumeBlurApplied_ = false;
   std::wstring caretMeasureText_ = L"\x01";  // sentinel that never equals a real measured prefix
   float caretMeasureWidth_ = -1.0f;
   float caretOffset_ = 0.0f;
@@ -7984,6 +8920,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // Per-render-target cache of solid-color brushes, keyed by packed RGBA.
   std::unordered_map<ID2D1RenderTarget*, std::unordered_map<uint32_t, ComPtr<ID2D1SolidColorBrush>>> brushCache_;
   ComPtr<ID2D1DeviceContext> activeDC_;  // QI of activeRT_ for color-emoji DrawText, when available
+  ComPtr<ID2D1StrokeStyle> resultIconStroke_;
   ComPtr<IDWriteTextFormat> inputFormat_;
   ComPtr<IDWriteTextFormat> rowFormat_;
   ComPtr<IDWriteTextFormat> subFormat_;
@@ -7996,6 +8933,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   ComPtr<IDWriteTextFormat> buttonFormat_;
   ComPtr<IDWriteTextFormat> centerFormat_;
   ComPtr<IDWriteTextFormat> emojiFormat_;
+  ComPtr<IDWriteTextFormat> volumeValueFormat_;
 };
 
 }  // namespace

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core.hpp"
+#include "clock_utilities.hpp"
 #include "extension_protocol.hpp"
 #include "run_command.hpp"
 #include "settings.hpp"
@@ -13,8 +14,10 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace feathercast::app {
@@ -114,6 +117,14 @@ enum class CommandKind {
   ClipboardHistory,
   EmojiPicker,
   DiscoverFeatherCast,
+  VolumeControl,
+  VolumeUp,
+  VolumeDown,
+  MediaPlayPause,
+  MediaNext,
+  MediaPrevious,
+  ShowDesktop,
+  GenerateUuid,
 };
 
 struct ConfirmationDialog {
@@ -191,6 +202,14 @@ enum class ActionKind {
   Minimize,
   MaximizeRestore,
   CloseWindow,
+  MoveWindowLeftHalf,
+  MoveWindowRightHalf,
+  MoveWindowTopHalf,
+  MoveWindowBottomHalf,
+  CenterWindow,
+  MoveWindowNextDisplay,
+  CopyText,
+  PasteText,
 };
 
 struct RectF {
@@ -267,6 +286,28 @@ struct CurrencyRates {
   long long fetchedAt = 0;
 };
 
+enum class UtilityKind {
+  LocalTime,
+  LocalDate,
+  IsoWeek,
+  UnixTime,
+};
+
+struct UtilityResult {
+  UtilityKind kind = UtilityKind::LocalTime;
+  std::wstring stableId;
+  std::wstring title;
+  std::wstring value;
+  std::vector<std::wstring> keywords;
+};
+
+struct TextActionPayload {
+  std::wstring value;
+};
+
+using ActionTarget =
+    std::variant<std::monostate, AppEntry, WindowEntry, TextActionPayload>;
+
 struct DisplayItem {
   bool isWindow = false;
   bool isCommand = false;
@@ -280,6 +321,7 @@ struct DisplayItem {
   bool isRunCommand = false;
   bool isSymbol = false;
   bool isCapability = false;
+  std::optional<UtilityResult> utility;
   AppEntry app;
   WindowEntry window;
   feathercast::extensions::QueryResultItem extension;
@@ -290,9 +332,7 @@ struct DisplayItem {
   CapabilityItem capability;
   CommandKind command = CommandKind::Settings;
   ActionKind action = ActionKind::None;
-  bool actionTargetIsWindow = false;
-  AppEntry actionApp;
-  WindowEntry actionWindow;
+  ActionTarget actionTarget;
   std::wstring commandName;
   std::wstring commandDetail;
   std::vector<std::wstring> commandKeywords;
@@ -314,15 +354,23 @@ struct DisplayItem {
              L":" + runCommand.target;
     }
     if (isSymbol) return L"symbol:" + symbol.value;
+    if (utility) return L"utility:" + utility->stableId;
     if (isCommand) {
       return L"cmd:" + std::to_wstring(static_cast<int>(command));
     }
     if (isAction) {
+      std::wstring target;
+      if (const auto* windowTarget = std::get_if<WindowEntry>(&actionTarget)) {
+        target = std::to_wstring(
+            reinterpret_cast<std::uintptr_t>(windowTarget->hwnd));
+      } else if (const auto* appTarget = std::get_if<AppEntry>(&actionTarget)) {
+        target = !appTarget->id.empty() ? appTarget->id : appTarget->path;
+      } else if (const auto* textTarget =
+                     std::get_if<TextActionPayload>(&actionTarget)) {
+        target = textTarget->value;
+      }
       return L"act:" + std::to_wstring(static_cast<int>(action)) + L":" +
-             (actionTargetIsWindow
-                  ? std::to_wstring(
-                        reinterpret_cast<std::uintptr_t>(actionWindow.hwnd))
-                  : (!actionApp.id.empty() ? actionApp.id : actionApp.path));
+             target;
     }
     if (isWindow) {
       return L"win:" +
@@ -340,6 +388,7 @@ struct DisplayItem {
     if (isClipboard) return clipboard.preview;
     if (isRunCommand) return runCommand.label;
     if (isSymbol) return symbol.label;
+    if (utility) return utility->title;
     if (isCommand || isAction) return commandName;
     return isWindow ? window.name : app.name;
   }
@@ -347,17 +396,21 @@ struct DisplayItem {
   std::wstring IconKey() const {
     if (isCapability) return L"";
     if (isCalculator || isConversion || isWebSearch || isRunCommand ||
-        isSymbol) {
+        isSymbol || utility) {
       return L"";
     }
     if (isExtension) return extension.iconPath;
     if (isSnippet || isClipboard) return L"";
     if (isAction) {
-      return actionTargetIsWindow
-                 ? (!actionWindow.iconKey.empty() ? actionWindow.iconKey
-                                                  : actionWindow.exe)
-                 : (!actionApp.iconKey.empty() ? actionApp.iconKey
-                                               : actionApp.path);
+      if (const auto* windowTarget = std::get_if<WindowEntry>(&actionTarget)) {
+        return !windowTarget->iconKey.empty() ? windowTarget->iconKey
+                                              : windowTarget->exe;
+      }
+      if (const auto* appTarget = std::get_if<AppEntry>(&actionTarget)) {
+        return !appTarget->iconKey.empty() ? appTarget->iconKey
+                                           : appTarget->path;
+      }
+      return L"";
     }
     if (isCommand) return L"";
     return isWindow
@@ -418,6 +471,7 @@ struct QueryRequest {
   bool compactClear = false;
   int limit = 0;
   long long now = 0;
+  feathercast::clock_utilities::ClockSnapshot clock;
   const std::atomic<unsigned long long>* latestGeneration = nullptr;
   std::set<std::wstring> recentIds;
   std::map<std::wstring, std::wstring> searchEngines;

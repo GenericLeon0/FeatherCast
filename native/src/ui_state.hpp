@@ -61,6 +61,7 @@ struct OverlayState {
   app::DisplayItem actionTarget;
   app::BrowseView browseView = app::BrowseView::None;
   std::optional<app::ConfirmationDialog> confirmation;
+  std::optional<app::StatusMessage> status;
   int confirmationFocus = 0;
   int confirmationHover = -1;
   std::vector<NavigationState> navigationStack;
@@ -90,6 +91,7 @@ class OverlayController {
     state.actionTarget = {};
     state.browseView = app::BrowseView::None;
     state.confirmation.reset();
+    state.status.reset();
     state.confirmationFocus = 0;
     state.confirmationHover = -1;
     state.navigationStack.clear();
@@ -104,6 +106,7 @@ class OverlayController {
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
+    state.status.reset();
     return UiEffect::RequestSearch | UiEffect::Invalidate;
   }
 
@@ -184,6 +187,7 @@ class OverlayController {
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
+    state.status.reset();
     return UiEffect::RequestSearch | UiEffect::Invalidate;
   }
 
@@ -217,6 +221,7 @@ class OverlayController {
 
   static UiEffects RestoreNavigation(OverlayState& state) {
     state.imeComposition.clear();
+    state.status.reset();
     if (state.navigationStack.empty()) {
       state.actionMode = false;
       state.browseView = app::BrowseView::None;
@@ -266,6 +271,7 @@ class OverlayController {
     state.selectionAnchor.reset();
     state.selected = 0;
     state.scroll = 0;
+    state.status.reset();
   }
 };
 

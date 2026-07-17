@@ -72,6 +72,7 @@ void AssertPassOnly(const feathercast::shortcut::HookResult& result) {
   assert(!result.consume);
   assert(!result.toggle);
   assert(!result.suppressWinStart);
+  assert(!result.deferToggleUntilWinRelease);
 }
 
 void AssertRecordingPending(const feathercast::shortcut::RecordingResult& result) {
@@ -927,6 +928,20 @@ int main() {
     assert(!release.consume);
     assert(release.toggle);
     assert(release.suppressWinStart);
+    assert(release.deferToggleUntilWinRelease);
+    AssertPassOnly(runtime.Handle(super, VK_LWIN, false, true, Mods()));
+  }
+
+  {
+    const auto super = ParseShortcut(L"Super");
+    ShortcutRuntime runtime;
+    AssertPassOnly(runtime.Handle(super, VK_RWIN, true, false,
+                                  Mods(false, false, false, true)));
+    const auto release = runtime.Handle(super, VK_RWIN, false, true, Mods());
+    assert(!release.consume);
+    assert(release.toggle);
+    assert(release.suppressWinStart);
+    assert(release.deferToggleUntilWinRelease);
   }
 
   {
@@ -946,6 +961,7 @@ int main() {
     assert(open.consume);
     assert(open.toggle);
     assert(open.suppressWinStart);
+    assert(!open.deferToggleUntilWinRelease);
     const auto repeat = runtime.Handle(superSpace, VK_SPACE, true, false, Mods(false, false, false, true));
     assert(repeat.consume);
     assert(!repeat.toggle);
@@ -953,6 +969,7 @@ int main() {
     assert(release.consume);
     assert(!release.toggle);
     assert(!release.suppressWinStart);
+    assert(!release.deferToggleUntilWinRelease);
   }
 
   {
@@ -983,6 +1000,7 @@ int main() {
     assert(altRelease.consume);
     assert(altRelease.toggle);
     assert(!altRelease.suppressWinStart);
+    assert(!altRelease.deferToggleUntilWinRelease);
   }
 
   return 0;

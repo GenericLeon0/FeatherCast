@@ -1,11 +1,13 @@
 #include "capability_catalog.hpp"
 #include "command_catalog.hpp"
 #include "settings_catalog.hpp"
+#include "result_icons.hpp"
 #include "test_framework.hpp"
 #include "ui_state.hpp"
 #include "ui_renderer.hpp"
 
 #include <algorithm>
+#include <array>
 
 int main() {
   feathercast::ui::HitRegions geometry;
@@ -50,6 +52,157 @@ int main() {
   assert(capabilityItem.capability.action.kind ==
          feathercast::app::CapabilityActionKind::SeedQuery);
 
+  using feathercast::ui::ResultIcon;
+  const std::array capabilityIcons{
+      std::pair{L"apps", ResultIcon::AppGrid},
+      std::pair{L"windows", ResultIcon::Windows},
+      std::pair{L"window-management", ResultIcon::WindowLayout},
+      std::pair{L"actions", ResultIcon::Actions},
+      std::pair{L"calculator", ResultIcon::Calculator},
+      std::pair{L"conversions", ResultIcon::Convert},
+      std::pair{L"time-utilities", ResultIcon::Clock},
+      std::pair{L"uuid", ResultIcon::Code},
+      std::pair{L"web-search", ResultIcon::WebSearch},
+      std::pair{L"emoji", ResultIcon::Smile},
+      std::pair{L"symbols", ResultIcon::Symbols},
+      std::pair{L"files", ResultIcon::FolderSearch},
+      std::pair{L"clipboard", ResultIcon::Clipboard},
+      std::pair{L"snippets", ResultIcon::Document},
+      std::pair{L"quicklinks", ResultIcon::Link},
+      std::pair{L"system-commands", ResultIcon::Terminal},
+      std::pair{L"windows-settings", ResultIcon::Gear},
+      std::pair{L"plugins", ResultIcon::Puzzle},
+      std::pair{L"shortcut", ResultIcon::Keyboard},
+  };
+  assert(capabilityIcons.size() == feathercast::capabilities::Catalog().size());
+  for (const auto& [stableId, expected] : capabilityIcons) {
+    const auto found = std::find_if(
+        feathercast::capabilities::Catalog().begin(),
+        feathercast::capabilities::Catalog().end(),
+        [&](const auto& descriptor) { return descriptor.stableId == stableId; });
+    assert(found != feathercast::capabilities::Catalog().end());
+    assert(feathercast::ui::ResolveResultIcon(
+               feathercast::capabilities::Display(*found)) == expected);
+    assert(expected != ResultIcon::App);
+  }
+
+  using feathercast::app::CommandKind;
+  const std::array commandIcons{
+      std::pair{CommandKind::Settings, ResultIcon::Gear},
+      std::pair{CommandKind::Quit, ResultIcon::Exit},
+      std::pair{CommandKind::Restart, ResultIcon::Refresh},
+      std::pair{CommandKind::RefreshApps, ResultIcon::Refresh},
+      std::pair{CommandKind::ClearIconCache, ResultIcon::Trash},
+      std::pair{CommandKind::ClearRecents, ResultIcon::HistoryOff},
+      std::pair{CommandKind::OpenDataFolder, ResultIcon::FolderGear},
+      std::pair{CommandKind::OpenLocalDataFolder, ResultIcon::Database},
+      std::pair{CommandKind::ReloadExtensions, ResultIcon::PuzzleRefresh},
+      std::pair{CommandKind::LockPC, ResultIcon::Lock},
+      std::pair{CommandKind::SleepPC, ResultIcon::Moon},
+      std::pair{CommandKind::MuteAudio, ResultIcon::SpeakerOff},
+      std::pair{CommandKind::ShutDown, ResultIcon::Power},
+      std::pair{CommandKind::RestartPC, ResultIcon::PowerRefresh},
+      std::pair{CommandKind::EmptyRecycleBin, ResultIcon::Trash},
+      std::pair{CommandKind::ClearClipboardHistory, ResultIcon::ClipboardOff},
+      std::pair{CommandKind::OpenSnippetsFile, ResultIcon::Document},
+      std::pair{CommandKind::ReloadSnippets, ResultIcon::DocumentRefresh},
+      std::pair{CommandKind::OpenThemeFile, ResultIcon::Palette},
+      std::pair{CommandKind::ReloadTheme, ResultIcon::PaletteRefresh},
+      std::pair{CommandKind::CheckForUpdates, ResultIcon::Download},
+      std::pair{CommandKind::ClipboardHistory, ResultIcon::Clipboard},
+      std::pair{CommandKind::EmojiPicker, ResultIcon::Smile},
+      std::pair{CommandKind::DiscoverFeatherCast, ResultIcon::Compass},
+      std::pair{CommandKind::VolumeControl, ResultIcon::Sliders},
+      std::pair{CommandKind::VolumeUp, ResultIcon::SpeakerPlus},
+      std::pair{CommandKind::VolumeDown, ResultIcon::SpeakerMinus},
+      std::pair{CommandKind::MediaPlayPause, ResultIcon::PlayPause},
+      std::pair{CommandKind::MediaNext, ResultIcon::NextTrack},
+      std::pair{CommandKind::MediaPrevious, ResultIcon::PreviousTrack},
+      std::pair{CommandKind::ShowDesktop, ResultIcon::Monitor},
+      std::pair{CommandKind::GenerateUuid, ResultIcon::Code},
+  };
+  assert(commandIcons.size() == feathercast::commands::Catalog().size());
+  for (const auto& [kind, expected] : commandIcons) {
+    feathercast::app::DisplayItem item;
+    item.isCommand = true;
+    item.command = kind;
+    assert(feathercast::commands::Find(kind));
+    assert(feathercast::ui::ResolveResultIcon(item) == expected);
+    assert(expected != ResultIcon::App);
+  }
+
+  using feathercast::app::ActionKind;
+  const std::array actionIcons{
+      std::pair{ActionKind::None, ResultIcon::Actions},
+      std::pair{ActionKind::Open, ResultIcon::ExternalLink},
+      std::pair{ActionKind::RunAsAdmin, ResultIcon::Shield},
+      std::pair{ActionKind::OpenLocation, ResultIcon::Folder},
+      std::pair{ActionKind::CopyPath, ResultIcon::Copy},
+      std::pair{ActionKind::Pin, ResultIcon::Pin},
+      std::pair{ActionKind::Unpin, ResultIcon::PinOff},
+      std::pair{ActionKind::Hide, ResultIcon::EyeOff},
+      std::pair{ActionKind::Unhide, ResultIcon::Eye},
+      std::pair{ActionKind::Switch, ResultIcon::Windows},
+      std::pair{ActionKind::Minimize, ResultIcon::Minimize},
+      std::pair{ActionKind::MaximizeRestore, ResultIcon::Maximize},
+      std::pair{ActionKind::CloseWindow, ResultIcon::Close},
+      std::pair{ActionKind::MoveWindowLeftHalf, ResultIcon::WindowLeft},
+      std::pair{ActionKind::MoveWindowRightHalf, ResultIcon::WindowRight},
+      std::pair{ActionKind::MoveWindowTopHalf, ResultIcon::WindowTop},
+      std::pair{ActionKind::MoveWindowBottomHalf, ResultIcon::WindowBottom},
+      std::pair{ActionKind::CenterWindow, ResultIcon::Center},
+      std::pair{ActionKind::MoveWindowNextDisplay, ResultIcon::MultiMonitor},
+      std::pair{ActionKind::CopyText, ResultIcon::Copy},
+      std::pair{ActionKind::PasteText, ResultIcon::Clipboard},
+  };
+  for (const auto& [kind, expected] : actionIcons) {
+    feathercast::app::DisplayItem item;
+    item.isAction = true;
+    item.action = kind;
+    assert(feathercast::ui::ResolveResultIcon(item) == expected);
+  }
+
+  feathercast::app::DisplayItem internal;
+  internal.isCalculator = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Calculator);
+  internal = {};
+  internal.isConversion = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Convert);
+  internal = {};
+  internal.isWebSearch = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::WebSearch);
+  internal = {};
+  internal.isExtension = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Puzzle);
+  internal = {};
+  internal.isSnippet = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Document);
+  internal = {};
+  internal.isClipboard = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Clipboard);
+  internal = {};
+  internal.isRunCommand = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Terminal);
+  for (const auto [kind, expected] : {
+           std::pair{feathercast::app::UtilityKind::LocalTime, ResultIcon::Clock},
+           std::pair{feathercast::app::UtilityKind::LocalDate, ResultIcon::Calendar},
+           std::pair{feathercast::app::UtilityKind::IsoWeek, ResultIcon::CalendarWeek},
+           std::pair{feathercast::app::UtilityKind::UnixTime, ResultIcon::Code}}) {
+    internal = {};
+    internal.utility = feathercast::app::UtilityResult{kind};
+    assert(feathercast::ui::ResolveResultIcon(internal) == expected);
+  }
+  internal = {};
+  internal.app.source = L"quicklink";
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Link);
+  internal = {};
+  internal.app.source = L"file";
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::File);
+  internal.app.fileIsDirectory = true;
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::Folder);
+  internal = {};
+  assert(feathercast::ui::ResolveResultIcon(internal) == ResultIcon::App);
+
   feathercast::settings_catalog::CatalogContext context;
   context.clipboardEnabled = false;
   auto privacy = feathercast::settings_catalog::FocusOrder(
@@ -74,12 +227,18 @@ int main() {
       feathercast::app::HitType::CompactToggle, settingValues));
 
   feathercast::ui::OverlayState overlay;
+  overlay.status = feathercast::app::StatusMessage{
+      feathercast::app::StatusSeverity::Error, L"Previous error"};
   const auto resetEffects = feathercast::ui::OverlayController::ResetForShow(
       overlay, feathercast::app::View::Search);
   assert((resetEffects & feathercast::ui::Effect(
                              feathercast::ui::UiEffect::RequestSearch)) != 0);
+  assert(!overlay.status);
+  overlay.status = feathercast::app::StatusMessage{
+      feathercast::app::StatusSeverity::Error, L"Previous error"};
   feathercast::ui::OverlayController::SetQuery(overlay, L"terminal");
   assert(overlay.query == L"terminal" && overlay.caret == 8);
+  assert(!overlay.status);
   feathercast::ui::OverlayController::MoveCaret(overlay, 4, true);
   assert(overlay.selectionAnchor && *overlay.selectionAnchor == 8);
   feathercast::ui::OverlayController::InsertText(overlay, L"\U0001F600");

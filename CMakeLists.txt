@@ -4,7 +4,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "FeatherCast Native is a Windows-only Win32 application.")
 endif()
 
-project(FeatherCastNative VERSION 0.5.0 LANGUAGES C CXX RC)
+project(FeatherCastNative VERSION 0.6.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,7 @@ add_library(FeatherCastRuntime STATIC
   native/src/runtime.cpp
   native/src/persistence_service.cpp
   native/src/search_coordinator.cpp
+  native/src/search_pipeline.cpp
   native/src/discovery_service.cpp
   native/src/command_catalog.cpp
   native/src/capability_catalog.cpp
@@ -69,6 +70,7 @@ target_link_libraries(FeatherCastRuntime PUBLIC
 
 add_library(FeatherCastUi STATIC
   native/src/ui.cpp
+  native/src/result_icons.cpp
 )
 
 target_include_directories(FeatherCastUi PUBLIC native/src)
@@ -83,6 +85,7 @@ target_link_libraries(FeatherCastUi PUBLIC FeatherCastRuntime d2d1)
 
 add_executable(FeatherCast WIN32
   native/src/main.cpp
+  native/src/audio_volume.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/native/FeatherCast.rc
 )
 
@@ -196,13 +199,17 @@ add_executable(FeatherCastCatalogUiStateTests
   native/tests/catalog_ui_state_tests.cpp
 )
 
-  add_executable(FeatherCastBackgroundServicesTests
-    native/tests/background_services_tests.cpp
-  )
+add_executable(FeatherCastBackgroundServicesTests
+  native/tests/background_services_tests.cpp
+)
 
-  add_executable(FeatherCastRuntimeLifecycleTests
-    native/tests/runtime_lifecycle_tests.cpp
-  )
+add_executable(FeatherCastRuntimeLifecycleTests
+  native/tests/runtime_lifecycle_tests.cpp
+)
+
+add_executable(FeatherCastProductivityPackTests
+  native/tests/productivity_pack_tests.cpp
+)
 
 target_compile_features(FeatherCastCoreTests PRIVATE cxx_std_23)
 target_include_directories(FeatherCastCoreTests PRIVATE native/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -223,8 +230,9 @@ target_compile_features(FeatherCastPersistenceServiceTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastSearchCoordinatorTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastDiscoveryServiceTests PRIVATE cxx_std_23)
 target_compile_features(FeatherCastCatalogUiStateTests PRIVATE cxx_std_23)
-  target_compile_features(FeatherCastBackgroundServicesTests PRIVATE cxx_std_23)
-  target_compile_features(FeatherCastRuntimeLifecycleTests PRIVATE cxx_std_23)
+target_compile_features(FeatherCastBackgroundServicesTests PRIVATE cxx_std_23)
+target_compile_features(FeatherCastRuntimeLifecycleTests PRIVATE cxx_std_23)
+target_compile_features(FeatherCastProductivityPackTests PRIVATE cxx_std_23)
 
 target_include_directories(FeatherCastTestExtension PRIVATE native/src)
 target_include_directories(FeatherCastV1TestExtension PRIVATE native/src)
@@ -239,8 +247,9 @@ target_include_directories(FeatherCastPersistenceServiceTests PRIVATE native/src
 target_include_directories(FeatherCastSearchCoordinatorTests PRIVATE native/src)
 target_include_directories(FeatherCastDiscoveryServiceTests PRIVATE native/src)
 target_include_directories(FeatherCastCatalogUiStateTests PRIVATE native/src)
-  target_include_directories(FeatherCastBackgroundServicesTests PRIVATE native/src)
-  target_include_directories(FeatherCastRuntimeLifecycleTests PRIVATE native/src third_party/sqlite)
+target_include_directories(FeatherCastBackgroundServicesTests PRIVATE native/src)
+target_include_directories(FeatherCastRuntimeLifecycleTests PRIVATE native/src third_party/sqlite)
+target_include_directories(FeatherCastProductivityPackTests PRIVATE native/src)
 
 target_compile_definitions(FeatherCastV1TestExtension PRIVATE FEATHERCAST_TEST_API_VERSION=1)
 target_compile_definitions(FeatherCastBadApiExtension PRIVATE FEATHERCAST_TEST_BAD_API)
@@ -254,15 +263,17 @@ target_compile_definitions(FeatherCastPersistenceServiceTests PRIVATE UNICODE _U
 target_compile_definitions(FeatherCastSearchCoordinatorTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastDiscoveryServiceTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(FeatherCastCatalogUiStateTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_compile_definitions(FeatherCastBackgroundServicesTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_compile_definitions(FeatherCastRuntimeLifecycleTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FeatherCastBackgroundServicesTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FeatherCastRuntimeLifecycleTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FeatherCastProductivityPackTests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(FeatherCastUiEventQueueTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastPersistenceServiceTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastSearchCoordinatorTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastDiscoveryServiceTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastCatalogUiStateTests PRIVATE FeatherCastRuntime FeatherCastUi)
-  target_link_libraries(FeatherCastBackgroundServicesTests PRIVATE FeatherCastRuntime)
-  target_link_libraries(FeatherCastRuntimeLifecycleTests PRIVATE FeatherCastRuntime)
+target_link_libraries(FeatherCastBackgroundServicesTests PRIVATE FeatherCastRuntime)
+target_link_libraries(FeatherCastRuntimeLifecycleTests PRIVATE FeatherCastRuntime)
+target_link_libraries(FeatherCastProductivityPackTests PRIVATE FeatherCastRuntime)
 target_link_libraries(FeatherCastSearchBenchmarks PRIVATE normaliz)
 target_link_libraries(FeatherCastStorageTrustTests PRIVATE FeatherCastSQLite advapi32 crypt32)
 
@@ -288,8 +299,9 @@ feathercast_apply_project_warnings(FeatherCastPersistenceServiceTests)
 feathercast_apply_project_warnings(FeatherCastSearchCoordinatorTests)
 feathercast_apply_project_warnings(FeatherCastDiscoveryServiceTests)
 feathercast_apply_project_warnings(FeatherCastCatalogUiStateTests)
-  feathercast_apply_project_warnings(FeatherCastBackgroundServicesTests)
-  feathercast_apply_project_warnings(FeatherCastRuntimeLifecycleTests)
+feathercast_apply_project_warnings(FeatherCastBackgroundServicesTests)
+feathercast_apply_project_warnings(FeatherCastRuntimeLifecycleTests)
+feathercast_apply_project_warnings(FeatherCastProductivityPackTests)
 
 enable_testing()
 add_test(NAME FeatherCastCoreTests COMMAND FeatherCastCoreTests)
@@ -308,8 +320,9 @@ add_test(NAME FeatherCastPersistenceServiceTests COMMAND FeatherCastPersistenceS
 add_test(NAME FeatherCastSearchCoordinatorTests COMMAND FeatherCastSearchCoordinatorTests)
 add_test(NAME FeatherCastDiscoveryServiceTests COMMAND FeatherCastDiscoveryServiceTests)
 add_test(NAME FeatherCastCatalogUiStateTests COMMAND FeatherCastCatalogUiStateTests)
-  add_test(NAME FeatherCastBackgroundServicesTests COMMAND FeatherCastBackgroundServicesTests)
-  add_test(NAME FeatherCastRuntimeLifecycleTests COMMAND FeatherCastRuntimeLifecycleTests)
+add_test(NAME FeatherCastBackgroundServicesTests COMMAND FeatherCastBackgroundServicesTests)
+add_test(NAME FeatherCastRuntimeLifecycleTests COMMAND FeatherCastRuntimeLifecycleTests)
+add_test(NAME FeatherCastProductivityPackTests COMMAND FeatherCastProductivityPackTests)
 
 install(TARGETS FeatherCast FeatherCastPluginHost RUNTIME DESTINATION bin)
 
