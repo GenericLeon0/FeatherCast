@@ -60,28 +60,40 @@ jobs:
             throw "Tag version $tagVersion does not match CMake project version $projectVersion."
           }
 
-      - name: Prepare signing certificate
+      - name: Determine signing mode
         if: startsWith(github.ref, 'refs/tags/v')
+        id: signing
         shell: pwsh
         env:
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}
           SIGNER_THUMBPRINTS: ${{ vars.FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) {
-            throw "WINDOWS_CERTIFICATE_BASE64 is required for release tags."
+          $values = @(
+            $env:CERTIFICATE_BASE64,
+            $env:CERTIFICATE_PASSWORD,
+            $env:EXPECTED_PUBLISHER,
+            $env:SIGNER_THUMBPRINTS
+          )
+          $configured = @($values | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+          if ($configured -ne 0 -and $configured -ne $values.Count) {
+            throw "Release signing is only partially configured. Configure all certificate secrets and publisher variables, or none of them."
           }
-          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER)) {
-            throw "FEATHERCAST_EXPECTED_PUBLISHER repository variable is required for release tags."
-          }
-          if ([string]::IsNullOrWhiteSpace($env:SIGNER_THUMBPRINTS)) {
-            throw "FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS repository variable is required for release tags."
-          }
+          $enabled = if ($configured -eq $values.Count) { 'true' } else { 'false' }
+          "enabled=$enabled" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Prepare signing certificate
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+        run: |
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\feathercast-signing.pfx",
             [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
 
       - name: Sign application binaries
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
@@ -112,7 +124,7 @@ jobs:
         run: cpack --config build-native/CPackConfig.cmake -C Release
 
       - name: Sign installer
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
