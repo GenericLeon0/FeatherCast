@@ -44,7 +44,31 @@ jobs:
         run: ctest --test-dir build-native -C Release --output-on-failure
 
       - name: Verify search performance
-        run: build-native\Release\FeatherCastSearchBenchmarks.exe
+        run: |
+          build-native\Release\FeatherCastSearchBenchmarks.exe
+          build-native\Release\FeatherCastFileSearchBenchmarks.exe
+
+      - name: Verify self-contained runtime and startup
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio" `
+            -Recurse -Filter dumpbin.exe -ErrorAction Stop |
+            Where-Object FullName -Match 'Hostx64\\x64\\dumpbin\.exe$' |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "Unable to locate dumpbin.exe." }
+          foreach ($file in @(
+            "build-native\Release\FeatherCast.exe",
+            "build-native\Release\FeatherCastPluginHost.exe"
+          )) {
+            $dependencies = & $dumpbin.FullName /dependents $file | Out-String
+            if ($dependencies -match '(?im)^\s+(MSVCP|VCRUNTIME)[^\s]*\.dll\s*$') {
+              throw "$file depends on a dynamic MSVC runtime."
+            }
+          }
+          & build-native\Release\FeatherCast.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "FeatherCast self-test failed." }
+          & build-native\Release\FeatherCastPluginHost.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Plugin host self-test failed." }
 
       - name: Validate tag version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -77,11 +101,10 @@ jobs:
             $env:SIGNER_THUMBPRINTS
           )
           $configured = @($values | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
-          if ($configured -ne 0 -and $configured -ne $values.Count) {
-            throw "Release signing is only partially configured. Configure all certificate secrets and publisher variables, or none of them."
+          if ($configured -ne $values.Count) {
+            throw "Stable release tags require the signing certificate, password, expected publisher, and signer thumbprint pins."
           }
-          $enabled = if ($configured -eq $values.Count) { 'true' } else { 'false' }
-          "enabled=$enabled" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Prepare signing certificate
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
@@ -106,6 +129,38 @@ jobs:
             signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
               /f $certificate /p $env:CERTIFICATE_PASSWORD $file
             signtool verify /pa /v $file
+          }
+
+      - name: Verify signed application identities
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}
+          SIGNER_THUMBPRINTS: ${{ vars.FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS }}
+        run: |
+          $pins = @($env:SIGNER_THUMBPRINTS.Split(';') |
+            ForEach-Object { ($_ -replace '[^0-9A-Fa-f]', '').ToLowerInvariant() } |
+            Where-Object { $_ })
+          foreach ($file in @(
+            "build-native\Release\FeatherCast.exe",
+            "build-native\Release\FeatherCastPluginHost.exe"
+          )) {
+            $signature = Get-AuthenticodeSignature $file
+            if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate) {
+              throw "$file does not have a valid Authenticode signature."
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              throw "$file does not have an Authenticode timestamp."
+            }
+            $publisher = $signature.SignerCertificate.GetNameInfo(
+              [Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($publisher -ne $env:EXPECTED_PUBLISHER) {
+              throw "$file publisher '$publisher' does not match '$env:EXPECTED_PUBLISHER'."
+            }
+            $pin = [Convert]::ToHexString(
+              [Security.Cryptography.SHA256]::HashData($signature.SignerCertificate.RawData)
+            ).ToLowerInvariant()
+            if ($pin -notin $pins) { throw "$file signer certificate is not pinned." }
           }
 
       - name: Retain release symbols
@@ -134,6 +189,32 @@ jobs:
           signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
             /f $certificate /p $env:CERTIFICATE_PASSWORD $installer.FullName
           signtool verify /pa /v $installer.FullName
+
+      - name: Verify signed installer identity
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}
+          SIGNER_THUMBPRINTS: ${{ vars.FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS }}
+        run: |
+          $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+              -not $signature.TimeStamperCertificate) {
+            throw "Installer signature or timestamp is invalid."
+          }
+          $publisher = $signature.SignerCertificate.GetNameInfo(
+            [Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ($publisher -ne $env:EXPECTED_PUBLISHER) {
+            throw "Installer publisher '$publisher' does not match '$env:EXPECTED_PUBLISHER'."
+          }
+          $pin = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($signature.SignerCertificate.RawData)
+          ).ToLowerInvariant()
+          $pins = @($env:SIGNER_THUMBPRINTS.Split(';') |
+            ForEach-Object { ($_ -replace '[^0-9A-Fa-f]', '').ToLowerInvariant() } |
+            Where-Object { $_ })
+          if ($pin -notin $pins) { throw "Installer signer certificate is not pinned." }
 
       - name: Smoke-test installer
         if: startsWith(github.ref, 'refs/tags/v')
@@ -165,9 +246,24 @@ jobs:
           }
 
           $settingsRoot = Join-Path $env:APPDATA 'FeatherCast'
-          New-Item -ItemType Directory -Force $settingsRoot | Out-Null
-          $upgradeMarker = Join-Path $settingsRoot 'installer-upgrade-marker.txt'
-          Set-Content -Encoding ascii $upgradeMarker 'preserve'
+          $pluginsRoot = Join-Path $settingsRoot 'plugins\upgrade-smoke-plugin'
+          $localRoot = Join-Path $env:LOCALAPPDATA 'FeatherCast'
+          New-Item -ItemType Directory -Force $pluginsRoot | Out-Null
+          New-Item -ItemType Directory -Force $localRoot | Out-Null
+          $preservedFiles = @(
+            (Join-Path $settingsRoot 'settings.json'),
+            (Join-Path $settingsRoot 'snippets.json'),
+            (Join-Path $pluginsRoot 'manifest.json'),
+            (Join-Path $localRoot 'installer-upgrade-marker.dat')
+          )
+          Set-Content -Encoding utf8 $preservedFiles[0] '{"schemaVersion":1}'
+          Set-Content -Encoding utf8 $preservedFiles[1] '{"snippets":[]}'
+          Set-Content -Encoding utf8 $preservedFiles[2] '{"name":"Upgrade Smoke Plugin"}'
+          Set-Content -Encoding ascii $preservedFiles[3] 'preserve-local-data'
+          $preservedHashes = @{}
+          foreach ($preservedFile in $preservedFiles) {
+            $preservedHashes[$preservedFile] = (Get-FileHash $preservedFile -Algorithm SHA256).Hash
+          }
 
           $process = Start-Process $installer.FullName -ArgumentList '/S' -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Installer failed with exit code $($process.ExitCode)." }
@@ -176,7 +272,35 @@ jobs:
           $uninstaller = Join-Path $installRoot 'Uninstall.exe'
           if (-not (Test-Path $app)) { throw "Installed FeatherCast.exe was not found." }
           if (-not (Test-Path $uninstaller)) { throw "Uninstaller was not found." }
-          if (-not (Test-Path $upgradeMarker)) { throw "Upgrade removed roaming user data." }
+          foreach ($preservedFile in $preservedFiles) {
+            if (-not (Test-Path $preservedFile)) {
+              throw "Upgrade removed user data: $preservedFile"
+            }
+            if ((Get-FileHash $preservedFile -Algorithm SHA256).Hash -ne $preservedHashes[$preservedFile]) {
+              throw "Upgrade changed user data: $preservedFile"
+            }
+          }
+          & $app --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed FeatherCast self-test failed." }
+          $pluginHost = Join-Path $installRoot 'bin\FeatherCastPluginHost.exe'
+          if (-not (Test-Path $pluginHost)) { throw "Installed plugin host was not found." }
+          & $pluginHost --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed plugin host self-test failed." }
+
+          $zip = Get-ChildItem FeatherCast-*-win64.zip | Select-Object -First 1
+          $portableRoot = Join-Path $env:RUNNER_TEMP 'portable-release'
+          Expand-Archive $zip.FullName $portableRoot -Force
+          $portableApp = Get-ChildItem $portableRoot -Recurse -Filter FeatherCast.exe |
+            Select-Object -First 1
+          $portableHost = Get-ChildItem $portableRoot -Recurse -Filter FeatherCastPluginHost.exe |
+            Select-Object -First 1
+          if (-not $portableApp -or -not $portableHost) {
+            throw "Portable release binaries were not found."
+          }
+          & $portableApp.FullName --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Portable FeatherCast self-test failed." }
+          & $portableHost.FullName --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Portable plugin host self-test failed." }
 
           $identities = @(
             Get-ChildItem 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
@@ -191,7 +315,14 @@ jobs:
           $uninstall = Start-Process $uninstaller -ArgumentList '/S' -PassThru -Wait
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)." }
           if (Test-Path $installRoot) { throw "Installation directory remains after uninstall." }
-          if (-not (Test-Path $upgradeMarker)) { throw "Uninstall removed roaming user data." }
+          foreach ($preservedFile in $preservedFiles) {
+            if (-not (Test-Path $preservedFile)) {
+              throw "Uninstall removed user data: $preservedFile"
+            }
+            if ((Get-FileHash $preservedFile -Algorithm SHA256).Hash -ne $preservedHashes[$preservedFile]) {
+              throw "Uninstall changed user data: $preservedFile"
+            }
+          }
 
       - name: Generate SHA-256 sidecars
         if: startsWith(github.ref, 'refs/tags/v')

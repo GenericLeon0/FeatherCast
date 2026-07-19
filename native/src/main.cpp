@@ -12,10 +12,16 @@
 #include "discovery_service.hpp"
 #include "emoji.hpp"
 #include "extension_manager.hpp"
+#include "file_index_service.hpp"
+#include "file_search_service.hpp"
 #include "interaction_state.hpp"
 #include "json.hpp"
+#include "library.hpp"
+#include "library_ui.hpp"
+#include "motion.hpp"
 #include "network_client.hpp"
 #include "persistence_service.hpp"
+#include "preview_service.hpp"
 #include "run_command.hpp"
 #include "search_coordinator.hpp"
 #include "search_pipeline.hpp"
@@ -24,6 +30,7 @@
 #include "settings_io.hpp"
 #include "shortcut.hpp"
 #include "snippets.hpp"
+#include "snippets_io.hpp"
 #include "storage.hpp"
 #include "symbols.hpp"
 #include "system_settings.hpp"
@@ -93,6 +100,7 @@
 
 using Microsoft::WRL::ComPtr;
 using feathercast::shortcut::GenericModifier;
+using feathercast::shortcut::IsExclusiveWinShortcut;
 using feathercast::shortcut::IsModifier;
 using feathercast::shortcut::ModifierPressed;
 using feathercast::shortcut::ParseShortcut;
@@ -123,12 +131,48 @@ constexpr UINT WM_EXTENSION_ACTIVATED = WM_APP + 10;
 constexpr UINT WM_EXTENSION_RELOAD_READY = WM_APP + 15;
 constexpr UINT WM_BACKGROUND_TASK_ERROR = WM_APP + 17;
 constexpr UINT WM_APP_EVENTS = WM_APP + 18;
+constexpr UINT WM_RENDER_RECOVER = WM_APP + 19;
+constexpr UINT WM_OVERLAY_RETRY_ACTIVATION = WM_APP + 20;
 constexpr int HOTKEY_OPEN_SEARCH = 0x4C43;
 constexpr int HOTKEY_VALIDATE_SHORTCUT = 0x4C44;
 constexpr UINT TIMER_MEM_TRIM = 3;
-constexpr UINT TIMER_SELECTION_ANIM = 4;
 constexpr UINT TIMER_VOLUME_REFRESH = 5;
-constexpr UINT TIMER_SHORTCUT_TOGGLE = 6;
+constexpr UINT TIMER_OVERLAY_ACTIVATE = 6;
+constexpr UINT TIMER_PREVIEW_LOAD = 7;
+constexpr UINT TIMER_FILE_SNAPSHOT = 8;
+constexpr UINT TIMER_SHORTCUT_TOGGLE = 9;
+constexpr UINT OVERLAY_ACTIVATION_INTERVAL_MS = 50;
+
+enum class OverlayCloseReason {
+  ExplicitDismiss,
+  PassiveFocusLoss,
+  Action,
+  Transition,
+};
+
+struct ForegroundSnapshot {
+  HWND hwnd = nullptr;
+  DWORD processId = 0;
+  DWORD threadId = 0;
+  DWORD inputTime = 0;
+  ULONGLONG observedTick = 0;
+};
+
+struct RestoreCandidate : ForegroundSnapshot {
+  std::uint64_t generation = 0;
+};
+
+struct PendingOverlayClose {
+  std::optional<RestoreCandidate> candidate;
+  std::uint64_t generation = 0;
+  OverlayCloseReason reason = OverlayCloseReason::Action;
+};
+
+struct ShortcutToggleRequest {
+  std::uint64_t id = 0;
+  std::optional<ForegroundSnapshot> foreground;
+  bool deferUntilWinRelease = false;
+};
 
 constexpr int WIN_WIDTH = 720;
 constexpr int WIN_HEIGHT = 470;
@@ -206,6 +250,8 @@ class ScopeExit {
 // Settings model and JSON round-trip live in settings.hpp (unit-tested there).
 using Quicklink = feathercast::settings::Quicklink;
 using Settings = feathercast::settings::Settings;
+using AnimationLevel = feathercast::settings::AnimationLevel;
+using AnimationKind = feathercast::settings::AnimationKind;
 using feathercast::settings::JsonEscape;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -518,8 +564,8 @@ std::filesystem::path LocalDataPath();
 
 std::atomic<bool> g_diagnosticsEnabled = false;
 
-// Opt-in diagnostics for launch troubleshooting. Paths can contain personal
-// information, so release builds never create this log unless enabled.
+// Opt-in diagnostics contain only state counters, durations, and error codes.
+// Queries, paths, names, and user content are never written.
 std::wstring ToHex(unsigned value) {
   wchar_t buf[16]{};
   swprintf_s(buf, L"%08X", value);
@@ -545,6 +591,26 @@ void DebugLaunchLog(const std::wstring& line) {
   f << ts << line << L"\n";
 }
 
+void DebugFocusLog(const std::wstring& line) {
+  if (!g_diagnosticsEnabled.load()) return;
+  const auto path = LocalDataPath() / L"focus-debug.log";
+  std::error_code ec;
+  if (std::filesystem::file_size(path, ec) > 1024 * 1024) {
+    const auto rotated = LocalDataPath() / L"focus-debug.previous.log";
+    std::filesystem::remove(rotated, ec);
+    ec.clear();
+    std::filesystem::rename(path, rotated, ec);
+  }
+  std::wofstream file(path, std::ios::app);
+  if (!file) return;
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  wchar_t timestamp[32]{};
+  swprintf_s(timestamp, L"%02d:%02d:%02d.%03d ", time.wHour,
+             time.wMinute, time.wSecond, time.wMilliseconds);
+  file << timestamp << line << L"\n";
+}
+
 std::filesystem::path LocalDataPath() {
   std::filesystem::path root = KnownFolderPath(FOLDERID_LocalAppData);
   if (root.empty()) {
@@ -556,6 +622,19 @@ std::filesystem::path LocalDataPath() {
   std::error_code ec;
   std::filesystem::create_directories(root, ec);
   return root;
+}
+
+void DebugGraphicsLog(const std::wstring& line) {
+  if (!g_diagnosticsEnabled.load()) return;
+  const auto path = LocalDataPath() / L"graphics-debug.log";
+  std::wofstream file(path, std::ios::app);
+  if (!file) return;
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  wchar_t timestamp[32]{};
+  swprintf_s(timestamp, L"%02d:%02d:%02d.%03d ", time.wHour, time.wMinute,
+             time.wSecond, time.wMilliseconds);
+  file << timestamp << line << L"\n";
 }
 
 bool MigrateLegacyOperationalData() {
@@ -642,14 +721,6 @@ std::filesystem::path DatabasePath() {
 
 std::filesystem::path ThemePath() {
   return UserDataPath() / L"theme.json";
-}
-
-std::vector<feathercast::snippets::Snippet> LoadSnippets() {
-  std::ifstream file(SnippetsPath(), std::ios::binary);
-  if (!file) return {};
-  std::ostringstream buffer;
-  buffer << file.rdbuf();
-  return feathercast::snippets::ParseSnippetsJson(buffer.str());
 }
 
 void EnsureSnippetsFile() {
@@ -1116,7 +1187,8 @@ bool ApplyWindowLayout(HWND target, feathercast::window_layout::Layout layout) {
   if (!GetMonitorInfoW(sourceMonitor, &sourceInfo)) return false;
 
   RECT targetWork = sourceInfo.rcWork;
-  if (layout == feathercast::window_layout::Layout::NextDisplay) {
+  if (layout == feathercast::window_layout::Layout::NextDisplay ||
+      layout == feathercast::window_layout::Layout::PreviousDisplay) {
     std::vector<MonitorRecord> monitors;
     EnumDisplayMonitors(nullptr, nullptr, CollectMonitor,
                         reinterpret_cast<LPARAM>(&monitors));
@@ -1130,13 +1202,17 @@ bool ApplyWindowLayout(HWND target, feathercast::window_layout::Layout layout) {
         monitors.begin(), monitors.end(), [&](const MonitorRecord& record) {
           return record.handle == sourceMonitor;
         });
-    const std::size_t index =
+    const std::size_t currentIndex =
         current == monitors.end()
             ? 0
-            : feathercast::window_layout::NextIndex(
-                  static_cast<std::size_t>(
-                      std::distance(monitors.begin(), current)),
-                  monitors.size());
+            : static_cast<std::size_t>(
+                  std::distance(monitors.begin(), current));
+    const std::size_t index =
+        layout == feathercast::window_layout::Layout::PreviousDisplay
+            ? feathercast::window_layout::PreviousIndex(currentIndex,
+                                                        monitors.size())
+            : feathercast::window_layout::NextIndex(currentIndex,
+                                                    monitors.size());
     targetWork = monitors[index].work;
   }
 
@@ -1204,9 +1280,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }),
         searchCoordinator_([this](ResultsCollection result) {
           searchEvents_.Push(std::move(result));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
         }),
         snapshotCoordinator_([this](SnapshotBuildResult result) {
           searchEvents_.Push(std::move(result));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
         }),
         discoveryEvents_([this] {
           if (hwnd_ && !stopThreads_) {
@@ -1215,14 +1299,58 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }),
         discoveryService_([this](DiscoveryResult result) {
           discoveryEvents_.Push(std::move(result));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
+        }),
+        fileIndexEvents_([this] {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
+          }
+        }),
+        fileIndexService_([this](feathercast::files::IndexStatus status) {
+          fileIndexEvents_.Push(std::move(status));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
+        }),
+        fileSearchEvents_([this] {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
+          }
+        }),
+        fileSearchService_(DatabasePath(), [this](ResultsCollection result) {
+          fileSearchEvents_.Push(std::move(result));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
+        }),
+        previewEvents_([this] {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
+          }
+        }),
+        previewService_([this](feathercast::preview::Result result) {
+          previewEvents_.Push(std::move(result));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
         }),
         iconEvents_([this] {
           if (hwnd_ && !stopThreads_) {
             PostMessageW(hwnd_, WM_APP_EVENTS, 0, 0);
           }
         }),
-        iconResolver_([this](std::wstring key) {
-          iconEvents_.Push(std::move(key));
+        iconResolver_([this](feathercast::runtime::DecodedIcon icon) {
+          iconEvents_.Push(std::move(icon));
+        }, [this](std::exception_ptr) {
+          if (hwnd_ && !stopThreads_) {
+            PostMessageW(hwnd_, WM_BACKGROUND_TASK_ERROR, 0, 0);
+          }
         }),
         networkEvents_([this] {
           if (hwnd_ && !stopThreads_) {
@@ -1238,6 +1366,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         instance_(instance),
         cmdLine_(std::move(cmdLine)) {
     QueryPerformanceFrequency(&qpcFrequency_);
+    overlayOpacity_.Snap(1.0);
+    settingsOpacity_.Snap(1.0);
+    volumeOpacity_.Snap(1.0);
+    confirmationProgress_.Snap(0.0);
+    pendingResultsOpacity_.Snap(1.0);
+    overlayVisualScroll_.Snap(0.0);
+    settingsVisualScroll_.Snap(0.0);
+    settingsPageProgress_.Snap(1.0);
+    settingsCategoryTop_.Snap(0.0);
+    volumeVisualPercent_.Snap(0.0);
     auto loadedSettings = persistence_.LoadSettingsForStartup();
     settings_ = std::move(loadedSettings.value);
     ClampSettings(settings_);
@@ -1250,7 +1388,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     shortcut_ = ParseShortcut(settings_.shortcut);
     theme_ = feathercast::theme::LoadTheme(ThemePath());
     RefreshSystemPreferences();
-    snippets_ = LoadSnippets();
+    const auto loadedSnippets = feathercast::snippets_io::Load(SnippetsPath());
+    snippets_ = loadedSnippets.snippets;
+    snippetsFingerprint_ = loadedSnippets.fingerprint;
+    snippetsWritable_ = loadedSnippets.Writable();
+    snippetsLoadMessage_ = loadedSnippets.message;
     systemFolders_ = SystemFolderEntries();
     if (!SetStartOnStartup(settings_.startOnStartup) && settings_.startOnStartup) {
       settings_.startOnStartup = false;
@@ -1273,8 +1415,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     stopThreads_ = true;
     launchExecutor_.Stop();
     extensions_.Shutdown();
+    fileIndexService_.Stop();
+    fileIndexEvents_.Close();
     discoveryService_.Stop();
     discoveryEvents_.Close();
+    previewService_.Stop();
+    previewEvents_.Close();
+    fileSearchService_.Stop();
+    fileSearchEvents_.Close();
     searchCoordinator_.Stop();
     snapshotCoordinator_.Stop();
     searchEvents_.Close();
@@ -1307,6 +1455,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return 1;
     }
     persistence_.Start();
+    fileSearchService_.Start();
+    previewService_.Start();
+    fileIndexService_.Start();
     PromptForPrivacyConsentIfNeeded();
     LoadPersistentState();
     UpdateClipboardListenerRegistration();
@@ -1326,8 +1477,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               : L"Invalid settings were preserved and defaults are active.");
     }
     extensions_.Initialize(UserDataPath(), ExeDirectory(), hwnd_, WM_REBUILD_RESULTS);
-    const bool hotKeyReady = RegisterShortcutHotKey();
     const bool hookReady = InstallHook();
+    const bool hotKeyReady = RegisterShortcutHotKey();
     if (!hotKeyReady && !hookReady) {
       MessageBoxW(hwnd_, L"FeatherCast could not register the global shortcut or keyboard hook.",
                   L"FeatherCast Startup", MB_OK | MB_ICONWARNING);
@@ -1370,6 +1521,82 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return static_cast<int>(msg.wParam);
   }
 
+  bool IsFeatherCastWindow(HWND window) const {
+    return window &&
+           (window == hwnd_ || window == settingsHwnd_ || window == volumeHwnd_);
+  }
+
+  std::optional<ForegroundSnapshot> CaptureForegroundSnapshot(
+      HWND window, DWORD inputTime = 0) const {
+    if (!window || !IsWindow(window)) return std::nullopt;
+    HWND root = GetAncestor(window, GA_ROOT);
+    if (!root) root = window;
+    if (!IsWindow(root) || IsFeatherCastWindow(root)) return std::nullopt;
+    DWORD processId = 0;
+    const DWORD threadId = GetWindowThreadProcessId(root, &processId);
+    if (!threadId || !processId) return std::nullopt;
+    return ForegroundSnapshot{root, processId, threadId, inputTime,
+                              GetTickCount64()};
+  }
+
+  bool ValidateRestoreCandidate(const RestoreCandidate& candidate) const {
+    if (!candidate.hwnd || !IsWindow(candidate.hwnd) ||
+        IsFeatherCastWindow(candidate.hwnd) ||
+        GetAncestor(candidate.hwnd, GA_ROOT) != candidate.hwnd) {
+      return false;
+    }
+    DWORD processId = 0;
+    const DWORD threadId =
+        GetWindowThreadProcessId(candidate.hwnd, &processId);
+    const feathercast::interaction::OverlayRestoreIdentity expected{
+        reinterpret_cast<std::uintptr_t>(candidate.hwnd), candidate.processId,
+        candidate.threadId, candidate.generation};
+    return feathercast::interaction::OverlayRestoreIdentityMatches(
+        expected, reinterpret_cast<std::uintptr_t>(candidate.hwnd), processId,
+        threadId, candidate.generation);
+  }
+
+  void QueueShortcutToggle(
+      std::optional<ForegroundSnapshot> foreground,
+      bool deferUntilWinRelease = false) {
+    ShortcutToggleRequest request;
+    request.id = ++nextShortcutToggleRequestId_;
+    request.foreground = std::move(foreground);
+    request.deferUntilWinRelease = deferUntilWinRelease;
+    shortcutToggleRequests_.push_back(std::move(request));
+    if (!PostMessageW(hwnd_, WM_SHORTCUT_TOGGLE,
+                      static_cast<WPARAM>(nextShortcutToggleRequestId_), 0)) {
+      shortcutToggleRequests_.pop_back();
+    }
+  }
+
+  std::optional<ForegroundSnapshot> TakeShortcutToggleRequest(
+      std::uint64_t id) {
+    const auto found = std::find_if(
+        shortcutToggleRequests_.begin(), shortcutToggleRequests_.end(),
+        [id](const ShortcutToggleRequest& request) { return request.id == id; });
+    if (found == shortcutToggleRequests_.end()) return std::nullopt;
+    auto foreground = std::move(found->foreground);
+    shortcutToggleRequests_.erase(found);
+    return foreground;
+  }
+
+  bool ShortcutToggleNeedsWinRelease(std::uint64_t id) const {
+    const auto found = std::find_if(
+        shortcutToggleRequests_.begin(), shortcutToggleRequests_.end(),
+        [id](const ShortcutToggleRequest& request) { return request.id == id; });
+    return found != shortcutToggleRequests_.end() &&
+           found->deferUntilWinRelease;
+  }
+
+  void DispatchShortcutToggle(std::uint64_t id) {
+    if (!recording_) {
+      TriggerShortcutToggle(TakeShortcutToggleRequest(id));
+    } else {
+      TakeShortcutToggleRequest(id);
+    }
+  }
+
   LRESULT LowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < 0) return CallNextHookEx(hook_, nCode, wParam, lParam);
     const auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
@@ -1395,8 +1622,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         SendVirtualKeyTap(0xE8);
       }
       if (result.toggle && hwnd_) {
-        PostMessageW(hwnd_, WM_SHORTCUT_TOGGLE,
-                     result.deferToggleUntilWinRelease ? 1 : 0, 0);
+        QueueShortcutToggle(
+            CaptureForegroundSnapshot(GetForegroundWindow(), kb->time),
+            result.deferToggleUntilWinRelease);
       }
       if (result.consume) return 1;
     }
@@ -1480,7 +1708,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       search.screenRect = screenRect({52, 12, static_cast<float>(client.right) / scale - 94, 50});
       items.push_back(std::move(search));
 
-      float y = kResultsTop - static_cast<float>(scroll_);
+      float y = kResultsTop -
+                static_cast<float>(overlayVisualScroll_.Value());
       int index = 0;
       for (const auto& section : sections_) {
         y += kSectionHeaderHeight;
@@ -1536,19 +1765,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       Item setting;
       setting.name = nameFor(type);
       const auto category = SettingsCategoryForHit(type);
-      setting.defaultAction = category ? L"Select" : L"Activate";
+      setting.defaultAction = category
+                                  ? L"Select"
+                                  : (type == HitType::AnimationLevel
+                                         ? L"Change animation level"
+                                         : L"Activate");
       if (category) {
         setting.role = ROLE_SYSTEM_PAGETAB;
+      } else if (type == HitType::AnimationLevel) {
+        setting.role = ROLE_SYSTEM_SLIDER;
+        setting.value = std::wstring(
+            feathercast::settings::AnimationLevelLabel(settings_.animationLevel));
+        setting.description =
+            L"Off, Reduced, or Full. Use arrow keys to adjust.";
       } else {
         setting.role =
             type == HitType::StartupToggle ||
                     type == HitType::UpdateChecksToggle ||
                     type == HitType::CompactToggle ||
-                    type == HitType::AnimationsToggle ||
                     type == HitType::ShowWindowsToggle ||
                     type == HitType::ShowStoreAppsToggle ||
                     type == HitType::ClipboardHistoryToggle ||
                     type == HitType::FileIndexToggle ||
+                    type == HitType::FileContentIndexToggle ||
                     type == HitType::DiagnosticsToggle ||
                     type == HitType::AccentToggle
                 ? ROLE_SYSTEM_CHECKBUTTON
@@ -1569,8 +1808,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       HitType::ClipboardLimitUp,
       HitType::FileIndexLimitDown,
       HitType::FileIndexLimitUp,
+      HitType::FileContentIndexToggle,
       HitType::AddFileRoot,
+      HitType::RemoveFileRoot,
       HitType::ClearFileRoots,
+      HitType::RebuildFileIndex,
       HitType::ClearClipboardData,
       HitType::ClearFileIndexData,
       HitType::ReloadExtensions,
@@ -1588,6 +1830,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       setting.state = STATE_SYSTEM_UNAVAILABLE;
       setting.screenRect = screenRect(hit->rect);
       items.push_back(std::move(setting));
+    }
+    if (settingsCategory_ == SettingsCategory::Extensions) {
+      const float width = static_cast<float>(client.right) / scale;
+      float y = kSettTop + SettingsStatusOffset() + kSettSection + kSettRow -
+                static_cast<float>(settingsVisualScroll_.Value());
+      for (const auto& plugin : extensions_.Health()) {
+        Item status;
+        status.name = plugin.name;
+        status.value = plugin.version;
+        status.description =
+            !plugin.available
+                ? L"Unavailable"
+                : (plugin.failureStrikes > 0 ? L"Degraded" : L"Available");
+        if (!plugin.lastError.empty()) {
+          status.description += L": " + plugin.lastError;
+        }
+        status.role = ROLE_SYSTEM_STATICTEXT;
+        status.state = STATE_SYSTEM_READONLY;
+        status.screenRect = screenRect(
+            {kSettSidebarWidth + kSettContentInset, y,
+             width - kSettContentInset, y + kSettRow});
+        items.push_back(std::move(status));
+        y += kSettRow;
+      }
     }
     if (settingsStatus_) {
       Item status;
@@ -1695,10 +1961,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_TIMER:
         if (wParam == 1) {
           if (visible_) {
-            if (!suppressHide_) {
+            if (!suppressHide_ && !overlayClosing_ &&
+                !overlayFocusSession_.GuardActive(GetTickCount64())) {
               HWND foreground = GetForegroundWindow();
               if (foreground && foreground != hwnd_) {
-                HideOverlay(false);
+                HideOverlay(OverlayCloseReason::PassiveFocusLoss);
                 return 0;
               }
             }
@@ -1713,15 +1980,23 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         } else if (wParam == TIMER_MEM_TRIM) {
           KillTimer(hwnd_, TIMER_MEM_TRIM);
           SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
-        } else if (wParam == TIMER_SELECTION_ANIM) {
-          OnSelectionAnimationTimer();
+        } else if (wParam == TIMER_OVERLAY_ACTIVATE) {
+          RetryOverlayActivation();
+        } else if (wParam == TIMER_PREVIEW_LOAD) {
+          KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
+          LoadSelectedPreview();
+        } else if (wParam == TIMER_FILE_SNAPSHOT) {
+          KillTimer(hwnd_, TIMER_FILE_SNAPSHOT);
+          MarkSearchDataChanged();
+          if (visible_) RequestSearch();
         } else if (wParam == TIMER_SHORTCUT_TOGGLE) {
-          if (!pendingShortcutToggle_) {
+          if (!pendingShortcutToggleRequestId_) {
             KillTimer(hwnd_, TIMER_SHORTCUT_TOGGLE);
           } else if (!ModifierPressed(VK_LWIN)) {
-            pendingShortcutToggle_ = false;
+            const std::uint64_t requestId = pendingShortcutToggleRequestId_;
+            pendingShortcutToggleRequestId_ = 0;
             KillTimer(hwnd_, TIMER_SHORTCUT_TOGGLE);
-            if (!recording_) TriggerShortcutToggle();
+            DispatchShortcutToggle(requestId);
           }
         }
         return 0;
@@ -1747,20 +2022,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return 0;
       case WM_HOTKEY:
         if (static_cast<int>(wParam) == HOTKEY_OPEN_SEARCH) {
-          if (!recording_) TriggerShortcutToggle();
+          if (!recording_) {
+            TriggerShortcutToggle(CaptureForegroundSnapshot(
+                GetForegroundWindow(), static_cast<DWORD>(GetMessageTime())));
+          }
           return 0;
         }
         break;
       case WM_SHORTCUT_TOGGLE:
-        if (wParam) {
-          pendingShortcutToggle_ = true;
+        if (const std::uint64_t requestId = static_cast<std::uint64_t>(wParam);
+            ShortcutToggleNeedsWinRelease(requestId) &&
+            ModifierPressed(VK_LWIN)) {
+          pendingShortcutToggleRequestId_ = requestId;
           if (!SetTimer(hwnd_, TIMER_SHORTCUT_TOGGLE, 1, nullptr)) {
-            pendingShortcutToggle_ = false;
-            if (!recording_) TriggerShortcutToggle();
+            pendingShortcutToggleRequestId_ = 0;
+            DispatchShortcutToggle(requestId);
           }
-        } else if (!recording_) {
-          TriggerShortcutToggle();
+        } else {
+          DispatchShortcutToggle(requestId);
         }
+        return 0;
+      case WM_OVERLAY_RETRY_ACTIVATION:
+        RetryOverlayActivation();
         return 0;
       case WM_DESTROY:
         UnregisterShortcutHotKey();
@@ -1786,10 +2069,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_DPICHANGED: {
         auto prc = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        if (overlaySurface_.dc) {
-          float dpi = static_cast<float>(LOWORD(wParam));
-          overlaySurface_.dc->SetDpi(dpi, dpi);
-        }
+        ResetTextFormats();
+        DiscardGlassDevice();
         ApplyRoundedRegion(prc->right - prc->left, prc->bottom - prc->top);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -1797,12 +2078,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
           CancelPointerPress(hwnd);
-          if (visible_ && !suppressHide_) HideOverlay(false);
+          HandleOverlayFocusLoss(reinterpret_cast<HWND>(lParam));
         }
         return 0;
       case WM_KILLFOCUS:
         CancelPointerPress(hwnd);
-        if (visible_ && !suppressHide_) HideOverlay(false);
+        HandleOverlayFocusLoss(reinterpret_cast<HWND>(wParam));
         return 0;
       case WM_CANCELMODE:
       case WM_CAPTURECHANGED:
@@ -1882,6 +2163,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_MOUSEWHEEL:
         OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
+      case WM_POWERBROADCAST:
+        if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+          fileIndexService_.Rebuild();
+        }
+        return TRUE;
       case WM_TRAYICON:
         OnTray(lParam);
         return 0;
@@ -1923,6 +2209,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_APP_EVENTS:
         OnRuntimeEvents();
         return 0;
+      case WM_RENDER_RECOVER:
+        renderRecoveryQueued_ = false;
+        // Recreate the shared device stack from a normal app message, never
+        // recursively from the failing WM_PAINT call.
+        EnsureGlassDevice();
+        if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
+          InvalidateRect(settingsHwnd_, nullptr, FALSE);
+        }
+        if (volumeVisible_) InvalidateRect(volumeHwnd_, nullptr, FALSE);
+        return 0;
       case WM_EXTENSION_RELOAD_READY:
         extensionReloadPending_ = false;
         SetSettingsStatus(StatusSeverity::Success, L"Extensions reloaded.");
@@ -1963,7 +2260,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     for (auto& result : discoveryEvents_.Drain()) {
       OnDiscoveryCompleted(std::move(result));
     }
-    if (!iconEvents_.Drain().empty()) {
+    for (auto& status : fileIndexEvents_.Drain()) {
+      OnFileIndexReady(std::move(status));
+    }
+    for (auto& result : fileSearchEvents_.Drain()) {
+      searchPresentation_.MarkCompleted(result.generation);
+      if (result.generation == searchPresentation_.Requested()) {
+        ApplyResults(std::move(result));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+      }
+    }
+    for (auto& result : previewEvents_.Drain()) {
+      if (result.generation != previewGeneration_ || !previewOpen_) continue;
+      previewResult_ = std::move(result);
+      previewBitmap_.Reset();
+      previewScroll_ = 0.0f;
+      InvalidateRect(hwnd_, nullptr, FALSE);
+      NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
+    }
+    auto decodedIcons = iconEvents_.Drain();
+    for (auto& icon : decodedIcons) {
+      pendingDecodedIcons_.insert_or_assign(icon.key, std::move(icon));
+    }
+    if (!decodedIcons.empty()) {
       InvalidateRect(hwnd_, nullptr, FALSE);
     }
     for (auto& queued : networkEvents_.Drain()) {
@@ -2030,6 +2349,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                     event.error.message.empty()
                         ? L"Local data could not be saved."
                         : Utf8ToWide(event.error.message));
+              } else if constexpr (std::is_same_v<
+                                       Event,
+                                       feathercast::persistence::
+                                           FileIndexWriteCompleted>) {
+                if (visible_ &&
+                    feathercast::search_scope::Parse(query_).scope ==
+                        feathercast::search_scope::Scope::Files) {
+                  RequestSearch();
+                }
               }
             } else if constexpr (std::is_same_v<
                                      Event,
@@ -2131,10 +2459,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         SetWindowPos(hwnd, nullptr, rect->left, rect->top,
                      rect->right - rect->left, rect->bottom - rect->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        if (volumeSurface_.dc) {
-          const float dpi = static_cast<float>(LOWORD(wParam));
-          volumeSurface_.dc->SetDpi(dpi, dpi);
-        }
+        ResetTextFormats();
+        DiscardGlassDevice();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -2150,9 +2476,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (volumeVisible_) HideVolumeControl(false);
         return 0;
       case WM_KEYDOWN:
+        if (volumeClosing_) return 0;
         HandleVolumeKeyDown(static_cast<UINT>(wParam));
         return 0;
       case WM_LBUTTONDOWN: {
+        if (volumeClosing_) return 0;
         const float scale = GetWindowScale(hwnd);
         const float x = static_cast<float>(GET_X_LPARAM(lParam)) / scale;
         const float y = static_cast<float>(GET_Y_LPARAM(lParam)) / scale;
@@ -2167,6 +2495,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return 0;
       }
       case WM_MOUSEMOVE:
+        if (volumeClosing_) return 0;
         if (volumeDragging_ && GetCapture() == hwnd) {
           const float scale = GetWindowScale(hwnd);
           RECT client{};
@@ -2228,10 +2557,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case WM_DPICHANGED: {
         auto prc = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        if (settingsSurface_.dc) {
-          float dpi = static_cast<float>(LOWORD(wParam));
-          settingsSurface_.dc->SetDpi(dpi, dpi);
-        }
+        ResetTextFormats();
+        DiscardGlassDevice();
         // The visible corners are drawn by Direct2D; no window region is used.
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -2250,6 +2577,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return HTCLIENT;
       }
       case WM_KEYDOWN:
+        if (settingsClosing_) return 0;
         if (wParam == VK_ESCAPE && !recording_) {
           HideSettings();
         } else {
@@ -2272,6 +2600,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         return 0;
       case WM_LBUTTONDOWN: {
+        if (settingsClosing_) return 0;
         const float scale = GetWindowScale(hwnd);
         OnPointerDown(hwnd,
                       static_cast<float>(GET_X_LPARAM(lParam)) / scale,
@@ -2279,6 +2608,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return 0;
       }
       case WM_LBUTTONUP: {
+        if (settingsClosing_) return 0;
         const float scale = GetWindowScale(hwnd);
         OnPointerUp(hwnd,
                     static_cast<float>(GET_X_LPARAM(lParam)) / scale,
@@ -2451,16 +2781,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // opaque HWND surface, so transparent pixels let desktop content show through.
   bool EnsureGlassDevice() {
     if (d2dDevice_) return true;
+    // A previous partial initialization must never be reused or overwritten.
+    dcompDevice_.Reset();
+    dxgiFactory_.Reset();
+    d2dDevice_.Reset();
+    d3dDevice_.Reset();
 
     const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-                                   d3dDevice_.GetAddressOf(), nullptr, nullptr);
+    HRESULT hr = E_FAIL;
+    if (!forceWarp_) {
+      hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                            d3dDevice_.GetAddressOf(), nullptr, nullptr);
+    }
     if (FAILED(hr)) {
       // Fall back to WARP so the app still renders on machines without a usable GPU path.
+      d3dDevice_.Reset();
       hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
                              levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                              d3dDevice_.GetAddressOf(), nullptr, nullptr);
@@ -2488,21 +2827,50 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     d2dDevice_.Reset();
     d3dDevice_.Reset();
     ClearIconBitmaps();
+    previewBitmap_.Reset();
     brushCache_.clear();
   }
 
+  static bool IsDeviceLoss(HRESULT result) {
+    return result == D2DERR_RECREATE_TARGET ||
+           result == DXGI_ERROR_DEVICE_REMOVED ||
+           result == DXGI_ERROR_DEVICE_RESET ||
+           result == DXGI_ERROR_DEVICE_HUNG ||
+           result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+  }
+
+  void ScheduleRenderRecovery(const wchar_t* phase, HRESULT result) {
+    std::wstring detail = L"phase=" + std::wstring(phase) + L" hr=0x" +
+                          ToHex(static_cast<unsigned>(result));
+    if (d3dDevice_) {
+      const HRESULT removed = d3dDevice_->GetDeviceRemovedReason();
+      detail += L" removed=0x" + ToHex(static_cast<unsigned>(removed));
+    }
+    DebugGraphicsLog(detail);
+    if (IsDeviceLoss(result) && ++deviceLossCount_ >= 2) forceWarp_ = true;
+    DiscardGlassDevice();
+    if (!renderRecoveryQueued_ && hwnd_) {
+      renderRecoveryQueued_ =
+          PostMessageW(hwnd_, WM_RENDER_RECOVER, 0, 0) != FALSE;
+    }
+  }
+
   // (Re)binds the swap chain's back buffer as the Direct2D device context's target.
-  bool BindSurfaceTarget(GlassSurface& surface, float dpi) {
+  HRESULT BindSurfaceTarget(GlassSurface& surface, float dpi) {
     ComPtr<IDXGISurface> dxgiSurface;
-    if (FAILED(surface.swapChain->GetBuffer(0, IID_PPV_ARGS(dxgiSurface.GetAddressOf())))) return false;
+    HRESULT result = surface.swapChain->GetBuffer(
+        0, IID_PPV_ARGS(dxgiSurface.GetAddressOf()));
+    if (FAILED(result)) return result;
     const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
     surface.bitmap.Reset();
-    if (FAILED(surface.dc->CreateBitmapFromDxgiSurface(dxgiSurface.Get(), &props, surface.bitmap.GetAddressOf()))) return false;
+    result = surface.dc->CreateBitmapFromDxgiSurface(
+        dxgiSurface.Get(), &props, surface.bitmap.GetAddressOf());
+    if (FAILED(result)) return result;
     surface.dc->SetTarget(surface.bitmap.Get());
     surface.dc->SetDpi(dpi, dpi);
-    return true;
+    return S_OK;
   }
 
   // Creates the composition swap chain, Direct2D context and DComp visual for a window.
@@ -2540,12 +2908,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     surface.target->SetRoot(surface.visual.Get());
     dcompDevice_->Commit();
 
-    if (!BindSurfaceTarget(surface, dpi)) {
+    if (FAILED(BindSurfaceTarget(surface, dpi))) {
       surface.Reset();
       return false;
     }
     EnsureTextFormats();
     return true;
+  }
+
+  // Create and render a surface before its HWND becomes visible. The first
+  // Direct3D/DirectComposition setup and DirectWrite layout pass can be much
+  // slower than a normal frame; keeping that work outside the reveal clock
+  // prevents the first opening from jumping ahead while later openings are
+  // already smooth from cached resources.
+  bool PrewarmGlassSurface(HWND hwnd, GlassSurface& surface) {
+    if (!hwnd) return false;
+    if (surface.dc) return true;
+    if (!CreateGlassSurface(surface, hwnd)) return false;
+    RedrawWindow(hwnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    return surface.dc != nullptr;
   }
 
   // Resizes a surface's swap chain to match the window's new physical client size.
@@ -2555,13 +2937,25 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     height = std::max<UINT>(1, height);
     surface.dc->SetTarget(nullptr);
     surface.bitmap.Reset();
-    if (FAILED(surface.swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) return;
-    BindSurfaceTarget(surface, GetWindowScale(hwnd) * 96.0f);
+    const HRESULT resizeResult = surface.swapChain->ResizeBuffers(
+        0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(resizeResult)) {
+      surfaceResizeFailed_ = true;
+      ScheduleRenderRecovery(L"resize-buffers", resizeResult);
+      return;
+    }
+    const HRESULT bindResult =
+        BindSurfaceTarget(surface, GetWindowScale(hwnd) * 96.0f);
+    if (FAILED(bindResult)) {
+      surfaceResizeFailed_ = true;
+      ScheduleRenderRecovery(L"bind-target", bindResult);
+    }
   }
 
   void ResetTextFormats() {
     inputFormat_.Reset();
     rowFormat_.Reset();
+    calculationResultFormat_.Reset();
     subFormat_.Reset();
     sectionFormat_.Reset();
     footerFormat_.Reset();
@@ -2607,11 +3001,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       theme_.sectionText = theme_.textPrimary;
       theme_.accentFallback = ThemeColorFromSystem(GetSysColor(COLOR_HIGHLIGHT));
     }
+    // Theme, high-contrast and display preference changes invalidate every
+    // device-bound surface as well as all DirectWrite formats.
     ResetTextFormats();
+    DiscardGlassDevice();
+    if (!FadeAnimationsAllowed()) {
+      SnapAllMotionToTargets();
+    } else if (!SpatialAnimationsAllowed()) {
+      SnapSpatialMotionToTargets();
+    }
   }
 
-  bool AnimationsAllowed() const {
-    return settings_.animationsEnabled && systemAnimationsEnabled_ && !highContrast_;
+  bool AnimationAllowed(AnimationKind kind) const {
+    return feathercast::settings::AnimationAllowed(
+        settings_.animationLevel, kind, systemAnimationsEnabled_, highContrast_);
+  }
+
+  bool FadeAnimationsAllowed() const {
+    return AnimationAllowed(AnimationKind::Fade);
+  }
+
+  bool SpatialAnimationsAllowed() const {
+    return AnimationAllowed(AnimationKind::Spatial);
+  }
+
+  bool ControlAnimationsAllowed() const {
+    return AnimationAllowed(AnimationKind::ControlFeedback);
   }
 
   void EnsureTextFormats() {
@@ -2620,6 +3035,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     CreateTextFormat(18.0f, DWRITE_FONT_WEIGHT_NORMAL, inputFormat_);
     // 14px Medium: stronger name/title separation from subtitle (was 15px Normal).
     CreateTextFormat(14.0f, DWRITE_FONT_WEIGHT_MEDIUM, rowFormat_);
+    CreateTextFormat(16.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                     calculationResultFormat_);
+    if (calculationResultFormat_) {
+      calculationResultFormat_->SetTextAlignment(
+          DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
     CreateTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL, subFormat_);
     // 10px Semi-Bold: section labels in all-caps feel (was 11px).
     CreateTextFormat(10.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, sectionFormat_);
@@ -2633,8 +3054,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     CreateTextFormat(13.0f, DWRITE_FONT_WEIGHT_NORMAL, bodyFormat_);
     CreateTextFormat(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, buttonFormat_);
     CreateTextFormat(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, centerFormat_);
-    centerFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    centerFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    if (centerFormat_) {
+      centerFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+      centerFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
     CreateTextFormat(22.0f, DWRITE_FONT_WEIGHT_NORMAL, emojiFormat_);
     if (emojiFormat_) {
       emojiFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -2717,14 +3140,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   bool RegisterShortcutHotKey() {
     UnregisterShortcutHotKey();
+    if (IsExclusiveWinShortcut(shortcut_)) {
+      // A bare Windows-key shortcut is handled on key-up by the low-level
+      // hook. Reserving VK_LWIN/VK_RWIN with RegisterHotKey interferes with
+      // native Windows chords such as Win+Arrow.
+      return hook_ != nullptr;
+    }
     const auto hotKey = ToHotKeySpec(shortcut_);
     if (!hwnd_ || !hotKey.supported) return false;
     hotKeyRegistered_ = RegisterHotKey(hwnd_, HOTKEY_OPEN_SEARCH, hotKey.modifiers, hotKey.vk) != FALSE;
     return hotKeyRegistered_;
   }
 
+  bool EnsureRenderResources() {
+    EnsureTextFormats();
+    return inputFormat_ && rowFormat_ && calculationResultFormat_ &&
+           subFormat_ && sectionFormat_ && footerFormat_ &&
+           footerRightFormat_ && titleFormat_ && labelFormat_ && bodyFormat_ &&
+           buttonFormat_ && centerFormat_ && emojiFormat_ &&
+           volumeValueFormat_;
+  }
+
   bool CanActivateShortcut(const ShortcutSpec& candidate) const {
     if (candidate.display.empty() || candidate.display == L"none") return true;
+    if (IsExclusiveWinShortcut(candidate)) {
+      return hook_ != nullptr;
+    }
     const auto hotKey = ToHotKeySpec(candidate);
     if (!hotKey.supported) return hook_ != nullptr;
     if (!hwnd_) return false;
@@ -2736,7 +3177,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void UnregisterShortcutHotKey() {
     if (!hotKeyRegistered_) return;
-    if (hwnd_) UnregisterHotKey(hwnd_, HOTKEY_OPEN_SEARCH);
+    if (hwnd_) {
+      UnregisterHotKey(hwnd_, HOTKEY_OPEN_SEARCH);
+    }
     hotKeyRegistered_ = false;
   }
 
@@ -2840,6 +3283,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       for (const auto& entry : state.files) {
         if (!entry.path.empty() && !entry.name.empty()) fileIndex_.push_back(FileIndexApp(entry));
       }
+      fileSearchService_.UpdateFiles(fileIndex_);
     }
     if (settings_.clipboardHistoryEnabled) {
       for (const auto& entry : state.clipboard) {
@@ -2876,12 +3320,69 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     DiscoveryRequest request;
     request.generation = generation;
-    request.fileIndexEnabled =
-        settings_.fileIndexEnabled && !skipFileIndexOnce;
-    request.fileIndexLimit = FileIndexLimit();
-    request.configuredRoots = settings_.fileIndexRoots;
     if (!discoveryService_.Refresh(std::move(request))) {
       ReportBackgroundFailure(L"The discovery worker is unavailable.");
+    }
+    if (!skipFileIndexOnce) ConfigureFileIndex();
+  }
+
+  std::vector<std::wstring> ResolvedFileIndexRoots() const {
+    if (!settings_.fileIndexRoots.empty()) return settings_.fileIndexRoots;
+    std::vector<std::wstring> roots;
+    for (const KNOWNFOLDERID& folder :
+         {FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads}) {
+      const auto path = KnownFolderPath(folder);
+      if (!path.empty()) roots.push_back(path);
+    }
+    return roots;
+  }
+
+  void ConfigureFileIndex() {
+    feathercast::files::IndexRequest request;
+    request.generation = ++fileIndexGeneration_;
+    request.limit = FileIndexLimit();
+    request.contentEnabled = settings_.fileContentIndexEnabled;
+    if (settings_.fileIndexEnabled) request.roots = ResolvedFileIndexRoots();
+    if (!fileIndexService_.Reconfigure(std::move(request))) {
+      ReportBackgroundFailure(L"The live file index worker is unavailable.");
+    }
+  }
+
+  void OnFileIndexReady(feathercast::files::IndexStatus status) {
+    if (!fileIndexService_.IsCurrent(status.generation)) return;
+    const auto entryCount = status.entries.size();
+    std::vector<AppEntry> files;
+    files.reserve(status.entries.size());
+    for (const auto& entry : status.entries) {
+      if (!entry.path.empty() && !entry.name.empty()) {
+        files.push_back(FileIndexApp(entry));
+      }
+    }
+    if (!persistence_.UpdateFileIndex(std::move(status.entries))) {
+      ReportPersistenceFailure(L"The persistence worker is unavailable.");
+    }
+    {
+      std::lock_guard lock(dataMutex_);
+      fileIndex_ = files;
+    }
+    fileSearchService_.UpdateFiles(std::move(files));
+    fileIndexStatus_ = std::move(status);
+    KillTimer(hwnd_, TIMER_FILE_SNAPSHOT);
+    SetTimer(hwnd_, TIMER_FILE_SNAPSHOT, 500, nullptr);
+    if (visible_ && feathercast::search_scope::Parse(query_).scope ==
+                        feathercast::search_scope::Scope::Files) {
+      RequestSearch();
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
+      SetSettingsStatus(
+          fileIndexStatus_->live ? StatusSeverity::Success
+                                 : StatusSeverity::Error,
+          fileIndexStatus_->message + L" " + std::to_wstring(entryCount) +
+              L" entries, " +
+              std::to_wstring(fileIndexStatus_->indexedContentFiles) +
+              L" content files.");
+      InvalidateRect(settingsHwnd_, nullptr, FALSE);
     }
   }
 
@@ -2902,36 +3403,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     DiscoveryResult result;
     result.generation = request.generation;
     result.apps = std::move(*apps);
-    result.fileIndexBuilt = request.fileIndexEnabled;
-    if (request.fileIndexEnabled) {
-      auto files = BuildFileIndex(stopToken, request.generation,
-                                  request.configuredRoots,
-                                  request.fileIndexLimit);
-      if (!files) return std::nullopt;
-      result.fileIndex = std::move(*files);
-    }
     return result;
   }
 
   void OnDiscoveryCompleted(DiscoveryResult result) {
     if (!discoveryService_.IsCurrent(result.generation)) return;
-    std::vector<feathercast::storage::FileIndexEntry> storageEntries;
-    if (result.fileIndexBuilt) {
-      storageEntries.reserve(result.fileIndex.size());
-      for (const auto& file : result.fileIndex) {
-        storageEntries.push_back(StorageFileEntry(file));
-      }
-    }
     {
       std::lock_guard lock(dataMutex_);
       apps_ = std::move(result.apps);
-      fileIndex_ = std::move(result.fileIndex);
     }
     appsReady_.store(true, std::memory_order_release);
-    if (result.fileIndexBuilt &&
-        !persistence_.UpdateFileIndex(std::move(storageEntries))) {
-      ReportPersistenceFailure(L"The persistence worker is unavailable.");
-    }
     MarkSearchDataChanged();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2939,118 +3420,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settingsStatus_->severity == StatusSeverity::Progress &&
         settingsStatus_->text.find(L"index") != std::wstring::npos) {
       SetSettingsStatus(StatusSeverity::Success,
-                        L"Apps and file index refreshed.");
+                        L"Apps refreshed; file indexing continues in the background.");
     }
     const auto generation = result.generation;
     launchExecutor_.Submit([this, generation](std::stop_token token) {
       PrecacheIcons(token, generation);
     });
-  }
-
-  static constexpr int kFileIndexDepth = 4;
-
-  std::optional<std::vector<AppEntry>> BuildFileIndex(
-      std::stop_token stopToken, uint64_t generation,
-      const std::vector<std::wstring>& configuredRoots, size_t limit) {
-    std::vector<AppEntry> files;
-    std::set<std::wstring> seen;
-    const long long indexedAt = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    std::vector<std::filesystem::path> roots;
-    for (const auto& configuredRoot : configuredRoots) {
-      if (!Trim(configuredRoot).empty()) roots.emplace_back(configuredRoot);
-    }
-    if (roots.empty()) {
-      for (const KNOWNFOLDERID& folder : {FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads}) {
-        const std::wstring root = KnownFolderPath(folder);
-        if (!root.empty()) roots.emplace_back(root);
-      }
-    }
-
-    struct RootState {
-      std::deque<std::pair<std::filesystem::path, int>> directories;
-      std::deque<std::pair<std::filesystem::path, int>> entries;
-    };
-    std::vector<RootState> states(roots.size());
-    for (size_t i = 0; i < roots.size(); ++i) states[i].directories.emplace_back(roots[i], 0);
-
-    auto fillEntries = [&](RootState& state) {
-      while (state.entries.empty() && !state.directories.empty()) {
-        if (DiscoveryCanceled(stopToken, generation)) return false;
-        auto [directory, depth] = std::move(state.directories.front());
-        state.directories.pop_front();
-        std::error_code ec;
-        std::vector<std::filesystem::path> sorted;
-        size_t enumerated = 0;
-        for (std::filesystem::directory_iterator it(
-                 directory, std::filesystem::directory_options::skip_permission_denied, ec), end;
-             !ec && it != end; it.increment(ec)) {
-          sorted.push_back(it->path());
-          if ((++enumerated & 63u) == 0 && DiscoveryCanceled(stopToken, generation)) {
-            return false;
-          }
-        }
-        if (DiscoveryCanceled(stopToken, generation)) return false;
-        std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
-          return Lower(left.wstring()) < Lower(right.wstring());
-        });
-        for (auto& path : sorted) state.entries.emplace_back(std::move(path), depth);
-      }
-      return true;
-    };
-
-    constexpr size_t kRootBatch = 64;
-    bool madeProgress = true;
-    while (files.size() < limit && madeProgress && !DiscoveryCanceled(stopToken, generation)) {
-      madeProgress = false;
-      for (auto& state : states) {
-        if (!fillEntries(state)) return std::nullopt;
-        size_t batch = 0;
-        while (!state.entries.empty() && batch++ < kRootBatch && files.size() < limit) {
-          if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
-          madeProgress = true;
-          auto [path, depth] = std::move(state.entries.front());
-          state.entries.pop_front();
-          const std::wstring name = path.filename().wstring();
-          if (name.empty() || name.front() == L'.') continue;
-          const DWORD attrs = GetFileAttributesW(path.c_str());
-          if (attrs == INVALID_FILE_ATTRIBUTES ||
-              (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT))) {
-            continue;
-          }
-          const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-          if (isDirectory && depth < kFileIndexDepth) state.directories.emplace_back(path, depth + 1);
-
-          const std::wstring full = path.wstring();
-          if (!seen.insert(Lower(full)).second) continue;
-          long long lastWriteTime = 0;
-          long long fileSize = 0;
-          std::error_code metaEc;
-          const auto writeTime = std::filesystem::last_write_time(path, metaEc);
-          if (!metaEc) lastWriteTime = writeTime.time_since_epoch().count();
-          if (!isDirectory) {
-            fileSize = static_cast<long long>(std::filesystem::file_size(path, metaEc));
-            if (metaEc) fileSize = 0;
-          }
-
-          AppEntry app;
-          app.id = L"file:" + full;
-          app.name = name;
-          app.path = full;
-          app.source = L"file";
-          app.launchType = LaunchType::Exe;
-          app.launchTarget = full;
-          app.iconKey = full;
-          app.fileIsDirectory = isDirectory;
-          app.fileLastWriteTime = lastWriteTime;
-          app.fileSize = fileSize;
-          app.fileIndexedAt = indexedAt;
-          files.push_back(std::move(app));
-        }
-      }
-    }
-    if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
-    return files;
   }
 
   // Loads cached FX rates immediately, then refreshes from the network in the
@@ -3576,14 +3951,35 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void RequestSearch() {
     overlayStatus_.reset();
     QueryRequest req = GatherRequest();
+    if (std::abs(overlayVisualScroll_.Target() -
+                 static_cast<double>(scroll_)) > 0.001) {
+      RetargetOverlayScroll();
+    }
     CancelResultPointerPress();
     if (visible_) NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, hwnd_, OBJID_CLIENT, 1);
-    if (!req.compactClear && !req.empty && !req.actionMode) {
+    if (!req.compactClear && !req.empty && !req.actionMode &&
+        req.scope == feathercast::search_scope::Scope::All) {
       extensions_.RequestQuery(req.query, req.generation);
     }
+    if (!req.compactClear && !req.actionMode &&
+        req.browseView == BrowseView::None &&
+        req.scope == feathercast::search_scope::Scope::Files) {
+      pendingResultsOpacity_.Retarget(0.38, 0.060,
+                                      visible_ && FadeAnimationsAllowed());
+      if (!fileSearchService_.Query(
+              {req.generation, req.query, req.limit,
+               settings_.fileContentIndexEnabled})) {
+        ReportBackgroundFailure(L"The file search worker is unavailable.");
+      }
+      return;
+    }
     if (req.compactClear || req.empty || req.actionMode) {
+      pendingResultsOpacity_.Snap(1.0);
       ApplyResults(ComputeResults(req));
     } else {
+      pendingResultsOpacity_.Retarget(0.38, 0.060,
+                                      visible_ && FadeAnimationsAllowed());
+      if (pendingResultsOpacity_.Active()) RequestAnimationFrame();
       DispatchToWorker(std::move(req));
     }
   }
@@ -3597,12 +3993,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     QueryRequest req;
     req.generation = searchPresentation_.NextRequest();
     req.query = query_;
+    if (!actionMode_ && browseView_ == BrowseView::None) {
+      const auto scoped = feathercast::search_scope::Parse(query_);
+      if (scoped.recognized) {
+        req.scope = scoped.scope;
+        req.query = scoped.terms;
+      }
+    }
 
-    const bool empty = Trim(query_).empty();
+    const bool empty = Trim(req.query).empty();
     req.empty = empty;
     req.actionMode = actionMode_;
     req.browseView = browseView_;
-    req.compactClear = settings_.compactMode && empty && view_ == View::Search &&
+    req.compactClear = settings_.compactMode && Trim(query_).empty() &&
+                       view_ == View::Search &&
                        !actionMode_ && browseView_ == BrowseView::None;
     req.recentIds = std::set<std::wstring>(settings_.recentApps.begin(), settings_.recentApps.end());
     req.limit = std::clamp(settings_.maxResults, MIN_RESULTS, MAX_RESULT_SETTING);
@@ -3646,7 +4050,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     // Query-dependent extension results (read from the extension result cache).
     if (!empty) {
-      for (const auto& extensionResult : extensions_.CachedResultsFor(query_)) {
+      for (const auto& extensionResult : extensions_.CachedResultsFor(req.query)) {
         req.extensionItems.push_back(ExtensionDisplay(extensionResult));
       }
     }
@@ -3780,9 +4184,89 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return feathercast::search_pipeline::ComputeResults(req);
   }
 
+  struct ResultPositions {
+    std::map<std::wstring, float> rows;
+    std::map<std::wstring, float> headers;
+  };
+
+  ResultPositions CaptureResultPositions() const {
+    ResultPositions positions;
+    float y = kResultsTop;
+    for (const auto& section : sections_) {
+      float headerY = y;
+      if (const auto motion = resultHeaderMotion_.find(section.title);
+          motion != resultHeaderMotion_.end()) {
+        headerY += static_cast<float>(motion->second.offsetY.Value());
+      }
+      positions.headers[section.title] = headerY;
+      y += kSectionHeaderHeight;
+      for (const auto& item : section.items) {
+        const std::wstring key = item.Key();
+        float rowY = y;
+        if (const auto motion = resultRowMotion_.find(key);
+            motion != resultRowMotion_.end()) {
+          rowY += static_cast<float>(motion->second.offsetY.Value());
+        }
+        positions.rows[key] = rowY;
+        y += kResultRowStride;
+      }
+    }
+    return positions;
+  }
+
+  void StartResultTransitions(const ResultPositions& oldPositions) {
+    resultRowMotion_.clear();
+    resultHeaderMotion_.clear();
+    if (!FadeAnimationsAllowed() || !visible_) return;
+
+    float y = kResultsTop;
+    for (const auto& section : sections_) {
+      auto& header = resultHeaderMotion_[section.title];
+      const auto oldHeader = oldPositions.headers.find(section.title);
+      header.offsetY.Snap(
+          SpatialAnimationsAllowed()
+              ? (oldHeader == oldPositions.headers.end()
+                     ? 4.0
+                     : oldHeader->second - y)
+              : 0.0);
+      header.opacity.Snap(oldHeader == oldPositions.headers.end() ? 0.65
+                                                                  : 1.0);
+      header.offsetY.Retarget(0.0, kResultTransitionSeconds,
+                              SpatialAnimationsAllowed());
+      header.opacity.Retarget(1.0, kResultTransitionSeconds, true);
+      y += kSectionHeaderHeight;
+      for (const auto& item : section.items) {
+        const std::wstring key = item.Key();
+        auto& row = resultRowMotion_[key];
+        const auto oldRow = oldPositions.rows.find(key);
+        row.offsetY.Snap(
+            SpatialAnimationsAllowed()
+                ? (oldRow == oldPositions.rows.end() ? 4.0
+                                                     : oldRow->second - y)
+                : 0.0);
+        row.opacity.Snap(oldRow == oldPositions.rows.end() ? 0.65 : 1.0);
+        row.offsetY.Retarget(0.0, kResultTransitionSeconds,
+                             SpatialAnimationsAllowed());
+        row.opacity.Retarget(1.0, kResultTransitionSeconds, true);
+        y += kResultRowStride;
+      }
+    }
+    RequestAnimationFrame();
+  }
+
   // UI thread: commit a freshly computed result set to the rendered state.
   void ApplyResults(ResultsCollection result) {
     if (!searchPresentation_.Publish(result.generation)) return;
+    pendingResultsOpacity_.Retarget(1.0, 0.060,
+                                    visible_ && FadeAnimationsAllowed());
+    if (pendingResultsOpacity_.Active()) RequestAnimationFrame();
+    const ResultPositions oldPositions = CaptureResultPositions();
+    const bool preserveSelection = query_ == displayedQuery_;
+    const std::wstring selectedKey =
+        preserveSelection && selected_ >= 0 &&
+                selected_ < static_cast<int>(flatItems_.size())
+            ? flatItems_[static_cast<size_t>(selected_)].Key()
+            : std::wstring{};
     sections_ = std::move(result.sections);
     flatItems_ = std::move(result.flatItems);
     if (pendingNavigationRestore_) {
@@ -3797,10 +4281,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               : restore.selected,
           restore.scroll);
       pendingNavigationRestore_.reset();
+    } else if (!selectedKey.empty()) {
+      const auto match = std::find_if(
+          flatItems_.begin(), flatItems_.end(), [&](const DisplayItem& item) {
+            return item.Key() == selectedKey;
+          });
+      if (match != flatItems_.end()) {
+        feathercast::ui::OverlayController::Select(
+            overlayState_,
+            static_cast<int>(std::distance(flatItems_.begin(), match)),
+            static_cast<int>(flatItems_.size()), false);
+      }
     }
+    displayedQuery_ = query_;
     if (selected_ >= static_cast<int>(flatItems_.size())) selected_ = std::max<int>(0, static_cast<int>(flatItems_.size()) - 1);
+    if (!pendingNavigation_.Empty()) {
+      feathercast::ui::OverlayController::Select(
+          overlayState_,
+          pendingNavigation_.Apply(selected_,
+                                   static_cast<int>(flatItems_.size())),
+          static_cast<int>(flatItems_.size()), false);
+      pendingNavigation_.Clear();
+      EnsureSelectedVisible();
+    }
     ApplyWindowSize();
+    StartResultTransitions(oldPositions);
     SyncSelectionAnimationToTarget();
+    ScheduleSelectedPreview();
     NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
   }
 
@@ -3919,7 +4426,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     POINT cursor{};
     if (GetCursorPos(&cursor)) return MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     if (foreground && IsWindow(foreground)) return MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-    if (lastActiveWindow_ && IsWindow(lastActiveWindow_)) return MonitorFromWindow(lastActiveWindow_, MONITOR_DEFAULTTONEAREST);
+    if (overlayRestoreCandidate_ &&
+        ValidateRestoreCandidate(*overlayRestoreCandidate_)) {
+      return MonitorFromWindow(overlayRestoreCandidate_->hwnd,
+                               MONITOR_DEFAULTTONEAREST);
+    }
     return MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
   }
 
@@ -3941,42 +4452,58 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         visible_ || volumeVisible_ ||
         (settingsHwnd_ && IsWindowVisible(settingsHwnd_));
     if (isForeground) {
-      KillTimer(hwnd_, TIMER_MEM_TRIM);
-      SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-
-      MEMORY_PRIORITY_INFORMATION memPriority{};
-      memPriority.MemoryPriority = MEMORY_PRIORITY_NORMAL;
-      SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memPriority, sizeof(memPriority));
-
-      PROCESS_POWER_THROTTLING_STATE powerThrottling{};
-      powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-      powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-      powerThrottling.StateMask = 0;
-      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
+      EnterInteractiveScheduling();
     } else {
       // Retain prepared search, rendering, icon, emoji, and extension state so
       // the next launcher invocation stays warm. Only query-specific results
       // are discarded; reusable capacity is intentionally kept.
       searchPresentation_.Invalidate();
       searchCoordinator_.Invalidate(searchPresentation_.Requested());
+      fileSearchService_.Invalidate(searchPresentation_.Requested());
       sections_.clear();
       flatItems_.clear();
       hits_.clear();
 
       // Background work remains unobtrusive without forcing page faults,
       // re-decoding icons, or restarting plugin hosts on every reopen.
-      SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-
-      MEMORY_PRIORITY_INFORMATION memPriority{};
-      memPriority.MemoryPriority = MEMORY_PRIORITY_LOW;
-      SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memPriority, sizeof(memPriority));
-
-      PROCESS_POWER_THROTTLING_STATE powerThrottling{};
-      powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-      powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-      powerThrottling.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling));
+      EnterBackgroundScheduling();
     }
+  }
+
+  void EnterInteractiveScheduling() {
+    KillTimer(hwnd_, TIMER_MEM_TRIM);
+    SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+
+    MEMORY_PRIORITY_INFORMATION memPriority{};
+    memPriority.MemoryPriority = MEMORY_PRIORITY_NORMAL;
+    SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority,
+                          &memPriority, sizeof(memPriority));
+
+    PROCESS_POWER_THROTTLING_STATE powerThrottling{};
+    powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    powerThrottling.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &powerThrottling, sizeof(powerThrottling));
+  }
+
+  void EnterBackgroundScheduling() {
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+
+    MEMORY_PRIORITY_INFORMATION memPriority{};
+    memPriority.MemoryPriority = MEMORY_PRIORITY_LOW;
+    SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority,
+                          &memPriority, sizeof(memPriority));
+
+    // Let Windows infer background QoS from the hidden window and reduced
+    // priority. Explicit EcoQoS can keep the first interactive frame on a
+    // power-efficient core long enough for a reveal to miss its cadence.
+    PROCESS_POWER_THROTTLING_STATE powerThrottling{};
+    powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    powerThrottling.ControlMask = 0;
+    powerThrottling.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &powerThrottling, sizeof(powerThrottling));
   }
 
   void ExecuteOverlayEffects(feathercast::ui::UiEffects effects) {
@@ -3988,7 +4515,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (HasEffect(effects, UiEffect::RefreshData)) StartAppDiscovery();
     if (HasEffect(effects, UiEffect::FocusWindow) && hwnd_) SetFocus(hwnd_);
-    if (HasEffect(effects, UiEffect::CloseView)) HideOverlay(true);
+    if (HasEffect(effects, UiEffect::CloseView)) {
+      HideOverlay(OverlayCloseReason::ExplicitDismiss);
+    }
     if (HasEffect(effects, UiEffect::Invalidate) && hwnd_) {
       InvalidateRect(hwnd_, nullptr, FALSE);
     }
@@ -4010,25 +4539,171 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
   }
 
-  void ShowOverlay(View view) {
+  void AdoptRestoreCandidate(const ForegroundSnapshot& snapshot) {
+    RestoreCandidate candidate;
+    static_cast<ForegroundSnapshot&>(candidate) = snapshot;
+    candidate.generation = overlayFocusSession_.Generation();
+    if (!ValidateRestoreCandidate(candidate)) return;
+    overlayRestoreCandidate_ = candidate;
+    DebugFocusLog(
+        L"candidate generation=" + std::to_wstring(candidate.generation) +
+        L" hwnd=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(
+                         candidate.hwnd)) +
+        L" pid=" + std::to_wstring(candidate.processId) +
+        L" tid=" + std::to_wstring(candidate.threadId));
+  }
+
+  void ObserveExternalForeground(HWND window) {
+    const ULONGLONG now = GetTickCount64();
+    if (!overlayFocusSession_.AcceptsExternalCandidate(now)) return;
+    if (auto snapshot = CaptureForegroundSnapshot(window)) {
+      AdoptRestoreCandidate(*snapshot);
+    }
+  }
+
+  bool TryActivateOverlay() {
+    if (!visible_ || !hwnd_ || !IsWindowVisible(hwnd_)) return false;
+
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    BringWindowToTop(hwnd_);
+    const BOOL requested = SetForegroundWindow(hwnd_);
+    SetActiveWindow(hwnd_);
+    SetFocus(hwnd_);
+    bool activated = GetForegroundWindow() == hwnd_;
+
+    if (!activated) {
+      HWND foreground = GetForegroundWindow();
+      const DWORD currentThreadId = GetCurrentThreadId();
+      const DWORD foregroundThreadId =
+          foreground && foreground != hwnd_
+              ? GetWindowThreadProcessId(foreground, nullptr)
+              : 0;
+      const bool attached =
+          foregroundThreadId != 0 && foregroundThreadId != currentThreadId &&
+          AttachThreadInput(foregroundThreadId, currentThreadId, TRUE) != FALSE;
+      if (attached) {
+        BringWindowToTop(hwnd_);
+        SetForegroundWindow(hwnd_);
+        SetActiveWindow(hwnd_);
+        SetFocus(hwnd_);
+        activated = GetForegroundWindow() == hwnd_;
+        AttachThreadInput(foregroundThreadId, currentThreadId, FALSE);
+      }
+    }
+
+    DebugFocusLog(
+        L"activate-overlay generation=" +
+        std::to_wstring(overlayFocusSession_.Generation()) + L" requested=" +
+        std::to_wstring(requested != FALSE) + L" verified=" +
+        std::to_wstring(activated));
+    return activated;
+  }
+
+  void RetryOverlayActivation() {
+    if (!visible_) {
+      KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
+      overlayFocusSession_.End();
+      return;
+    }
+    if (overlayClosing_) {
+      KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
+      return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    const bool reactivationRequested = overlayReactivationQueued_;
+    overlayReactivationQueued_ = false;
+    if (!overlayFocusSession_.GuardActive(now) && !reactivationRequested) {
+      KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
+      overlayFocusSession_.Expire(now);
+      HWND foreground = GetForegroundWindow();
+      if (foreground != hwnd_) {
+        HideOverlay(OverlayCloseReason::PassiveFocusLoss);
+      }
+      return;
+    }
+
+    HWND foreground = GetForegroundWindow();
+    if (foreground == hwnd_) {
+      if (overlayFocusSession_.Phase() ==
+          feathercast::interaction::OverlayFocusPhase::Acquiring) {
+        overlayFocusSession_.RecordActivationAttempt(true);
+      }
+      return;
+    }
+
+    ObserveExternalForeground(foreground);
+    overlayFocusSession_.RecordActivationAttempt(TryActivateOverlay());
+  }
+
+  void BeginOverlayActivation() {
+    KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
+    if (!SetTimer(hwnd_, TIMER_OVERLAY_ACTIVATE,
+                  OVERLAY_ACTIVATION_INTERVAL_MS, nullptr)) {
+      const bool activated = TryActivateOverlay();
+      overlayFocusSession_.RecordActivationAttempt(activated);
+      overlayFocusSession_.End();
+      if (!activated) HideOverlay(OverlayCloseReason::PassiveFocusLoss);
+      return;
+    }
+    RetryOverlayActivation();
+  }
+
+  void HandleOverlayFocusLoss(HWND nextWindow) {
+    if (!visible_ || suppressHide_ || overlayClosing_ ||
+        overlayFocusSession_.Phase() ==
+            feathercast::interaction::OverlayFocusPhase::Closing) {
+      return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (overlayFocusSession_.GuardActive(now)) {
+      if (nextWindow) ObserveExternalForeground(nextWindow);
+      if (HWND foreground = GetForegroundWindow(); foreground != hwnd_) {
+        ObserveExternalForeground(foreground);
+      }
+      overlayReactivationQueued_ = true;
+      PostMessageW(hwnd_, WM_OVERLAY_RETRY_ACTIVATION, 0, 0);
+      return;
+    }
+    HideOverlay(OverlayCloseReason::PassiveFocusLoss);
+  }
+
+  void ShowOverlay(
+      View view,
+      std::optional<ForegroundSnapshot> foregroundSnapshot = std::nullopt) {
+    // Restore foreground scheduling before search preparation, surface
+    // resizing, or the first hidden-frame render can consume the reveal budget.
+    EnterInteractiveScheduling();
+    if (!foregroundSnapshot) {
+      foregroundSnapshot = CaptureForegroundSnapshot(GetForegroundWindow());
+    }
+    const bool wasVisible = visible_;
+    const auto previousCandidate = overlayRestoreCandidate_;
+    overlayClosing_ = false;
+    overlayReactivationQueued_ = false;
+    pendingOverlayClose_.reset();
     CancelPointerPress();
     if (volumeVisible_) HideVolumeControl(false);
     if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
-      HideSettings();
+      HideSettings(false);
     }
     const auto effects =
         feathercast::ui::OverlayController::ResetForShow(overlayState_, view);
-    HWND foreground = GetForegroundWindow();
-    if (!visible_) {
-      // Never carry a restore target over from an earlier overlay session. A
-      // temporarily missing foreground window must not make Escape reactivate
-      // an unrelated stale app.
-      lastActiveWindow_ =
-          foreground && foreground != hwnd_ && foreground != settingsHwnd_ &&
-                  foreground != volumeHwnd_
-              ? foreground
-              : nullptr;
+    const std::uint64_t generation =
+        overlayFocusSession_.Begin(GetTickCount64());
+    overlayRestoreCandidate_.reset();
+    if (foregroundSnapshot) {
+      AdoptRestoreCandidate(*foregroundSnapshot);
+    } else if (wasVisible && previousCandidate &&
+               ValidateRestoreCandidate(*previousCandidate)) {
+      RestoreCandidate retained = *previousCandidate;
+      retained.generation = generation;
+      overlayRestoreCandidate_ = retained;
     }
+    HWND foreground = foregroundSnapshot ? foregroundSnapshot->hwnd
+                                         : GetForegroundWindow();
     overlayMonitor_ = ResolveOverlayMonitor(foreground);
     visible_ = true;
     UpdateBackgroundState();
@@ -4037,40 +4712,39 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     PositionWindow();
     // Reassert the transparent window treatment each reveal.
     ApplyGlass(hwnd_);
-
-    // Prepare the first frame while the HWND is still hidden. Otherwise DWM can
-    // briefly reveal the swap chain's fully rendered frame from the previous
-    // invocation before the new reveal animation gets its first paint.
-    animating_ = AnimationsAllowed();
-    if (animating_) {
-      animStartQpc_ = NowQpc();
-      lastAnimationFrameQpc_ = animStartQpc_;
+    const bool surfaceReady = overlaySurface_.dc != nullptr ||
+                              PrewarmGlassSurface(hwnd_, overlaySurface_);
+    animating_ = FadeAnimationsAllowed() && surfaceReady;
+    // The actual reveal clock begins only after the hidden initial frame has
+    // been rendered and foreground activation has completed.
+    overlayRevealTimeline_.Reset();
+    if (!wasVisible) {
+      if (surfaceReady) {
+        StartSurfaceOpen(hwnd_, overlayBounds_, overlayOpacity_, true);
+      } else {
+        RECT windowBounds{};
+        GetWindowRect(hwnd_, &windowBounds);
+        SnapWindowBounds(overlayBounds_, windowBounds);
+        overlayOpacity_.Snap(1.0);
+      }
+    } else {
+      overlayOpacity_.Retarget(1.0, kSurfaceOpenSeconds,
+                               animating_);
     }
+
+    // Prepare the reveal's zero-progress frame while the HWND is still hidden.
+    // Otherwise DWM can briefly reveal the swap chain's previous full frame.
     RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
 
     // Show the HWND only once. PositionWindow already established its topmost
     // z-order, so a second SWP_SHOWWINDOW transition only causes visible churn.
-    ShowWindow(hwnd_, SW_SHOWNORMAL);
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     RefreshWindowsAsync();
 
-    // Auto-focus overlay
-    SendVirtualKeyTap(0xE8);
-
-    DWORD foregroundThreadId = GetWindowThreadProcessId(foreground, nullptr);
-    DWORD currentThreadId = GetCurrentThreadId();
-    if (foreground && foreground != hwnd_ && foregroundThreadId != currentThreadId) {
-      AttachThreadInput(foregroundThreadId, currentThreadId, TRUE);
-      SetForegroundWindow(hwnd_);
-      SetActiveWindow(hwnd_);
-      SetFocus(hwnd_);
-      AttachThreadInput(foregroundThreadId, currentThreadId, FALSE);
-    } else {
-      SetForegroundWindow(hwnd_);
-      SetActiveWindow(hwnd_);
-      SetFocus(hwnd_);
-    }
+    DebugFocusLog(L"show generation=" + std::to_wstring(generation));
+    BeginOverlayActivation();
 
     // Ignore the mouse pointer until it is actually moved, so an overlay that
     // opens under the cursor does not hover-select the result beneath it.
@@ -4078,29 +4752,118 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ignoreMouseUntilMove_ = true;
 
     SetTimer(hwnd_, 1, 200, nullptr);
-    if (animating_) RequestAnimationFrame();
+    if (animating_) {
+      overlayRevealTimeline_.Start(AnimFinishMs() / 1000.0);
+    }
+    RestartAnimationClock();
   }
 
-  void HideOverlay(bool restoreFocus) {
-    HWND restoreTarget = restoreFocus ? lastActiveWindow_ : nullptr;
+  bool ActivateRestoreCandidate(const RestoreCandidate& candidate) {
+    if (!ValidateRestoreCandidate(candidate)) return false;
+    if (IsIconic(candidate.hwnd)) ShowWindowAsync(candidate.hwnd, SW_RESTORE);
+    BOOL requested = SetForegroundWindow(candidate.hwnd);
+    bool activated = GetForegroundWindow() == candidate.hwnd;
+    if (!activated) {
+      const DWORD currentThreadId = GetCurrentThreadId();
+      const bool attached =
+          candidate.threadId != currentThreadId &&
+          AttachThreadInput(candidate.threadId, currentThreadId, TRUE) != FALSE;
+      if (attached) {
+        BringWindowToTop(candidate.hwnd);
+        requested = SetForegroundWindow(candidate.hwnd);
+        activated = GetForegroundWindow() == candidate.hwnd;
+        AttachThreadInput(candidate.threadId, currentThreadId, FALSE);
+      }
+    }
+    DebugFocusLog(
+        L"restore generation=" + std::to_wstring(candidate.generation) +
+        L" requested=" + std::to_wstring(requested != FALSE) +
+        L" verified=" + std::to_wstring(activated));
+    return activated;
+  }
+
+  void FinishHideOverlay(PendingOverlayClose close) {
+    if (!overlayFocusSession_.CanFinishClose(close.generation)) return;
+
+    const bool explicitRestore =
+        close.reason == OverlayCloseReason::ExplicitDismiss;
+    HWND foreground = GetForegroundWindow();
+    const bool candidateValid =
+        close.candidate && close.candidate->generation == close.generation &&
+        ValidateRestoreCandidate(*close.candidate);
+    const bool overlayStillForeground = !foreground || foreground == hwnd_;
+    if (feathercast::interaction::ShouldAttemptOverlayRestore(
+            explicitRestore, overlayStillForeground, candidateValid)) {
+      ActivateRestoreCandidate(*close.candidate);
+    } else if (explicitRestore && foreground && foreground != hwnd_) {
+      DebugFocusLog(
+          L"restore-skipped-external generation=" +
+          std::to_wstring(close.generation));
+    }
+
     // Every hide ends the focus-restore session, including launch, paste and
     // focus-loss paths that intentionally do not restore the previous window.
-    lastActiveWindow_ = nullptr;
+    overlayRestoreCandidate_.reset();
+    pendingOverlayClose_.reset();
+    overlayClosing_ = false;
     CancelPointerPress(hwnd_);
     KillTimer(hwnd_, 1);
+    KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
+    overlayReactivationQueued_ = false;
+    overlayFocusSession_.End();
     animating_ = false;
+    overlayRevealTimeline_.Reset();
     animatingSelection_ = false;
     animationFrameQueued_ = false;
     visualSelectedY_ = -1.0f;
     StopSelectionAnimationTimer();
+    KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
+    previewOpen_ = false;
+    ++previewGeneration_;
+    previewService_.Invalidate(previewGeneration_);
+    previewResult_.reset();
+    previewBitmap_.Reset();
+    previewScroll_ = 0.0f;
     confirmation_.reset();
     confirmationFocus_ = 0;
     confirmationHover_ = -1;
+    confirmationClosing_ = false;
+    confirmationProgress_.Snap(0.0);
+    pendingNavigation_.Clear();
     visible_ = false;
     ShowWindow(hwnd_, SW_HIDE);
     overlayMonitor_ = nullptr;
     UpdateBackgroundState();
-    if (restoreTarget) FocusWindow(restoreTarget);
+  }
+
+  void HideOverlay(OverlayCloseReason reason) {
+    if (!visible_) return;
+    if (overlayClosing_) return;
+
+    KillTimer(hwnd_, TIMER_OVERLAY_ACTIVATE);
+    const bool restoreFocus = reason == OverlayCloseReason::ExplicitDismiss;
+    PendingOverlayClose close;
+    close.generation = overlayFocusSession_.Generation();
+    close.reason = reason;
+    if (restoreFocus && overlayRestoreCandidate_ &&
+        overlayRestoreCandidate_->generation == close.generation) {
+      close.candidate = overlayRestoreCandidate_;
+    }
+    overlayFocusSession_.BeginClosing();
+    DebugFocusLog(L"close generation=" + std::to_wstring(close.generation) +
+                  L" reason=" +
+                  std::to_wstring(static_cast<int>(reason)));
+
+    if (restoreFocus && FadeAnimationsAllowed()) {
+      pendingOverlayClose_ = close;
+      overlayClosing_ = true;
+      CancelPointerPress(hwnd_);
+      KillTimer(hwnd_, 1);
+      overlayOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
+      RequestAnimationFrame();
+      return;
+    }
+    FinishHideOverlay(std::move(close));
   }
 
   static RectF VolumeTrackRect(float width) {
@@ -4119,6 +4882,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, volumeHwnd_, OBJID_CLIENT, 1);
   }
 
+  void RetargetVolumeVisual(bool animate) {
+    volumeVisualPercent_.Retarget(
+        static_cast<double>(volumePercent_), 0.080,
+        animate && SpatialAnimationsAllowed());
+    if (volumeVisualPercent_.Active()) RequestAnimationFrame();
+  }
+
   void SetVolumeStatus(std::wstring status) {
     if (volumeStatus_ == status) return;
     volumeStatus_ = std::move(status);
@@ -4135,6 +4905,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     SetVolumeStatus({});
     if (*current == volumePercent_) return;
     volumePercent_ = *current;
+    RetargetVolumeVisual(true);
     NotifyVolumeValueChanged();
   }
 
@@ -4146,6 +4917,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     volumePercent_ = next;
+    RetargetVolumeVisual(!volumeDragging_);
     SetVolumeStatus({});
     NotifyVolumeValueChanged();
   }
@@ -4216,15 +4988,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     HMONITOR monitor = overlayMonitor_;
     if (!monitor) monitor = ResolveOverlayMonitor(GetForegroundWindow());
-    volumeRestoreWindow_ = lastActiveWindow_;
-    HideOverlay(false);
+    volumeRestoreWindow_ =
+        overlayRestoreCandidate_ ? overlayRestoreCandidate_->hwnd : nullptr;
+    HideOverlay(OverlayCloseReason::Transition);
+    EnterInteractiveScheduling();
 
     volumePercent_ = *current;
     volumeStatus_.clear();
     volumeMonitor_ = monitor;
     volumeVisible_ = true;
+    volumeClosing_ = false;
+    pendingVolumeRestore_ = nullptr;
+    volumeVisualPercent_.Snap(static_cast<double>(volumePercent_));
     PositionVolumeWindow(monitor);
     ApplyGlass(volumeHwnd_);
+    const bool surfaceReady =
+        PrewarmGlassSurface(volumeHwnd_, volumeSurface_);
+    if (surfaceReady) {
+      StartSurfaceOpen(volumeHwnd_, volumeBounds_, volumeOpacity_, false);
+    } else {
+      RECT windowBounds{};
+      GetWindowRect(volumeHwnd_, &windowBounds);
+      SnapWindowBounds(volumeBounds_, windowBounds);
+      volumeOpacity_.Snap(1.0);
+    }
     RedrawWindow(volumeHwnd_, nullptr, nullptr,
                  RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     ShowWindow(volumeHwnd_, SW_SHOWNORMAL);
@@ -4236,11 +5023,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     SetTimer(volumeHwnd_, TIMER_VOLUME_REFRESH, 250, nullptr);
     UpdateBackgroundState();
     NotifyWinEvent(EVENT_OBJECT_FOCUS, volumeHwnd_, OBJID_CLIENT, 1);
+    RestartAnimationClock();
   }
 
-  void HideVolumeControl(bool restoreFocus) {
-    if (!volumeVisible_) return;
-    HWND restoreTarget = restoreFocus ? volumeRestoreWindow_ : nullptr;
+  void FinishHideVolumeControl(HWND restoreTarget) {
+    volumeClosing_ = false;
+    pendingVolumeRestore_ = nullptr;
     volumeRestoreWindow_ = nullptr;
     volumeVisible_ = false;
     volumeDragging_ = false;
@@ -4253,23 +5041,51 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (restoreTarget) FocusWindow(restoreTarget);
   }
 
-  void ToggleOverlay() {
-    if (volumeVisible_) HideVolumeControl(true);
-    else if (visible_) HideOverlay(true);
-    else ShowOverlay(View::Search);
+  void HideVolumeControl(bool restoreFocus) {
+    if (!volumeVisible_) return;
+    HWND restoreTarget = restoreFocus ? volumeRestoreWindow_ : nullptr;
+    if (restoreFocus && FadeAnimationsAllowed() && !volumeClosing_) {
+      pendingVolumeRestore_ = restoreTarget;
+      volumeClosing_ = true;
+      volumeOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
+      RequestAnimationFrame();
+      return;
+    }
+    FinishHideVolumeControl(restoreTarget);
   }
 
-  void TriggerShortcutToggle() {
+  void ToggleOverlay(
+      std::optional<ForegroundSnapshot> foregroundSnapshot = std::nullopt) {
+    if (volumeVisible_) HideVolumeControl(true);
+    else if (visible_ && overlayClosing_) {
+      ShowOverlay(View::Search, std::move(foregroundSnapshot));
+    } else if (visible_) {
+      HideOverlay(OverlayCloseReason::ExplicitDismiss);
+    } else {
+      ShowOverlay(View::Search, std::move(foregroundSnapshot));
+    }
+  }
+
+  void TriggerShortcutToggle(
+      std::optional<ForegroundSnapshot> foregroundSnapshot) {
     const ULONGLONG now = GetTickCount64();
     if (now - lastShortcutToggleTick_ < 250) return;
     lastShortcutToggleTick_ = now;
-    ToggleOverlay();
+    ToggleOverlay(std::move(foregroundSnapshot));
   }
 
   void OpenSettings() {
     CancelPointerPress();
     if (volumeVisible_) HideVolumeControl(false);
-    HideOverlay(false);
+    HideOverlay(OverlayCloseReason::Transition);
+    // A successful save is transient feedback for the settings session that
+    // caused it. Do not carry it into a later session, where it would imply
+    // that the user had already changed something after opening Settings.
+    if (settingsStatus_ &&
+        settingsStatus_->severity == StatusSeverity::Success &&
+        settingsStatus_->text == L"All changes saved.") {
+      settingsStatus_.reset();
+    }
     const auto effects = feathercast::ui::SettingsController::Open(
         settingsState_, SettingsCategoryIndex(settingsCategory_));
     shortcutRecorder_.Reset();
@@ -4277,8 +5093,204 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     ExecuteSettingsEffects(effects);
   }
 
+  feathercast::library_ui::ManagerData LibraryManagerData() {
+    feathercast::library_ui::ManagerData data;
+    {
+      std::lock_guard lock(dataMutex_);
+      data.snippets = snippets_;
+      for (const auto& app : apps_) {
+        if (!app.id.empty() && !app.name.empty()) {
+          data.availableApps.push_back({app.id, app.name});
+        }
+      }
+    }
+    data.quicklinks = settings_.quicklinks;
+    for (const auto& [appId, alias] : settings_.appAliases) {
+      const auto app = std::find_if(
+          data.availableApps.begin(), data.availableApps.end(),
+          [&](const auto& choice) { return choice.id == appId; });
+      data.appAliases.push_back(
+          {appId, app == data.availableApps.end() ? L"" : app->name, alias});
+    }
+    for (const auto& [keyword, urlTemplate] : settings_.searchEngines) {
+      data.webSearches.push_back({keyword, urlTemplate});
+    }
+    std::sort(data.availableApps.begin(), data.availableApps.end(),
+              [](const auto& left, const auto& right) {
+                return feathercast::library::NormalizeKeyword(left.name) <
+                       feathercast::library::NormalizeKeyword(right.name);
+              });
+    data.snippetsWritable = snippetsWritable_;
+    data.quicklinksWritable = !settingsPersistenceBlocked_;
+    data.settingsWritable = !settingsPersistenceBlocked_;
+    data.snippetsMessage = snippetsLoadMessage_;
+    if (settingsPersistenceBlocked_) {
+      data.quicklinksMessage =
+          L"settings.json is protected from automatic writes. Quicklink editing is disabled.";
+      data.settingsMessage =
+          L"settings.json is protected from automatic writes. Customization is disabled.";
+    }
+    return data;
+  }
+
+  feathercast::library::OperationResult SaveManagedSnippets(
+      const std::vector<feathercast::snippets::Snippet>& candidate) {
+    if (!snippetsWritable_) {
+      return {false, snippetsLoadMessage_.empty()
+                         ? L"Snippet editing is unavailable."
+                         : snippetsLoadMessage_};
+    }
+    const auto saved = feathercast::snippets_io::Save(
+        SnippetsPath(), candidate, snippetsFingerprint_);
+    if (!saved.succeeded) {
+      snippetsFingerprint_ = saved.fingerprint;
+      snippetsWritable_ = false;
+      snippetsLoadMessage_ = saved.message;
+      return {false, saved.message};
+    }
+    {
+      std::lock_guard lock(dataMutex_);
+      snippets_ = candidate;
+    }
+    snippetsFingerprint_ = saved.fingerprint;
+    snippetsWritable_ = true;
+    snippetsLoadMessage_.clear();
+    MarkSearchDataChanged();
+    RequestSearch();
+    return {true, L"Snippets saved."};
+  }
+
+  feathercast::library::OperationResult SaveManagedQuicklinks(
+      const std::vector<Quicklink>& candidate) {
+    if (settingsPersistenceBlocked_) {
+      return {false,
+              L"settings.json is protected from automatic writes. Quicklink editing is disabled."};
+    }
+    Settings next = settings_;
+    next.quicklinks = candidate;
+    std::wstring error;
+    if (!persistence_.SaveSettingsAndWait(next, &error)) {
+      return {false, error.empty() ? L"Could not save settings.json." : error};
+    }
+    settings_ = std::move(next);
+    MarkSearchDataChanged();
+    RequestSearch();
+    return {true, L"Quicklinks saved."};
+  }
+
+  feathercast::library::OperationResult SaveManagedAppAliases(
+      const std::vector<feathercast::library::AppAlias>& candidate) {
+    if (settingsPersistenceBlocked_) {
+      return {false, L"settings.json is protected from automatic writes."};
+    }
+    Settings next = settings_;
+    next.appAliases.clear();
+    for (std::size_t index = 0; index < candidate.size(); ++index) {
+      const auto& entry = candidate[index];
+      if (const auto error = feathercast::library::ValidateAppAlias(
+              entry, candidate, index)) {
+        return {false, *error};
+      }
+      next.appAliases[entry.appId] = entry.alias;
+    }
+    std::wstring error;
+    if (!persistence_.SaveSettingsAndWait(next, &error)) {
+      return {false, error.empty() ? L"Could not save settings.json." : error};
+    }
+    settings_ = std::move(next);
+    MarkSearchDataChanged();
+    RequestSearch();
+    return {true, L"App aliases saved."};
+  }
+
+  feathercast::library::OperationResult SaveManagedWebSearches(
+      const std::vector<feathercast::library::WebSearch>& candidate) {
+    if (settingsPersistenceBlocked_) {
+      return {false, L"settings.json is protected from automatic writes."};
+    }
+    Settings next = settings_;
+    next.searchEngines.clear();
+    for (std::size_t index = 0; index < candidate.size(); ++index) {
+      if (const auto error = feathercast::library::ValidateWebSearch(
+              candidate[index], candidate, index)) {
+        return {false, *error};
+      }
+      next.searchEngines[feathercast::library::NormalizeKeyword(
+          candidate[index].keyword)] = candidate[index].urlTemplate;
+    }
+    std::wstring error;
+    if (!persistence_.SaveSettingsAndWait(next, &error)) {
+      return {false, error.empty() ? L"Could not save settings.json." : error};
+    }
+    settings_ = std::move(next);
+    RequestSearch();
+    return {true, L"Web searches saved."};
+  }
+
+  feathercast::library::OperationResult RestoreDefaultWebSearches() {
+    std::vector<feathercast::library::WebSearch> defaults;
+    for (const auto& [keyword, urlTemplate] :
+         feathercast::settings::DefaultSearchEngines()) {
+      defaults.push_back({keyword, urlTemplate});
+    }
+    return SaveManagedWebSearches(defaults);
+  }
+
+  feathercast::library_ui::ManagerData ReloadLibraryManagerData() {
+    const auto loaded = feathercast::snippets_io::Load(SnippetsPath());
+    snippetsFingerprint_ = loaded.fingerprint;
+    snippetsWritable_ = loaded.Writable();
+    snippetsLoadMessage_ = loaded.message;
+    if (loaded.Writable()) {
+      {
+        std::lock_guard lock(dataMutex_);
+        snippets_ = loaded.snippets;
+      }
+      MarkSearchDataChanged();
+      RequestSearch();
+    }
+    return LibraryManagerData();
+  }
+
+  void OpenSnippetsFileForLibrary() {
+    EnsureSnippetsFile();
+    ShellExecuteW(nullptr, L"open", SnippetsPath().c_str(), nullptr, nullptr,
+                  SW_SHOWNORMAL);
+  }
+
+  void OpenLibraryManager(feathercast::library::ItemKind initialKind,
+                          std::wstring initialAppId = {}) {
+    feathercast::library_ui::ManagerCallbacks callbacks;
+    callbacks.saveSnippets = [this](const auto& snippets) {
+      return SaveManagedSnippets(snippets);
+    };
+    callbacks.saveQuicklinks = [this](const auto& quicklinks) {
+      return SaveManagedQuicklinks(quicklinks);
+    };
+    callbacks.saveAppAliases = [this](const auto& aliases) {
+      return SaveManagedAppAliases(aliases);
+    };
+    callbacks.saveWebSearches = [this](const auto& searches) {
+      return SaveManagedWebSearches(searches);
+    };
+    callbacks.restoreDefaultWebSearches = [this] {
+      return RestoreDefaultWebSearches();
+    };
+    callbacks.reload = [this] { return ReloadLibraryManagerData(); };
+    callbacks.openSnippetsFile = [this] { OpenSnippetsFileForLibrary(); };
+    HWND owner = settingsHwnd_ && IsWindowVisible(settingsHwnd_)
+                     ? settingsHwnd_
+                     : hwnd_;
+    feathercast::library_ui::ShowLibraryManager(
+        owner, LibraryManagerData(), std::move(callbacks), initialKind,
+        std::move(initialAppId));
+    InvalidateRect(settingsHwnd_, nullptr, FALSE);
+  }
+
   void ShowSettingsWindow() {
     if (!settingsHwnd_) return;
+    EnterInteractiveScheduling();
+    settingsClosing_ = false;
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
@@ -4297,15 +5309,32 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, x, yPos, width, clamped, SWP_NOACTIVATE);
     // Reassert the transparent window treatment now that the window is sized.
     ApplyGlass(settingsHwnd_);
+    settingsCategoryTop_.Snap(
+        kSettTop + static_cast<double>(SettingsCategoryIndex(settingsCategory_)) *
+                       kSettCategoryRow);
+    settingsVisualScroll_.Snap(settingsScroll_);
+    const bool surfaceReady =
+        PrewarmGlassSurface(settingsHwnd_, settingsSurface_);
+    if (surfaceReady) {
+      StartSurfaceOpen(settingsHwnd_, settingsBounds_, settingsOpacity_, false);
+    } else {
+      RECT windowBounds{};
+      GetWindowRect(settingsHwnd_, &windowBounds);
+      SnapWindowBounds(settingsBounds_, windowBounds);
+      settingsOpacity_.Snap(1.0);
+    }
+    RedrawWindow(settingsHwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     ShowWindow(settingsHwnd_, SW_SHOW);
     SetForegroundWindow(settingsHwnd_);
     SetActiveWindow(settingsHwnd_);
     SetFocus(settingsHwnd_);
-    InvalidateRect(settingsHwnd_, nullptr, FALSE);
     UpdateBackgroundState();
+    RestartAnimationClock();
   }
 
-  void HideSettings() {
+  void FinishHideSettings() {
+    settingsClosing_ = false;
     CancelPointerPress(settingsHwnd_);
     const auto effects =
         feathercast::ui::SettingsController::Close(settingsState_);
@@ -4314,8 +5343,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     UpdateBackgroundState();
   }
 
+  void HideSettings(bool animate = true) {
+    if (!settingsHwnd_ || !IsWindowVisible(settingsHwnd_)) return;
+    if (animate && FadeAnimationsAllowed() && !settingsClosing_) {
+      settingsClosing_ = true;
+      CancelPointerPress(settingsHwnd_);
+      settingsOpacity_.Retarget(0.0, kSurfaceCloseSeconds, true);
+      RequestAnimationFrame();
+      return;
+    }
+    FinishHideSettings();
+  }
+
   void EnterActionMode(const DisplayItem& target) {
-    if (target.isCommand || target.isAction || target.isExtension ||
+    if (target.isCommand ||
+        (target.isAction && target.action != ActionKind::ArrangeWindow) ||
+        target.isExtension ||
         target.isRunCommand || target.isWebSearch || target.isCapability) {
       return;
     }
@@ -4368,6 +5411,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::wstring EmptyResultsMessage() const {
     if (SearchPending()) return L"Searching...";
     const bool emptyQuery = Trim(query_).empty();
+    const auto scopedQuery = feathercast::search_scope::Parse(query_);
     if (browseView_ == BrowseView::Clipboard) {
       if (!settings_.clipboardHistoryEnabled) return L"Clipboard history is turned off";
       return emptyQuery ? L"Clipboard history is empty"
@@ -4382,6 +5426,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     if (actionMode_) {
       return emptyQuery ? L"No actions available" : L"No matching actions";
+    }
+    if (scopedQuery.scope == feathercast::search_scope::Scope::Files) {
+      if (!settings_.fileIndexEnabled) {
+        return L"File indexing is turned off in Privacy settings";
+      }
+      return scopedQuery.terms.empty() ? L"No indexed files in the selected folders"
+                                       : L"No matching indexed files";
     }
     if (!appsReady_.load(std::memory_order_acquire)) return L"Loading apps...";
     return emptyQuery ? L"No items available"
@@ -4554,8 +5605,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const int currentWidth = rc.right - rc.left;
     const int currentHeight = rc.bottom - rc.top;
     if (currentWidth != width || currentHeight != height) {
-      SetWindowPos(hwnd_, HWND_TOPMOST, rc.left, rc.top, width, height, SWP_NOACTIVATE | SWP_NOMOVE);
-      ApplyRoundedRegion(width, height);
+      if (IsWindowVisible(hwnd_) && SpatialAnimationsAllowed()) {
+        if (!overlayBounds_.Active()) SnapWindowBounds(overlayBounds_, rc);
+        overlayBounds_.Retarget(rc.left, rc.top, width, height,
+                                kOverlayResizeSeconds, true);
+        RequestAnimationFrame();
+      } else {
+        SetWindowPos(hwnd_, HWND_TOPMOST, rc.left, rc.top, width, height,
+                     SWP_NOACTIVATE | SWP_NOMOVE);
+        RECT applied{};
+        GetWindowRect(hwnd_, &applied);
+        SnapWindowBounds(overlayBounds_, applied);
+        ApplyRoundedRegion(width, height);
+      }
     }
   }
 
@@ -4565,11 +5627,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return now.QuadPart;
   }
 
-  double QpcElapsedMs(LONGLONG startQpc) const {
-    if (!qpcFrequency_.QuadPart || !startQpc) return 0.0;
-    return static_cast<double>(NowQpc() - startQpc) * 1000.0 / static_cast<double>(qpcFrequency_.QuadPart);
-  }
-
   enum class SelectionMotion {
     Keyboard,
     Hover,
@@ -4577,6 +5634,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   static constexpr double kSelectionHoverSettleSeconds = 0.055;
   static constexpr double kSelectionKeyboardSettleSeconds = 0.090;
+  static constexpr double kSurfaceOpenSeconds = 0.150;
+  static constexpr double kSurfaceCloseSeconds = 0.090;
+  static constexpr double kOverlayResizeSeconds = 0.140;
+  static constexpr double kSettingsResizeSeconds = 0.160;
+  static constexpr double kOverlayScrollSeconds = 0.085;
+  static constexpr double kSettingsScrollSeconds = 0.090;
+  static constexpr double kResultTransitionSeconds = 0.110;
 
   double ConsumeAnimationDeltaSeconds() {
     if (!qpcFrequency_.QuadPart) return 0.0;
@@ -4590,26 +5654,174 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return std::clamp(dt, 0.0, 0.05);
   }
 
-  double ConsumeSelectionDeltaSeconds() {
-    if (!qpcFrequency_.QuadPart) return 0.0;
-    const LONGLONG now = NowQpc();
-    if (!lastSelectionFrameQpc_) {
-      lastSelectionFrameQpc_ = now;
-      return 0.0;
+  void SnapWindowBounds(feathercast::motion::AnimatedBounds& bounds,
+                        const RECT& rect) {
+    bounds.Snap(rect.left, rect.top, rect.right - rect.left,
+                rect.bottom - rect.top);
+  }
+
+  void ApplyAnimatedBounds(HWND hwnd,
+                           feathercast::motion::AnimatedBounds& bounds) {
+    if (!hwnd) return;
+    SetWindowPos(
+        hwnd, nullptr,
+        static_cast<int>(std::lround(bounds.left.Value())),
+        static_cast<int>(std::lround(bounds.top.Value())),
+        std::max(1, static_cast<int>(std::lround(bounds.width.Value()))),
+        std::max(1, static_cast<int>(std::lround(bounds.height.Value()))),
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    if (surfaceResizeFailed_) {
+      surfaceResizeFailed_ = false;
+      bounds.Snap(bounds.left.Target(), bounds.top.Target(),
+                  bounds.width.Target(), bounds.height.Target());
+      SetWindowPos(
+          hwnd, nullptr,
+          static_cast<int>(std::lround(bounds.left.Value())),
+          static_cast<int>(std::lround(bounds.top.Value())),
+          std::max(1, static_cast<int>(std::lround(bounds.width.Value()))),
+          std::max(1, static_cast<int>(std::lround(bounds.height.Value()))),
+          SWP_NOZORDER | SWP_NOACTIVATE);
     }
-    const double dt = static_cast<double>(now - lastSelectionFrameQpc_) / static_cast<double>(qpcFrequency_.QuadPart);
-    lastSelectionFrameQpc_ = now;
-    return std::clamp(dt, 0.0, 0.05);
+  }
+
+  void StartSurfaceOpen(HWND hwnd,
+                        feathercast::motion::AnimatedBounds& bounds,
+                        feathercast::motion::ScalarAnimation& opacity,
+                        bool topAnchored) {
+    if (!hwnd) return;
+    RECT target{};
+    GetWindowRect(hwnd, &target);
+    if (!FadeAnimationsAllowed() && !SpatialAnimationsAllowed()) {
+      SnapWindowBounds(bounds, target);
+      opacity.Snap(1.0);
+      return;
+    }
+
+    const double targetWidth = target.right - target.left;
+    const double targetHeight = target.bottom - target.top;
+    if (SpatialAnimationsAllowed()) {
+      const auto initial = feathercast::motion::OpeningBounds(
+          {static_cast<double>(target.left), static_cast<double>(target.top),
+           targetWidth, targetHeight},
+          0.98, topAnchored);
+      bounds.Snap(initial.left, initial.top, initial.width, initial.height);
+      SetWindowPos(hwnd, nullptr, static_cast<int>(std::lround(initial.left)),
+                   static_cast<int>(std::lround(initial.top)),
+                   static_cast<int>(std::lround(initial.width)),
+                   static_cast<int>(std::lround(initial.height)),
+                   SWP_NOZORDER | SWP_NOACTIVATE);
+      bounds.Retarget(target.left, target.top, targetWidth, targetHeight,
+                      kSurfaceOpenSeconds, true);
+    } else {
+      SnapWindowBounds(bounds, target);
+    }
+    if (FadeAnimationsAllowed()) {
+      opacity.Snap(0.0);
+      opacity.Retarget(1.0, kSurfaceOpenSeconds, true);
+    } else {
+      opacity.Snap(1.0);
+    }
+    RequestAnimationFrame();
+  }
+
+  void RetargetOverlayScroll(bool animate = true) {
+    overlayVisualScroll_.Retarget(
+        static_cast<double>(scroll_), kOverlayScrollSeconds,
+        animate && SpatialAnimationsAllowed());
+    if (overlayVisualScroll_.Active()) RequestAnimationFrame();
+  }
+
+  void RetargetSettingsScroll(bool animate = true) {
+    settingsVisualScroll_.Retarget(
+        static_cast<double>(settingsScroll_), kSettingsScrollSeconds,
+        animate && SpatialAnimationsAllowed());
+    if (settingsVisualScroll_.Active()) RequestAnimationFrame();
+  }
+
+  void SnapSpatialMotionToTargets() {
+    auto snap = [](feathercast::motion::ScalarAnimation& animation) {
+      animation.Snap(animation.Target());
+    };
+    snap(overlayVisualScroll_);
+    snap(settingsVisualScroll_);
+    snap(settingsCategoryTop_);
+    snap(volumeVisualPercent_);
+    for (auto& [_, element] : resultRowMotion_) {
+      snap(element.offsetY);
+    }
+    for (auto& [_, element] : resultHeaderMotion_) {
+      snap(element.offsetY);
+    }
+    overlayBounds_.Snap(overlayBounds_.left.Target(),
+                        overlayBounds_.top.Target(),
+                        overlayBounds_.width.Target(),
+                        overlayBounds_.height.Target());
+    settingsBounds_.Snap(settingsBounds_.left.Target(),
+                         settingsBounds_.top.Target(),
+                         settingsBounds_.width.Target(),
+                         settingsBounds_.height.Target());
+    volumeBounds_.Snap(volumeBounds_.left.Target(), volumeBounds_.top.Target(),
+                       volumeBounds_.width.Target(),
+                       volumeBounds_.height.Target());
+    auto applySnapped = [](HWND hwnd,
+                           const feathercast::motion::AnimatedBounds& bounds) {
+      if (!hwnd || !IsWindowVisible(hwnd) || bounds.width.Value() <= 0.0 ||
+          bounds.height.Value() <= 0.0) {
+        return;
+      }
+      SetWindowPos(
+          hwnd, nullptr, static_cast<int>(std::lround(bounds.left.Value())),
+          static_cast<int>(std::lround(bounds.top.Value())),
+          static_cast<int>(std::lround(bounds.width.Value())),
+          static_cast<int>(std::lround(bounds.height.Value())),
+          SWP_NOZORDER | SWP_NOACTIVATE);
+    };
+    applySnapped(hwnd_, overlayBounds_);
+    applySnapped(settingsHwnd_, settingsBounds_);
+    applySnapped(volumeHwnd_, volumeBounds_);
+    if (animatingSelection_) SyncSelectionAnimationToTarget();
+  }
+
+  void SnapAllMotionToTargets() {
+    auto snap = [](feathercast::motion::ScalarAnimation& animation) {
+      animation.Snap(animation.Target());
+    };
+    SnapSpatialMotionToTargets();
+    snap(overlayOpacity_);
+    snap(settingsOpacity_);
+    snap(volumeOpacity_);
+    snap(confirmationProgress_);
+    snap(pendingResultsOpacity_);
+    snap(settingsPageProgress_);
+    for (auto& [_, animation] : switchAnimations_) snap(animation);
+    for (auto& [_, element] : resultRowMotion_) snap(element.opacity);
+    for (auto& [_, element] : resultHeaderMotion_) snap(element.opacity);
+    animating_ = false;
+    overlayRevealTimeline_.Reset();
+    if (confirmationClosing_) FinishCancelConfirmation();
+    if (overlayClosing_ && pendingOverlayClose_) {
+      FinishHideOverlay(*pendingOverlayClose_);
+    }
+    if (settingsClosing_) FinishHideSettings();
+    if (volumeClosing_) FinishHideVolumeControl(pendingVolumeRestore_);
   }
 
   std::optional<float> SelectedRowTop() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(flatItems_.size())) return std::nullopt;
-    float y = kResultsTop - static_cast<float>(scroll_);
+    float y = kResultsTop -
+              static_cast<float>(overlayVisualScroll_.Value());
     int row = 0;
     for (const auto& section : sections_) {
       y += kSectionHeaderHeight;
       for (size_t i = 0; i < section.items.size(); ++i) {
-        if (row == selected_) return y;
+        if (row == selected_) {
+          if (const auto motion =
+                  resultRowMotion_.find(section.items[i].Key());
+              motion != resultRowMotion_.end()) {
+            y += static_cast<float>(motion->second.offsetY.Value());
+          }
+          return y;
+        }
         y += kResultRowStride;
         ++row;
       }
@@ -4626,7 +5838,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void StartSelectionAnimationFrom(std::optional<float> previousY, int previousScroll, SelectionMotion motion) {
     const auto targetY = SelectedRowTop();
-    if (!AnimationsAllowed() || !previousY || !targetY) {
+    if (!SpatialAnimationsAllowed() || !previousY || !targetY) {
       SyncSelectionAnimationToTarget();
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
       return;
@@ -4634,7 +5846,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     selectionSettleSeconds_ = motion == SelectionMotion::Hover ? kSelectionHoverSettleSeconds : kSelectionKeyboardSettleSeconds;
     if (!animatingSelection_ || visualSelectedY_ < 0.0f) {
       visualSelectedY_ = *previousY - static_cast<float>(scroll_ - previousScroll);
-      lastSelectionFrameQpc_ = NowQpc();
     }
     animatingSelection_ = true;
     StartSelectionAnimationTimer();
@@ -4672,11 +5883,80 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
     NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd_, OBJID_CLIENT, selected_ + 2);
+    ScheduleSelectedPreview();
+  }
+
+  bool SelectedFilePath(std::filesystem::path* path = nullptr) const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(flatItems_.size())) {
+      return false;
+    }
+    const auto& item = flatItems_[static_cast<std::size_t>(selected_)];
+    if (item.isWindow || item.isCommand || item.isAction ||
+        item.app.source != L"file" || item.app.path.empty()) {
+      return false;
+    }
+    if (path) *path = item.app.path;
+    return true;
+  }
+
+  void ClosePreview() {
+    previewOpen_ = false;
+    ++previewGeneration_;
+    previewService_.Invalidate(previewGeneration_);
+    previewResult_.reset();
+    previewBitmap_.Reset();
+    previewScroll_ = 0.0f;
+    KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
+    ApplyWindowSize();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void TogglePreview() {
+    if (previewOpen_) {
+      ClosePreview();
+      return;
+    }
+    if (!SelectedFilePath()) {
+      SetOverlayStatus(StatusSeverity::Info,
+                       L"Select an indexed file or folder to preview.");
+      return;
+    }
+    previewOpen_ = true;
+    previewResult_.reset();
+    previewBitmap_.Reset();
+    ApplyWindowSize();
+    ScheduleSelectedPreview();
+  }
+
+  void ScheduleSelectedPreview() {
+    if (!previewOpen_) return;
+    previewResult_.reset();
+    previewBitmap_.Reset();
+    KillTimer(hwnd_, TIMER_PREVIEW_LOAD);
+    SetTimer(hwnd_, TIMER_PREVIEW_LOAD, 120, nullptr);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void LoadSelectedPreview() {
+    if (!previewOpen_) return;
+    std::filesystem::path path;
+    if (!SelectedFilePath(&path)) {
+      previewResult_.reset();
+      previewBitmap_.Reset();
+      return;
+    }
+    feathercast::preview::Request request;
+    request.generation = ++previewGeneration_;
+    request.path = std::move(path);
+    request.terms = feathercast::search_scope::Parse(query_).terms;
+    if (!previewService_.Load(std::move(request))) {
+      ReportBackgroundFailure(L"The preview worker is unavailable.");
+    }
   }
 
   void UpdateSelectionAnimation(double deltaTime) {
     const auto targetY = SelectedRowTop();
-    if (!AnimationsAllowed() || !targetY) {
+    if (!SpatialAnimationsAllowed() || !targetY) {
       SyncSelectionAnimationToTarget();
       return;
     }
@@ -4699,67 +5979,158 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool HasRevealAnimation() const {
-    return visible_ && AnimationsAllowed() && animating_;
+    return visible_ && FadeAnimationsAllowed() && animating_;
+  }
+
+  template <typename ElementMap>
+  bool HasElementMotion(const ElementMap& elements) const {
+    return std::any_of(elements.begin(), elements.end(), [](const auto& entry) {
+      return entry.second.offsetY.Active() || entry.second.opacity.Active();
+    });
+  }
+
+  bool HasActiveMotion() const {
+    const bool switchMotion =
+        std::any_of(switchAnimations_.begin(), switchAnimations_.end(),
+                    [](const auto& entry) { return entry.second.Active(); });
+    return HasRevealAnimation() || animatingSelection_ ||
+           overlayOpacity_.Active() || settingsOpacity_.Active() ||
+           volumeOpacity_.Active() || confirmationProgress_.Active() ||
+           pendingResultsOpacity_.Active() || overlayVisualScroll_.Active() ||
+           settingsVisualScroll_.Active() || settingsPageProgress_.Active() ||
+           settingsCategoryTop_.Active() || volumeVisualPercent_.Active() ||
+           overlayBounds_.Active() || settingsBounds_.Active() ||
+           volumeBounds_.Active() || HasElementMotion(resultRowMotion_) ||
+           HasElementMotion(resultHeaderMotion_) || switchMotion;
   }
 
   void RequestAnimationFrame() {
-    if (!hwnd_ || animationFrameQueued_ || !HasRevealAnimation()) return;
+    if (!hwnd_ || animationFrameQueued_ || !HasActiveMotion()) return;
+    if (!animationLoopRunning_) {
+      lastAnimationFrameQpc_ = NowQpc();
+      animationLoopRunning_ = true;
+    }
     animationFrameQueued_ = PostMessageW(hwnd_, WM_ANIMATION_FRAME, 0, 0) != FALSE;
+  }
+
+  void RestartAnimationClock() {
+    if (!HasActiveMotion()) return;
+    lastAnimationFrameQpc_ = NowQpc();
+    animationLoopRunning_ = true;
+    RequestAnimationFrame();
   }
 
   void OnAnimationFrame() {
     animationFrameQueued_ = false;
-    if (!HasRevealAnimation()) return;
+    if (!HasActiveMotion()) {
+      animationLoopRunning_ = false;
+      return;
+    }
 
     const double deltaTime = ConsumeAnimationDeltaSeconds();
     if (animatingSelection_) UpdateSelectionAnimation(deltaTime);
-    if (QpcElapsedMs(animStartQpc_) >= AnimFinishMs()) {
-      // End the reveal before drawing its final frame. This must live outside
-      // DrawSearch because compact mode can return early after the search bar;
-      // leaving animating_ set there would keep the DWM frame loop alive forever.
-      animating_ = false;
+    if (animating_) {
+      overlayRevealTimeline_.Update(deltaTime);
+      if (!overlayRevealTimeline_.Active()) animating_ = false;
+    }
+    overlayOpacity_.Update(deltaTime);
+    settingsOpacity_.Update(deltaTime);
+    volumeOpacity_.Update(deltaTime);
+    confirmationProgress_.Update(deltaTime);
+    pendingResultsOpacity_.Update(deltaTime);
+    overlayVisualScroll_.Update(deltaTime);
+    settingsVisualScroll_.Update(deltaTime);
+    settingsPageProgress_.Update(deltaTime);
+    settingsCategoryTop_.Update(deltaTime);
+    volumeVisualPercent_.Update(deltaTime);
+    const bool overlayBoundsChanged = overlayBounds_.Active();
+    const bool settingsBoundsChanged = settingsBounds_.Active();
+    const bool volumeBoundsChanged = volumeBounds_.Active();
+    overlayBounds_.Update(deltaTime);
+    settingsBounds_.Update(deltaTime);
+    volumeBounds_.Update(deltaTime);
+    for (auto& [_, motion] : resultRowMotion_) {
+      motion.offsetY.Update(deltaTime);
+      motion.opacity.Update(deltaTime);
+    }
+    for (auto& [_, motion] : resultHeaderMotion_) {
+      motion.offsetY.Update(deltaTime);
+      motion.opacity.Update(deltaTime);
+    }
+    for (auto& [_, animation] : switchAnimations_) {
+      animation.Update(deltaTime);
     }
 
-    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    if (overlayBoundsChanged) ApplyAnimatedBounds(hwnd_, overlayBounds_);
+    if (settingsBoundsChanged) {
+      ApplyAnimatedBounds(settingsHwnd_, settingsBounds_);
+    }
+    if (volumeBoundsChanged) ApplyAnimatedBounds(volumeHwnd_, volumeBounds_);
 
-    if (HasRevealAnimation()) {
+    if (confirmationClosing_ && !confirmationProgress_.Active() &&
+        confirmationProgress_.Value() <= 0.001) {
+      FinishCancelConfirmation();
+    }
+    if (overlayClosing_ && pendingOverlayClose_ &&
+        !overlayOpacity_.Active() && overlayOpacity_.Value() <= 0.001) {
+      FinishHideOverlay(*pendingOverlayClose_);
+    }
+    if (settingsClosing_ && !settingsOpacity_.Active() &&
+        settingsOpacity_.Value() <= 0.001) {
+      FinishHideSettings();
+    }
+    if (volumeClosing_ && !volumeOpacity_.Active() &&
+        volumeOpacity_.Value() <= 0.001) {
+      FinishHideVolumeControl(pendingVolumeRestore_);
+    }
+
+    if (visible_) {
+      RedrawWindow(hwnd_, nullptr, nullptr,
+                   RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+    if (settingsHwnd_ && IsWindowVisible(settingsHwnd_)) {
+      RedrawWindow(settingsHwnd_, nullptr, nullptr,
+                   RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+    if (volumeVisible_) {
+      RedrawWindow(volumeHwnd_, nullptr, nullptr,
+                   RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+
+    if (HasActiveMotion()) {
+      // Wait until DWM has consumed this frame before queueing another one.
+      // This keeps the self-posted animation loop display-paced even when the
+      // process has just returned from reduced background priority.
       DwmFlush();
       RequestAnimationFrame();
-    } else if (animatingSelection_) {
-      StartSelectionAnimationTimer();
+    } else {
+      animationLoopRunning_ = false;
     }
   }
 
   void StartSelectionAnimationTimer() {
-    if (!hwnd_ || selectionTimerActive_ || !visible_ || !AnimationsAllowed() || !animatingSelection_) return;
-    selectionTimerActive_ = SetTimer(hwnd_, TIMER_SELECTION_ANIM, 8, nullptr) != 0;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    if (!hwnd_ || !visible_ || !SpatialAnimationsAllowed() ||
+        !animatingSelection_) {
+      return;
+    }
+    RequestAnimationFrame();
   }
 
   void StopSelectionAnimationTimer() {
-    if (!selectionTimerActive_ || !hwnd_) {
-      selectionTimerActive_ = false;
-      lastSelectionFrameQpc_ = 0;
-      return;
-    }
-    KillTimer(hwnd_, TIMER_SELECTION_ANIM);
-    selectionTimerActive_ = false;
-    lastSelectionFrameQpc_ = 0;
-  }
-
-  void OnSelectionAnimationTimer() {
-    if (!visible_ || !AnimationsAllowed() || !animatingSelection_) {
-      StopSelectionAnimationTimer();
-      return;
-    }
-
-    UpdateSelectionAnimation(ConsumeSelectionDeltaSeconds());
-    InvalidateRect(hwnd_, nullptr, FALSE);
-    if (!animatingSelection_) StopSelectionAnimationTimer();
+    animatingSelection_ = false;
   }
 
   int OverlayWidth() const {
-    return std::clamp(settings_.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH);
+    const int base = std::clamp(settings_.overlayWidth, MIN_OVERLAY_WIDTH,
+                                MAX_OVERLAY_WIDTH);
+    if (!previewOpen_) return base;
+    const MONITORINFO monitor = OverlayMonitorInfo();
+    HMONITOR handle = overlayMonitor_;
+    if (!handle) handle = ResolveOverlayMonitor(GetForegroundWindow());
+    const float scale = GetMonitorScale(handle);
+    const int available = static_cast<int>(
+        (monitor.rcWork.right - monitor.rcWork.left) / scale) - 32;
+    return std::max(base, std::min(base + 420, available));
   }
 
   // Visible corners are drawn by Direct2D. This only ensures no stale Win32 region is
@@ -4781,10 +6152,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void Paint() {
     PAINTSTRUCT ps{};
     BeginPaint(hwnd_, &ps);
-    if (CreateGlassSurface(overlaySurface_, hwnd_)) {
+    if (EnsureRenderResources() && CreateGlassSurface(overlaySurface_, hwnd_)) {
       ID2D1DeviceContext* dc = overlaySurface_.dc.Get();
       SetActiveTarget(dc);
+      const HRESULT brushes = EnsureBrushResources();
+      if (FAILED(brushes)) {
+        activeRT_ = nullptr;
+        activeDC_.Reset();
+        ScheduleRenderRecovery(L"overlay-brushes", brushes);
+        EndPaint(hwnd_, &ps);
+        return;
+      }
       const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
+        const float surfaceOpacity = static_cast<float>(
+            std::clamp(overlayOpacity_.Value(), 0.0, 1.0));
+        const bool opacityLayer = surfaceOpacity < 0.999f;
+        if (opacityLayer) {
+          dc->PushLayer(
+              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    D2D1::IdentityMatrix(), surfaceOpacity),
+              nullptr);
+        }
         hits_.clear();
         RECT rc{};
         GetClientRect(hwnd_, &rc);
@@ -4800,13 +6189,19 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           DrawConfirmationDialog();
         }
         DrawPressedState(hwnd_);
+        if (opacityLayer) dc->PopLayer();
       });
       activeRT_ = nullptr;
       activeDC_.Reset();
-      if (frame.recreateTarget) {
-        DiscardGlassDevice();
+      if (FAILED(lastBrushFailure_)) {
+        ScheduleRenderRecovery(L"overlay-brush-create", lastBrushFailure_);
+      } else if (FAILED(frame.result)) {
+        ScheduleRenderRecovery(L"overlay-end-draw", frame.result);
       } else {
-        overlaySurface_.swapChain->Present(1, 0);
+        const HRESULT present = overlaySurface_.swapChain->Present(1, 0);
+        if (FAILED(present)) {
+          ScheduleRenderRecovery(L"overlay-present", present);
+        }
       }
     }
     EndPaint(hwnd_, &ps);
@@ -4815,20 +6210,45 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void PaintSettings() {
     PAINTSTRUCT ps{};
     BeginPaint(settingsHwnd_, &ps);
-    if (CreateGlassSurface(settingsSurface_, settingsHwnd_)) {
+    if (EnsureRenderResources() &&
+        CreateGlassSurface(settingsSurface_, settingsHwnd_)) {
       ID2D1DeviceContext* dc = settingsSurface_.dc.Get();
       SetActiveTarget(dc);
+      const HRESULT brushes = EnsureBrushResources();
+      if (FAILED(brushes)) {
+        activeRT_ = nullptr;
+        activeDC_.Reset();
+        ScheduleRenderRecovery(L"settings-brushes", brushes);
+        EndPaint(settingsHwnd_, &ps);
+        return;
+      }
       const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
+        const float surfaceOpacity = static_cast<float>(
+            std::clamp(settingsOpacity_.Value(), 0.0, 1.0));
+        const bool opacityLayer = surfaceOpacity < 0.999f;
+        if (opacityLayer) {
+          dc->PushLayer(
+              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    D2D1::IdentityMatrix(), surfaceOpacity),
+              nullptr);
+        }
         hits_.clear();
         DrawSettings();
         DrawPressedState(settingsHwnd_);
+        if (opacityLayer) dc->PopLayer();
       });
       activeRT_ = nullptr;
       activeDC_.Reset();
-      if (frame.recreateTarget) {
-        DiscardGlassDevice();
+      if (FAILED(lastBrushFailure_)) {
+        ScheduleRenderRecovery(L"settings-brush-create", lastBrushFailure_);
+      } else if (FAILED(frame.result)) {
+        ScheduleRenderRecovery(L"settings-end-draw", frame.result);
       } else {
-        settingsSurface_.swapChain->Present(1, 0);
+        const HRESULT present = settingsSurface_.swapChain->Present(1, 0);
+        if (FAILED(present)) {
+          ScheduleRenderRecovery(L"settings-present", present);
+        }
       }
     }
     EndPaint(settingsHwnd_, &ps);
@@ -4837,10 +6257,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void PaintVolumeControl() {
     PAINTSTRUCT paint{};
     BeginPaint(volumeHwnd_, &paint);
-    if (CreateGlassSurface(volumeSurface_, volumeHwnd_)) {
+    if (EnsureRenderResources() &&
+        CreateGlassSurface(volumeSurface_, volumeHwnd_)) {
       ID2D1DeviceContext* dc = volumeSurface_.dc.Get();
       SetActiveTarget(dc);
+      const HRESULT brushes = EnsureBrushResources();
+      if (FAILED(brushes)) {
+        activeRT_ = nullptr;
+        activeDC_.Reset();
+        ScheduleRenderRecovery(L"volume-brushes", brushes);
+        EndPaint(volumeHwnd_, &paint);
+        return;
+      }
       const auto frame = feathercast::ui::RenderTransparentFrame(dc, [&] {
+        const float surfaceOpacity = static_cast<float>(
+            std::clamp(volumeOpacity_.Value(), 0.0, 1.0));
+        const bool opacityLayer = surfaceOpacity < 0.999f;
+        if (opacityLayer) {
+          dc->PushLayer(
+              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    D2D1::IdentityMatrix(), surfaceOpacity),
+              nullptr);
+        }
         RECT client{};
         GetClientRect(volumeHwnd_, &client);
         const float scale = GetWindowScale(volumeHwnd_);
@@ -4851,13 +6290,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
         DrawTextBlock(L"Volume Control", {24.0f, 18.0f, width - 150.0f, 46.0f},
                       titleFormat_.Get(), D2DColor(theme_.textPrimary));
-        DrawTextBlock(std::to_wstring(volumePercent_) + L"%",
+        const double visualPercent =
+            std::clamp(volumeVisualPercent_.Value(), 0.0, 100.0);
+        DrawTextBlock(std::to_wstring(static_cast<int>(std::lround(visualPercent))) + L"%",
                       {width - 145.0f, 10.0f, width - 24.0f, 52.0f},
                       volumeValueFormat_.Get(), D2DColor(theme_.textPrimary));
 
         const RectF track = VolumeTrackRect(width);
         FillRound(track, 6.0f, D2DColor(theme_.surface));
-        const float progress = static_cast<float>(volumePercent_) / 100.0f;
+        const float progress = static_cast<float>(visualPercent / 100.0);
         const float knobX = track.left + (track.right - track.left) * progress;
         if (knobX > track.left) {
           FillRound({track.left, track.top, knobX, track.bottom}, 6.0f,
@@ -4879,15 +6320,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                             : L"Arrow keys 1%  |  Page Up/Down 10%  |  Home/End",
                       {24.0f, 122.0f, width - 24.0f, height - 18.0f},
                       bodyFormat_.Get(),
-                      error ? D2DColor(theme_.danger)
-                            : D2DColor(theme_.textMuted));
+                       error ? D2DColor(theme_.danger)
+                             : D2DColor(theme_.textMuted));
+        if (opacityLayer) dc->PopLayer();
       });
       activeRT_ = nullptr;
       activeDC_.Reset();
-      if (frame.recreateTarget) {
-        DiscardGlassDevice();
+      if (FAILED(lastBrushFailure_)) {
+        ScheduleRenderRecovery(L"volume-brush-create", lastBrushFailure_);
+      } else if (FAILED(frame.result)) {
+        ScheduleRenderRecovery(L"volume-end-draw", frame.result);
       } else {
-        volumeSurface_.swapChain->Present(1, 0);
+        const HRESULT present = volumeSurface_.swapChain->Present(1, 0);
+        if (FAILED(present)) {
+          ScheduleRenderRecovery(L"volume-present", present);
+        }
       }
     }
     EndPaint(volumeHwnd_, &paint);
@@ -4903,12 +6350,50 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   // Reuse solid-color brushes across draw calls. Brushes are device-bound, so the
   // cache is keyed by the active render target as well as the color.
+  HRESULT EnsureBrushResources() {
+    lastBrushFailure_ = S_OK;
+    if (!activeRT_) return E_POINTER;
+    const std::array<D2D1_COLOR_F, 14> required = {
+        D2DColor(theme_.overlayBackground),
+        D2DColor(theme_.settingsBackground),
+        D2DColor(theme_.surface),
+        D2DColor(theme_.surfaceHover),
+        D2DColor(theme_.selectedBase),
+        D2DColor(theme_.iconTile),
+        D2DColor(theme_.border),
+        D2DColor(theme_.divider),
+        D2DColor(theme_.textPrimary),
+        D2DColor(theme_.textMuted),
+        D2DColor(theme_.textDim),
+        D2DColor(theme_.sectionText),
+        D2DColor(ActiveAccent()),
+        D2DColor(theme_.danger),
+    };
+    auto& byColor = brushCache_[activeRT_];
+    for (const auto color : required) {
+      const uint32_t key = ColorKey(color);
+      if (byColor.contains(key)) continue;
+      ComPtr<ID2D1SolidColorBrush> brush;
+      const HRESULT result =
+          activeRT_->CreateSolidColorBrush(color, brush.GetAddressOf());
+      if (FAILED(result)) return result;
+      byColor.emplace(key, std::move(brush));
+    }
+    return S_OK;
+  }
+
   ComPtr<ID2D1SolidColorBrush> Brush(D2D1_COLOR_F color) {
+    if (!activeRT_) return nullptr;
     auto& byColor = brushCache_[activeRT_];
     const uint32_t key = ColorKey(color);
     if (auto it = byColor.find(key); it != byColor.end()) return it->second;
     ComPtr<ID2D1SolidColorBrush> brush;
-    activeRT_->CreateSolidColorBrush(color, brush.GetAddressOf());
+    const HRESULT result =
+        activeRT_->CreateSolidColorBrush(color, brush.GetAddressOf());
+    if (FAILED(result)) {
+      lastBrushFailure_ = result;
+      return byColor.empty() ? nullptr : byColor.begin()->second;
+    }
     if (brush) byColor.emplace(key, brush);
     return brush;
   }
@@ -5501,6 +6986,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         line(12.0f, 4.0f, 10.5f, 2.5f);
         line(12.0f, 4.0f, 10.5f, 5.5f);
         break;
+      case ResultIcon::Edit:
+        line(3.0f, 13.0f, 5.2f, 8.2f);
+        line(5.2f, 8.2f, 11.8f, 1.6f);
+        line(11.8f, 1.6f, 14.4f, 4.2f);
+        line(14.4f, 4.2f, 7.8f, 10.8f);
+        line(7.8f, 10.8f, 3.0f, 13.0f);
+        break;
     }
   }
 
@@ -5549,6 +7041,65 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     caretMeasureWidth_ = width;
     caretOffset_ = offset;
     return offset;
+  }
+
+  void DrawPreviewPane(RectF rect) {
+    FillRound(rect, 8.0f, D2DColor(theme_.surface));
+    StrokeRound(rect, 8.0f, D2DColor(theme_.border));
+    const float left = rect.left + 18.0f;
+    const float right = rect.right - 18.0f;
+    if (!previewResult_) {
+      DrawTextBlock(L"Loading preview...",
+                    {left, rect.top + 22.0f, right, rect.top + 52.0f},
+                    bodyFormat_.Get(), D2DColor(theme_.textMuted));
+      return;
+    }
+    const auto& preview = *previewResult_;
+    DrawTextBlock(preview.title,
+                  {left, rect.top + 16.0f, right, rect.top + 44.0f},
+                  titleFormat_.Get(), D2DColor(theme_.textPrimary));
+    DrawTextBlock(preview.detail,
+                  {left, rect.top + 48.0f, right, rect.top + 112.0f},
+                  subFormat_.Get(),
+                  preview.kind == feathercast::preview::Kind::Error
+                      ? D2DColor(theme_.danger)
+                      : D2DColor(theme_.textMuted));
+    const float contentTop = rect.top + 120.0f;
+    if (preview.kind == feathercast::preview::Kind::Text) {
+      activeRT_->PushAxisAlignedClip(
+          D2D1::RectF(left, contentTop, right, rect.bottom - 16.0f),
+          D2D1_ANTIALIAS_MODE_ALIASED);
+      DrawTextBlock(preview.text,
+                    {left, contentTop - previewScroll_, right,
+                     contentTop - previewScroll_ + 4096.0f},
+                    bodyFormat_.Get(), D2DColor(theme_.textPrimary));
+      activeRT_->PopAxisAlignedClip();
+    } else if (preview.kind == feathercast::preview::Kind::Image &&
+               !preview.pixels.empty()) {
+      if (!previewBitmap_) {
+        const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_PREMULTIPLIED));
+        activeRT_->CreateBitmap(
+            D2D1::SizeU(preview.width, preview.height), preview.pixels.data(),
+            preview.stride, properties, previewBitmap_.GetAddressOf());
+      }
+      if (previewBitmap_) {
+        const float availableWidth = right - left;
+        const float availableHeight = rect.bottom - contentTop - 16.0f;
+        const float scale = std::min(
+            availableWidth / static_cast<float>(preview.width),
+            availableHeight / static_cast<float>(preview.height));
+        const float drawWidth = preview.width * scale;
+        const float drawHeight = preview.height * scale;
+        const float x = left + (availableWidth - drawWidth) / 2.0f;
+        const float y = contentTop + (availableHeight - drawHeight) / 2.0f;
+        activeRT_->DrawBitmap(
+            previewBitmap_.Get(),
+            D2D1::RectF(x, y, x + drawWidth, y + drawHeight), 1.0f,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+      }
+    }
   }
 
   void DrawSearch(bool drawBackground) {
@@ -5622,46 +7173,94 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float footerHeight = showFooter ? 40.0f : 0.0f;
     const float resultsTop = kResultsTop;
     const float resultsBottom = height - footerHeight;
-    const DisplayItem* detailItem = SelectedMarkdownDetailItem();
-    const float detailWidth = detailItem ? MarkdownDetailWidth(width) : 0.0f;
+    const int baseOverlayWidth = std::clamp(settings_.overlayWidth,
+                                            MIN_OVERLAY_WIDTH,
+                                            MAX_OVERLAY_WIDTH);
+    const bool previewSideBySide =
+        previewOpen_ && width >= static_cast<float>(baseOverlayWidth + 340);
+    const DisplayItem* detailItem = previewOpen_ ? nullptr : SelectedMarkdownDetailItem();
+    const float detailWidth = previewOpen_
+                                  ? (previewSideBySide ? 420.0f : width - 16.0f)
+                                  : (detailItem ? MarkdownDetailWidth(width) : 0.0f);
     if (detailWidth <= 0.0f) detailItem = nullptr;
-    const float resultsRight = detailItem ? width - detailWidth - 8.0f : width;
+    const float resultsRight = previewOpen_
+                                   ? (previewSideBySide
+                                          ? width - detailWidth - 8.0f
+                                          : width)
+                                   : (detailItem ? width - detailWidth - 8.0f
+                                                 : width);
     const float viewHeight = resultsBottom - resultsTop;
     const int contentHeight = ResultsContentHeight();
     feathercast::ui::OverlayController::SetScroll(
         overlayState_, scroll_, contentHeight - static_cast<int>(viewHeight));
+    if (std::abs(overlayVisualScroll_.Target() -
+                 static_cast<double>(scroll_)) > 0.001) {
+      RetargetOverlayScroll();
+    }
 
-    float y = resultsTop - static_cast<float>(scroll_);
+    float y = resultsTop -
+              static_cast<float>(overlayVisualScroll_.Value());
     int rowIndex = 0;
-    const bool dimStaleResults = SearchPending() && !sections_.empty();
+    const float resultsOpacity = static_cast<float>(
+        std::clamp(pendingResultsOpacity_.Value(), 0.0, 1.0));
+    const bool dimStaleResults = resultsOpacity < 0.999f && !sections_.empty();
     if (dimStaleResults) {
       activeRT_->PushLayer(
           D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
                                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                D2D1::IdentityMatrix(), 0.38f),
+                                D2D1::IdentityMatrix(), resultsOpacity),
           nullptr);
     }
     activeRT_->PushAxisAlignedClip(D2D1::RectF(0, resultsTop, resultsRight, resultsBottom), D2D1_ANTIALIAS_MODE_ALIASED);
     DrawSelectionPill(resultsRight);
     for (const auto& section : sections_) {
-      if (y + kSectionHeaderHeight >= resultsTop && y <= resultsBottom) {
-        DrawTextBlock(section.title, {12, y + 8, resultsRight - 12, y + 24}, sectionFormat_.Get(), D2DColor(theme_.sectionText));
+      float headerY = y;
+      float headerOpacity = 1.0f;
+      if (const auto motion = resultHeaderMotion_.find(section.title);
+          motion != resultHeaderMotion_.end()) {
+        headerY += static_cast<float>(motion->second.offsetY.Value());
+        headerOpacity = static_cast<float>(motion->second.opacity.Value());
+      }
+      if (headerY + kSectionHeaderHeight >= resultsTop &&
+          headerY <= resultsBottom) {
+        const bool headerLayer = headerOpacity < 0.999f;
+        if (headerLayer) {
+          activeRT_->PushLayer(
+              D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    D2D1::IdentityMatrix(), headerOpacity),
+              nullptr);
+        }
+        DrawTextBlock(section.title,
+                      {12, headerY + 8, resultsRight - 12, headerY + 24},
+                      sectionFormat_.Get(), D2DColor(theme_.sectionText));
+        if (headerLayer) activeRT_->PopLayer();
       }
       y += kSectionHeaderHeight;
       for (const auto& item : section.items) {
         // 50px row height (was 46px): subtitle no longer clips at the bottom edge.
-        RectF rowRect{8, y, resultsRight - 8, y + kResultRowHeight};
+        float rowOffset = 0.0f;
+        float rowOpacity = 1.0f;
+        if (const auto motion = resultRowMotion_.find(item.Key());
+            motion != resultRowMotion_.end()) {
+          rowOffset = static_cast<float>(motion->second.offsetY.Value());
+          rowOpacity = static_cast<float>(motion->second.opacity.Value());
+        }
+        RectF rowRect{8, y + rowOffset, resultsRight - 8,
+                      y + rowOffset + kResultRowHeight};
         if (rowRect.bottom >= resultsTop && rowRect.top <= resultsBottom) {
           const RowAnim anim = ComputeRowAnim(rowIndex);
-          if (anim.opacity < 1.0f || anim.dx != 0.0f) {
+          const float combinedOpacity = anim.opacity * rowOpacity;
+          if (combinedOpacity < 0.999f || anim.dy != 0.0f) {
             D2D1_MATRIX_3X2_F base;
             activeRT_->GetTransform(&base);
             activeRT_->SetTransform(
-                D2D1::Matrix3x2F::Translation(anim.dx, 0.0f) * base);
+                D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
             activeRT_->PushLayer(
                 D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
                                       D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                      D2D1::IdentityMatrix(), anim.opacity),
+                                      D2D1::IdentityMatrix(),
+                                      combinedOpacity),
                 nullptr);
             DrawResultRow(item, rowRect, rowIndex);
             activeRT_->PopLayer();
@@ -5679,6 +7278,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (detailItem) {
       DrawMarkdownDetail(*detailItem, {resultsRight + 4.0f, resultsTop + 8.0f, width - 8.0f, resultsBottom - 8.0f});
+    }
+    if (previewOpen_) {
+      DrawPreviewPane(previewSideBySide
+                          ? RectF{resultsRight + 4.0f, resultsTop + 8.0f,
+                                  width - 8.0f, resultsBottom - 8.0f}
+                          : RectF{8.0f, resultsTop + 8.0f, width - 8.0f,
+                                  resultsBottom - 8.0f});
+      if (!previewSideBySide) hits_.clear();
     }
     if (dimStaleResults) activeRT_->PopLayer();
 
@@ -5725,7 +7332,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                       footerRightFormat_.Get(), statusColor);
       } else {
         DrawTextBlock(
-            L"Up/Down Navigate | Enter Open | Tab Actions | Esc Close",
+            L"Up/Down Navigate | Enter Open | Tab Actions | Ctrl+Space Preview | Esc Close",
             {200, height - 28.0f, width - 16.0f, height - 12.0f},
             footerRightFormat_.Get(), D2DColor(theme_.textMuted));
       }
@@ -5758,9 +7365,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       (width + dialogWidth) * 0.5f,
       (height + 210.0f) * 0.5f,
     };
+    const float progress = static_cast<float>(
+        std::clamp(confirmationProgress_.Value(), 0.0, 1.0));
 
     FillRound({0.5f, 0.5f, width - 0.5f, height - 0.5f}, theme_.overlayRadius,
-              D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.58f));
+              D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.58f * progress));
+    D2D1_MATRIX_3X2_F dialogBase;
+    activeRT_->GetTransform(&dialogBase);
+    const D2D1_POINT_2F dialogCenter = D2D1::Point2F(
+        (dialog.left + dialog.right) * 0.5f,
+        (dialog.top + dialog.bottom) * 0.5f);
+    const float dialogScale = SpatialAnimationsAllowed()
+                                  ? 0.98f + 0.02f * progress
+                                  : 1.0f;
+    const float dialogOffset =
+        SpatialAnimationsAllowed() ? 4.0f * (1.0f - progress) : 0.0f;
+    activeRT_->SetTransform(
+        D2D1::Matrix3x2F::Scale(dialogScale, dialogScale, dialogCenter) *
+        D2D1::Matrix3x2F::Translation(0.0f, dialogOffset) *
+        dialogBase);
+    activeRT_->PushLayer(
+        D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                              D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                              D2D1::IdentityMatrix(), progress),
+        nullptr);
     FillRound(dialog, theme_.overlayRadius, D2DColor(theme_.overlayBackground));
     StrokeRound(dialog, theme_.overlayRadius, D2DColor(theme_.border));
 
@@ -5795,30 +7423,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     DrawTextBlock(confirmation_->actionLabel, actionRect, centerFormat_.Get(), D2D1::ColorF(1, 1, 1));
 
-    hits_.push_back({cancelRect, HitType::ConfirmCancel});
-    hits_.push_back({actionRect, HitType::ConfirmAction});
+    if (!confirmationClosing_ && progress >= 0.999f) {
+      hits_.push_back({cancelRect, HitType::ConfirmCancel});
+      hits_.push_back({actionRect, HitType::ConfirmAction});
+    }
+    activeRT_->PopLayer();
+    activeRT_->SetTransform(dialogBase);
   }
 
   // Keep the glass surface and search controls stationary while app rows fade
-  // and slide in from the left one after another. Only rows move, so the overlay
+  // and rise gently into place one after another. Only rows move, so the overlay
   // itself cannot produce the doubled-panel effect of the previous reveal.
-  static constexpr double kRowAnimDurationMs = 210.0;
-  static constexpr double kRowAnimStaggerMs = 26.0;
-  static constexpr int kRowAnimMaxStaggerRows = 6;
-  static constexpr float kRowAnimSlidePx = 10.0f;
+  static constexpr double kRowAnimDurationMs = 140.0;
+  static constexpr double kRowAnimStaggerMs = 14.0;
+  static constexpr int kRowAnimMaxStaggerRows = 5;
+  static constexpr float kRowAnimSlidePx = 6.0f;
 
-  struct RowAnim { float opacity; float dx; };
+  struct RowAnim { float opacity; float dy; };
 
   RowAnim ComputeRowAnim(int rowIndex) const {
     if (!animating_) return {1.0f, 0.0f};
     const double delay =
         std::min(rowIndex, kRowAnimMaxStaggerRows) * kRowAnimStaggerMs;
-    double t = (QpcElapsedMs(animStartQpc_) - delay) / kRowAnimDurationMs;
+    const double revealElapsedMs =
+        overlayRevealTimeline_.ElapsedSeconds() * 1000.0;
+    double t = (revealElapsedMs - delay) / kRowAnimDurationMs;
     t = std::clamp(t, 0.0, 1.0);
     const double eased = 1.0 - std::pow(1.0 - t, 3.0);
     return {
         static_cast<float>(eased),
-        static_cast<float>((eased - 1.0) * kRowAnimSlidePx),
+        SpatialAnimationsAllowed()
+            ? static_cast<float>((eased - 1.0) * kRowAnimSlidePx)
+            : 0.0f,
     };
   }
 
@@ -5830,7 +7466,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!ResultsActivationAllowed()) return;
     const auto targetY = SelectedRowTop();
     if (!targetY) return;
-    if (!AnimationsAllowed() || visualSelectedY_ < 0.0f) {
+    if (!SpatialAnimationsAllowed() || visualSelectedY_ < 0.0f ||
+        overlayVisualScroll_.Active() || HasElementMotion(resultRowMotion_)) {
       visualSelectedY_ = *targetY;
       animatingSelection_ = false;
     }
@@ -5838,11 +7475,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const COLORREF accent = ActiveAccent();
     RectF rect{8.0f, visualSelectedY_, width - 8.0f, visualSelectedY_ + kResultRowHeight};
     const RowAnim anim = ComputeRowAnim(selected_);
-    if (anim.opacity < 1.0f || anim.dx != 0.0f) {
+    if (anim.opacity < 1.0f || anim.dy != 0.0f) {
       D2D1_MATRIX_3X2_F base;
       activeRT_->GetTransform(&base);
       activeRT_->SetTransform(
-          D2D1::Matrix3x2F::Translation(anim.dx, 0.0f) * base);
+          D2D1::Matrix3x2F::Translation(0.0f, anim.dy) * base);
       activeRT_->PushLayer(
           D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
                                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -5967,6 +7604,38 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                      D2DColor(ActiveAccent()));
     }
 
+    if (item.isCalculator || item.isConversion) {
+      constexpr float kTextGap = 16.0f;
+      const float contentLeft = rowRect.left + 52.0f;
+      const float contentRight = rowRect.right - 10.0f;
+      const float contentWidth = std::max(0.0f, contentRight - contentLeft);
+      const float resultWidth =
+          std::clamp(contentWidth * 0.42f, 160.0f, 300.0f);
+      const float resultLeft = contentRight - resultWidth;
+      const float expressionRight = std::max(contentLeft, resultLeft - kTextGap);
+
+      // Raycast-style calculation rows keep the original expression on the
+      // left and reserve a stable, right-aligned column for the answer. The
+      // disjoint rectangles ensure long expressions are clipped before they
+      // can overlap the result.
+      DrawTextBlock(item.calculationExpression,
+                    {contentLeft, rowRect.top + 8.0f, expressionRight,
+                     rowRect.top + 28.0f},
+                    rowFormat_.Get(), D2DColor(theme_.textPrimary));
+      DrawTextBlock(item.calculationResult,
+                    {resultLeft, rowRect.top + 7.0f, contentRight,
+                     rowRect.top + 29.0f},
+                    calculationResultFormat_.Get(),
+                    D2DColor(theme_.textPrimary));
+      if (selected) {
+        DrawTextBlock(ActionHint(item),
+                      {resultLeft, rowRect.top + 29.0f, contentRight,
+                       rowRect.bottom},
+                      footerRightFormat_.Get(), D2DColor(theme_.textMuted));
+      }
+      return;
+    }
+
     // Unified text start at +52px (was +50 for icon path) to eliminate horizontal jitter.
     DrawTextBlock(item.Name(), {rowRect.left + 52, rowRect.top + 8, rowRect.right - 180, rowRect.top + 28}, rowFormat_.Get(), D2DColor(theme_.textPrimary));
     DrawTextBlock(SourceLabel(item), {rowRect.left + 52, rowRect.top + 29, rowRect.right - 180, rowRect.bottom}, subFormat_.Get(), D2DColor(theme_.textMuted));
@@ -5994,7 +7663,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.isWindow) return item.window.processName.empty() ? L"Open window" : L"Open window - " + item.window.processName;
     if (item.app.source == L"shortcut") return L"Desktop app";
     if (item.app.source == L"quicklink") return L"Quicklink";
-    if (item.app.source == L"file") return item.app.path.empty() ? L"File or folder" : item.app.path;
+    if (item.app.source == L"file") {
+      if (item.app.fileContentMatch) {
+        return item.app.path.empty() ? L"Content match"
+                                     : L"Content match - " + item.app.path;
+      }
+      return item.app.path.empty() ? L"File or folder" : item.app.path;
+    }
     if (item.app.source == L"system-folder") return item.app.path.empty() ? L"System folder" : item.app.path;
     if (item.app.source == L"windows-settings") return L"Windows Settings";
     if (item.app.source == L"alias") return L"System app";
@@ -6035,10 +7710,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   static constexpr float kSettBottom = 22.0f;
   static constexpr float kSettStatus = 52.0f;
 
-  static constexpr std::array<SettingsCategory, 7> kSettingsCategories = {
+  static constexpr std::array<SettingsCategory, 8> kSettingsCategories = {
     SettingsCategory::Shortcut,
     SettingsCategory::General,
     SettingsCategory::Results,
+    SettingsCategory::Library,
     SettingsCategory::Privacy,
     SettingsCategory::Extensions,
     SettingsCategory::Appearance,
@@ -6122,11 +7798,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case SettingsCategory::Results:
         h += kSettSection + 4 * kSettRow;
         break;
+      case SettingsCategory::Library:
+        h += kSettSection + 2 * kSettRow;
+        break;
       case SettingsCategory::Privacy:
-        h += kSettSection + 5 * kSettRow + 2 * kSettMaint;
+        h += kSettSection + 6 * kSettRow + 3 * kSettMaint;
         break;
       case SettingsCategory::Extensions:
-        h += kSettSection + kSettRow + kSettMaint;
+        h += kSettSection + kSettRow +
+             static_cast<float>(extensions_.Health().size()) * kSettRow +
+             kSettMaint;
         break;
       case SettingsCategory::Appearance:
         h += kSettSection + kSettRow + (settings_.syncAccentColor ? 0.0f : 48.0f);
@@ -6151,6 +7832,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       HitType::SettingsShortcutCategory,
       HitType::SettingsGeneralCategory,
       HitType::SettingsResultsCategory,
+      HitType::SettingsLibraryCategory,
       HitType::SettingsPrivacyCategory,
       HitType::SettingsExtensionsCategory,
       HitType::SettingsAppearanceCategory,
@@ -6230,18 +7912,99 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                         left, labelRight, enabled);
   }
 
-  void DrawSwitch(float y, float rowH, bool on, HitType type, float left, float right) {
+  void DrawSwitch(float y, float rowH, bool on, HitType type, float left,
+                  float right, bool enabled = true) {
     const COLORREF accent = ActiveAccent();
     const float trackLeft = right - 46.0f;
     const float h = 26.0f;
     const float top = y + (rowH - h) / 2.0f;
     RectF track{trackLeft, top, right, top + h};
-    const bool hover = SettHover(type);
-    FillRound(track, 13, on ? D2DColor(accent) : (hover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface)));
+    const bool hover = enabled && SettHover(type);
+    auto [animation, inserted] = switchAnimations_.try_emplace(type);
+    if (inserted) {
+      animation->second.Snap(on ? 1.0 : 0.0);
+    } else if (std::abs(animation->second.Target() - (on ? 1.0 : 0.0)) >
+               0.001) {
+      animation->second.Retarget(on ? 1.0 : 0.0, 0.110,
+                                 ControlAnimationsAllowed());
+      if (animation->second.Active()) RequestAnimationFrame();
+    }
+    const float progress = static_cast<float>(
+        std::clamp(animation->second.Value(), 0.0, 1.0));
+    const D2D1_COLOR_F offColor =
+        hover ? D2DColor(theme_.surfaceHover) : D2DColor(theme_.surface);
+    const D2D1_COLOR_F onColor = D2DColor(accent);
+    D2D1_COLOR_F trackColor = D2D1::ColorF(
+        offColor.r + (onColor.r - offColor.r) * progress,
+        offColor.g + (onColor.g - offColor.g) * progress,
+        offColor.b + (onColor.b - offColor.b) * progress,
+        offColor.a + (onColor.a - offColor.a) * progress);
+    if (!enabled) trackColor.a *= 0.45f;
+    FillRound(track, 13, trackColor);
     if (SettFocused(type)) StrokeRound(track, 13, D2DColor(accent), 2.0f);
-    const float knobX = on ? track.right - 22.0f : track.left + 4.0f;
-    FillRound({knobX, top + 4, knobX + 18, top + 22}, 9, D2D1::ColorF(1, 1, 1));
+    const float knobX = track.left + 4.0f +
+                        (track.right - 22.0f - (track.left + 4.0f)) *
+                            progress;
+    auto knobColor = D2D1::ColorF(1, 1, 1);
+    if (!enabled) knobColor.a = 0.55f;
+    FillRound({knobX, top + 4, knobX + 18, top + 22}, 9, knobColor);
     hits_.push_back({{left - 8.0f, y, right, y + rowH}, type});
+  }
+
+  static RectF AnimationSliderHitRect(float y, float rowH, float right) {
+    return {right - 232.0f, y + 4.0f, right, y + rowH - 4.0f};
+  }
+
+  static RectF AnimationSliderTrackRect(const RectF& hit) {
+    return {hit.left + 16.0f, hit.top + 18.0f, hit.right - 16.0f,
+            hit.top + 22.0f};
+  }
+
+  void DrawAnimationSlider(float y, float rowH, float right) {
+    const RectF hit = AnimationSliderHitRect(y, rowH, right);
+    const RectF track = AnimationSliderTrackRect(hit);
+    const COLORREF accent = ActiveAccent();
+    const int selected = static_cast<int>(settings_.animationLevel);
+    const bool hover = SettHover(HitType::AnimationLevel);
+
+    if (hover) {
+      FillRound(hit, theme_.controlRadius, D2DColor(theme_.surfaceHover));
+    }
+    if (SettFocused(HitType::AnimationLevel)) {
+      StrokeRound(hit, theme_.controlRadius, D2DColor(accent), 2.0f);
+    }
+
+    FillRound(track, 2.0f, D2DColor(theme_.surface));
+    const float selectedX =
+        track.left + (track.right - track.left) * selected / 2.0f;
+    if (selected > 0) {
+      FillRound({track.left, track.top, selectedX, track.bottom}, 2.0f,
+                D2DColor(accent));
+    }
+
+    constexpr std::array levels{
+        AnimationLevel::Off,
+        AnimationLevel::Reduced,
+        AnimationLevel::Full,
+    };
+    const float segmentWidth = (hit.right - hit.left) / 3.0f;
+    for (int index = 0; index < static_cast<int>(levels.size()); ++index) {
+      const float stopX =
+          track.left + (track.right - track.left) * index / 2.0f;
+      const bool active = index == selected;
+      FillRound({stopX - (active ? 8.0f : 4.0f),
+                 (track.top + track.bottom) * 0.5f - (active ? 8.0f : 4.0f),
+                 stopX + (active ? 8.0f : 4.0f),
+                 (track.top + track.bottom) * 0.5f + (active ? 8.0f : 4.0f)},
+                active ? 8.0f : 4.0f,
+                active ? D2DColor(accent) : D2DColor(theme_.textDim));
+      DrawTextBlock(
+          std::wstring(feathercast::settings::AnimationLevelLabel(levels[index])),
+          {hit.left + segmentWidth * index, hit.top + 31.0f,
+           hit.left + segmentWidth * (index + 1), hit.bottom},
+          centerFormat_.Get(), active ? D2DColor(accent) : SettGray());
+    }
+    hits_.push_back({hit, HitType::AnimationLevel});
   }
 
   void DrawStepper(float y, float rowH, const std::wstring& value,
@@ -6266,7 +8029,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const bool selected = category == settingsCategory_;
       const bool hover = SettHover(type);
       if (selected) {
-        FillRound(rect, theme_.controlRadius,
+        const float selectedTop =
+            static_cast<float>(settingsCategoryTop_.Value());
+        const RectF animatedRect{rect.left, selectedTop, rect.right,
+                                 selectedTop + 38.0f};
+        FillRound(animatedRect, theme_.controlRadius,
                   Mix(accent, ColorRefFromTheme(theme_.selectedBase), 0.22f));
       } else if (hover) {
         FillRound(rect, theme_.controlRadius, D2DColor(theme_.surfaceHover));
@@ -6322,15 +8089,37 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         std::max(0.0f, static_cast<float>(SettingsPageContentHeight()) - height);
     feathercast::ui::SettingsController::SetScroll(
         settingsState_, settingsScroll_, maxScroll);
+    if (std::abs(settingsVisualScroll_.Target() - settingsScroll_) > 0.001) {
+      RetargetSettingsScroll();
+    }
     activeRT_->PushAxisAlignedClip(
         D2D1::RectF(kSettSidebarWidth + 1.0f, 57.0f, width, height),
         D2D1_ANTIALIAS_MODE_ALIASED);
+    const float pageProgress = static_cast<float>(
+        std::clamp(settingsPageProgress_.Value(), 0.0, 1.0));
+    D2D1_MATRIX_3X2_F pageBase;
+    activeRT_->GetTransform(&pageBase);
+    activeRT_->SetTransform(
+        D2D1::Matrix3x2F::Translation(0.0f,
+                                     SpatialAnimationsAllowed()
+                                         ? (1.0f - pageProgress) * 4.0f
+                                         : 0.0f) *
+        pageBase);
+    const bool pageLayer = pageProgress < 0.999f;
+    if (pageLayer) {
+      activeRT_->PushLayer(
+          D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                D2D1::IdentityMatrix(), pageProgress),
+          nullptr);
+    }
 
     const float contentLeft = kSettSidebarWidth + kSettContentInset;
     const float contentRight = width - kSettContentInset;
     const float contentWidth = contentRight - contentLeft;
     DrawSettingsStatus(contentLeft, contentRight);
-    float y = kSettTop + SettingsStatusOffset() - settingsScroll_;
+    float y = kSettTop + SettingsStatusOffset() -
+              static_cast<float>(settingsVisualScroll_.Value());
 
     switch (settingsCategory_) {
       case SettingsCategory::Shortcut: {
@@ -6406,10 +8195,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         DrawSwitch(y, kSettRow, settings_.compactMode,
                    HitType::CompactToggle, contentLeft, contentRight);
         y += kSettRow;
-        DrawCatalogSettingRowLabel(y, kSettRow, HitType::AnimationsToggle,
-                                   contentLeft, contentRight - 66);
-        DrawSwitch(y, kSettRow, settings_.animationsEnabled,
-                   HitType::AnimationsToggle, contentLeft, contentRight);
+        DrawCatalogSettingRowLabel(y, kSettRow, HitType::AnimationLevel,
+                                   contentLeft, contentRight - 252);
+        DrawAnimationSlider(y, kSettRow, contentRight);
         break;
 
       case SettingsCategory::Results:
@@ -6438,6 +8226,36 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                        MAX_RESULT_SETTING)),
             HitType::MaxResultsDown, HitType::MaxResultsUp, contentRight);
         break;
+
+      case SettingsCategory::Library: {
+        y = DrawSettingsSection(y, L"LIBRARY", contentLeft, contentRight);
+        std::size_t snippetCount = 0;
+        {
+          std::lock_guard lock(dataMutex_);
+          snippetCount = snippets_.size();
+        }
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::ManageSnippets, contentLeft,
+            contentRight - 150.0f, true,
+            std::to_wstring(snippetCount) +
+                (snippetCount == 1 ? L" reusable text item." :
+                                     L" reusable text items."));
+        DrawSettingsButton(
+            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+            L"Manage", HitType::ManageSnippets);
+        y += kSettRow;
+        const std::size_t quicklinkCount = settings_.quicklinks.size();
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::ManageQuicklinks, contentLeft,
+            contentRight - 150.0f, true,
+            std::to_wstring(quicklinkCount) +
+                (quicklinkCount == 1 ? L" URL, file, or folder shortcut." :
+                                       L" URL, file, or folder shortcuts."));
+        DrawSettingsButton(
+            {contentRight - 128.0f, y + 12.0f, contentRight, y + 48.0f},
+            L"Manage", HitType::ManageQuicklinks);
+        break;
+      }
 
       case SettingsCategory::Privacy: {
         y = DrawSettingsSection(y, L"PRIVACY", contentLeft, contentRight);
@@ -6468,6 +8286,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         y += kSettRow;
         const bool fileIndexControls =
             SettingsControlEnabled(HitType::FileIndexLimitDown);
+        DrawCatalogSettingRowLabel(
+            y, kSettRow, HitType::FileContentIndexToggle, contentLeft,
+            contentRight - 66, fileIndexControls,
+            fileIndexStatus_
+                ? std::to_wstring(fileIndexStatus_->indexedContentFiles) +
+                      L" text files indexed locally."
+                : L"Disabled by default; supported text files only.");
+        DrawSwitch(y, kSettRow, settings_.fileContentIndexEnabled,
+                   HitType::FileContentIndexToggle, contentLeft, contentRight,
+                   fileIndexControls);
+        y += kSettRow;
         DrawCatalogSettingRowLabel(y, kSettRow,
                                    HitType::FileIndexLimitDown, contentLeft,
                                    contentRight - 176, fileIndexControls);
@@ -6481,14 +8310,28 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                    HitType::DiagnosticsToggle, contentLeft, contentRight);
         y += kSettRow;
 
-        const float twoButtonWidth = (contentWidth - 12.0f) / 2.0f;
+        const float threeRootButtonWidth = (contentWidth - 24.0f) / 3.0f;
         float btnTop = y + (kSettMaint - 38) / 2.0f;
         DrawSettingsButton(
-            {contentLeft, btnTop, contentLeft + twoButtonWidth, btnTop + 38},
+            {contentLeft, btnTop, contentLeft + threeRootButtonWidth,
+             btnTop + 38},
             L"Add Indexed Folder", HitType::AddFileRoot, fileIndexControls);
         DrawSettingsButton(
-            {contentLeft + twoButtonWidth + 12, btnTop, contentRight, btnTop + 38},
+            {contentLeft + threeRootButtonWidth + 12, btnTop,
+             contentLeft + 2 * threeRootButtonWidth + 12, btnTop + 38},
+            L"Remove Folder...", HitType::RemoveFileRoot,
+            fileIndexControls);
+        DrawSettingsButton(
+            {contentRight - threeRootButtonWidth, btnTop, contentRight,
+             btnTop + 38},
             L"Use Default Folders", HitType::ClearFileRoots,
+            fileIndexControls);
+        y += kSettMaint;
+
+        btnTop = y + (kSettMaint - 38) / 2.0f;
+        DrawSettingsButton(
+            {contentLeft, btnTop, contentRight, btnTop + 38},
+            L"Rebuild File Index", HitType::RebuildFileIndex,
             fileIndexControls);
         y += kSettMaint;
 
@@ -6530,6 +8373,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                 L" available. Only install extensions you trust.",
             contentLeft, contentRight);
         y += kSettRow;
+        for (const auto& plugin : health) {
+          const std::wstring state =
+              !plugin.available
+                  ? L"Unavailable"
+                  : (plugin.failureStrikes > 0 ? L"Degraded" : L"Available");
+          std::wstring detail = L"Version " + plugin.version + L" - " + state;
+          if (!plugin.lastError.empty()) detail += L" - " + plugin.lastError;
+          DrawSettingRowLabel(y, kSettRow, plugin.name, detail, contentLeft,
+                              contentRight);
+          y += kSettRow;
+        }
         const float btnW = (contentWidth - 12.0f) / 2.0f;
         const float btnTop = y + (kSettMaint - 38) / 2.0f;
         DrawSettingsButton(
@@ -6592,6 +8446,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
     }
 
+    if (pageLayer) activeRT_->PopLayer();
+    activeRT_->SetTransform(pageBase);
     activeRT_->PopAxisAlignedClip();
 
     // Scrollbar thumb, shown only when the content overflows the window.
@@ -6601,7 +8457,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const float trackH = trackBottom - trackTop;
       const float contentH = static_cast<float>(SettingsPageContentHeight());
       const float thumbH = std::max(36.0f, trackH * (height / contentH));
-      const float thumbY = trackTop + (trackH - thumbH) * (settingsScroll_ / maxScroll);
+      const float thumbY =
+          trackTop + (trackH - thumbH) *
+                         (static_cast<float>(settingsVisualScroll_.Value()) /
+                          maxScroll);
       FillRound({width - 7, thumbY, width - 4, thumbY + thumbH}, 1.5f, D2DColor(theme_.textDim));
     }
   }
@@ -6646,20 +8505,31 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void ClearIconBitmaps() {
     iconBitmaps_.clear();
     iconLru_.clear();
+    pendingDecodedIcons_.clear();
   }
 
   ComPtr<ID2D1Bitmap> IconBitmap(const std::wstring& key) {
     if (key.empty() || !overlaySurface_.dc) return nullptr;
     if (auto cached = CachedIconBitmap(key)) return cached;
 
-    const auto png = IconCachePath(key);
-    std::error_code ec;
-    if (std::filesystem::exists(png, ec)) {
-      auto bitmap = LoadBitmapFromFile(png);
-      if (bitmap) {
+    if (auto decoded = pendingDecodedIcons_.find(key);
+        decoded != pendingDecodedIcons_.end()) {
+      const auto& icon = decoded->second;
+      ComPtr<ID2D1Bitmap> bitmap;
+      if (icon.width != 0 && icon.height != 0 && icon.stride != 0 &&
+          !icon.pixels.empty() &&
+          SUCCEEDED(overlaySurface_.dc->CreateBitmap(
+              D2D1::SizeU(icon.width, icon.height), icon.pixels.data(),
+              icon.stride,
+              D2D1::BitmapProperties(D2D1::PixelFormat(
+                  DXGI_FORMAT_B8G8R8A8_UNORM,
+                  D2D1_ALPHA_MODE_PREMULTIPLIED)),
+              bitmap.GetAddressOf()))) {
+        pendingDecodedIcons_.erase(decoded);
         StoreIconBitmap(key, bitmap);
         return bitmap;
       }
+      pendingDecodedIcons_.erase(decoded);
     }
 
     QueueIcon(key);
@@ -6677,43 +8547,46 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const size_t workers = std::min<size_t>(3, std::max<unsigned>(2, hw / 2));
     iconResolver_.Start(workers, [this](const std::wstring& key,
                                        std::stop_token stopToken) {
-      if (stopThreads_ || stopToken.stop_requested()) return false;
-      return ResolveIconToCache(key);
+      if (stopThreads_ || stopToken.stop_requested()) {
+        return std::optional<feathercast::runtime::DecodedIcon>{};
+      }
+      return ResolveIcon(key);
     });
   }
 
-  ComPtr<ID2D1Bitmap> LoadBitmapFromFile(const std::filesystem::path& path) {
-    if (!wicFactory_ || !overlaySurface_.dc) return nullptr;
-    ComPtr<IWICBitmapDecoder> decoder;
-    if (FAILED(wicFactory_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf()))) return nullptr;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) return nullptr;
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(wicFactory_->CreateFormatConverter(converter.GetAddressOf()))) return nullptr;
-    if (FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeMedianCut))) return nullptr;
-    ComPtr<ID2D1Bitmap> bitmap;
-    overlaySurface_.dc->CreateBitmapFromWicBitmap(converter.Get(), nullptr, bitmap.GetAddressOf());
-    return bitmap;
+  std::optional<feathercast::runtime::DecodedIcon> DecodeIconFile(
+      IWICImagingFactory* wicFactory, const std::filesystem::path& path,
+      const std::wstring& key) {
+    return feathercast::runtime::DecodePngIcon(wicFactory, path, key);
   }
 
-  bool ResolveIconToCache(const std::wstring& key) {
+  std::optional<feathercast::runtime::DecodedIcon> ResolveIcon(
+      const std::wstring& key) {
+    ComPtr<IWICImagingFactory> workerWicFactory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&workerWicFactory)))) {
+      return std::nullopt;
+    }
     const auto png = IconCachePath(key);
     std::error_code ec;
-    if (std::filesystem::exists(png, ec)) return true;
-    UniqueBitmap bitmap(CreateShellBitmap(key));
-    if (!bitmap) return false;
-    auto temporary = png;
-    temporary += L".tmp-" + std::to_wstring(GetCurrentThreadId());
-    std::filesystem::remove(temporary, ec);
-    if (!SaveHBitmapPng(bitmap.get(), temporary)) {
+    if (!std::filesystem::exists(png, ec)) {
+      UniqueBitmap bitmap(CreateShellBitmap(key));
+      if (!bitmap) return std::nullopt;
+      auto temporary = png;
+      temporary += L".tmp-" + std::to_wstring(GetCurrentThreadId());
       std::filesystem::remove(temporary, ec);
-      return false;
+      if (!SaveHBitmapPng(workerWicFactory.Get(), bitmap.get(), temporary)) {
+        std::filesystem::remove(temporary, ec);
+        return std::nullopt;
+      }
+      if (!MoveFileExW(temporary.c_str(), png.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(temporary, ec);
+        if (!std::filesystem::exists(png, ec)) return std::nullopt;
+      }
     }
-    if (!MoveFileExW(temporary.c_str(), png.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-      std::filesystem::remove(temporary, ec);
-      return std::filesystem::exists(png, ec);
-    }
-    return true;
+    return DecodeIconFile(workerWicFactory.Get(), png, key);
   }
 
   HBITMAP CreateShellBitmap(const std::wstring& key) {
@@ -6774,17 +8647,22 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return bitmap;
   }
 
-  bool SaveHBitmapPng(HBITMAP bitmap, const std::filesystem::path& path) {
-    if (!wicFactory_ || !bitmap) return false;
+  bool SaveHBitmapPng(IWICImagingFactory* wicFactory, HBITMAP bitmap,
+                      const std::filesystem::path& path) {
+    if (!wicFactory || !bitmap) return false;
     ComPtr<IWICBitmap> wicBitmap;
-    if (FAILED(wicFactory_->CreateBitmapFromHBITMAP(bitmap, nullptr, WICBitmapUseAlpha, wicBitmap.GetAddressOf()))) return false;
+    if (FAILED(wicFactory->CreateBitmapFromHBITMAP(
+            bitmap, nullptr, WICBitmapUseAlpha, wicBitmap.GetAddressOf()))) {
+      return false;
+    }
 
     ComPtr<IWICStream> stream;
-    if (FAILED(wicFactory_->CreateStream(stream.GetAddressOf()))) return false;
+    if (FAILED(wicFactory->CreateStream(stream.GetAddressOf()))) return false;
     if (FAILED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) return false;
 
     ComPtr<IWICBitmapEncoder> encoder;
-    if (FAILED(wicFactory_->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf()))) return false;
+    if (FAILED(wicFactory->CreateEncoder(GUID_ContainerFormatPng, nullptr,
+                                         encoder.GetAddressOf()))) return false;
     if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) return false;
 
     ComPtr<IWICBitmapFrameEncode> frame;
@@ -6804,7 +8682,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnKeyDown(UINT vk) {
+    if (overlayClosing_) return;
     if (confirmation_) {
+      if (confirmationClosing_) return;
       if (vk == VK_ESCAPE) {
         CancelConfirmation();
       } else if (vk == VK_TAB || vk == VK_LEFT || vk == VK_RIGHT ||
@@ -6824,8 +8704,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         ExitBrowseView();
       } else if (actionMode_) {
         ExitActionMode();
+      } else if (previewOpen_) {
+        ClosePreview();
       } else {
-        HideOverlay(true);
+        const auto scoped = feathercast::search_scope::Parse(query_);
+        if (scoped.recognized) SetQueryText(scoped.terms);
+        else HideOverlay(OverlayCloseReason::ExplicitDismiss);
       }
       return;
     }
@@ -6833,6 +8717,46 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (view_ != View::Search) return;
     const bool control = ModifierPressed(VK_CONTROL);
     const bool shift = ModifierPressed(VK_SHIFT);
+
+    if (control && vk == VK_SPACE) {
+      suppressNextChar_ = true;
+      TogglePreview();
+      return;
+    }
+    if (previewOpen_ && control &&
+        (vk == VK_PRIOR || vk == VK_NEXT)) {
+      previewScroll_ = std::max(
+          0.0f, previewScroll_ + (vk == VK_NEXT ? 240.0f : -240.0f));
+      InvalidateRect(hwnd_, nullptr, FALSE);
+      return;
+    }
+
+    if (SearchPending()) {
+      if (vk == VK_DOWN) {
+        pendingNavigation_.Move(1);
+        return;
+      }
+      if (vk == VK_UP) {
+        pendingNavigation_.Move(-1);
+        return;
+      }
+      if (vk == VK_PRIOR) {
+        pendingNavigation_.Move(-8);
+        return;
+      }
+      if (vk == VK_NEXT) {
+        pendingNavigation_.Move(8);
+        return;
+      }
+      if (query_.empty() && vk == VK_HOME) {
+        pendingNavigation_.Home();
+        return;
+      }
+      if (query_.empty() && vk == VK_END) {
+        pendingNavigation_.End();
+        return;
+      }
+    }
 
     if (control && vk == 'A') {
       selectionAnchor_ = 0;
@@ -6902,7 +8826,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         OpenSelectedResultActions();
       }
     } else if (vk == VK_TAB) {
-      OpenSelectedResultActions();
+      if (selected_ >= 0 && selected_ < static_cast<int>(flatItems_.size()) &&
+          flatItems_[static_cast<std::size_t>(selected_)].isCapability &&
+          flatItems_[static_cast<std::size_t>(selected_)].capability.stableId
+              .starts_with(L"scope:")) {
+        ActivateResultAt(selected_, false);
+      } else {
+        OpenSelectedResultActions();
+      }
     } else if (vk == VK_LEFT) {
       if (caret_ > 0) {
         MoveCaret(control
@@ -6989,6 +8920,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           feathercast::ui::OverlayController::SetScroll(
               overlayState_, nextScroll,
               std::max(0, ResultsContentHeight() - visible));
+          RetargetOverlayScroll();
           return;
         }
         y += static_cast<int>(kResultRowStride);
@@ -7052,6 +8984,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnSettingsMouseMove(float x, float y) {
+    if (pointerPress_ && pointerPress_->owner == settingsHwnd_ &&
+        pointerPress_->type == HitType::AnimationLevel &&
+        GetCapture() == settingsHwnd_) {
+      SetAnimationLevelFromSliderX(x);
+    }
     UpdatePointerPress(settingsHwnd_, x, y);
     if (!mouseTracking_) {
       TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, settingsHwnd_, 0};
@@ -7079,12 +9016,59 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (wasRecording) {
       shortcutRecorder_.Reset();
     }
-    if (changed) ResizeSettingsWindow();
+    if (changed) {
+      settingsPageProgress_.Snap(0.0);
+      settingsPageProgress_.Retarget(1.0, 0.120, FadeAnimationsAllowed());
+      settingsCategoryTop_.Retarget(
+          kSettTop + static_cast<double>(SettingsCategoryIndex(category)) *
+                         kSettCategoryRow,
+          0.090, SpatialAnimationsAllowed());
+      RetargetSettingsScroll();
+      ResizeSettingsWindow();
+      RequestAnimationFrame();
+    }
     if (settingsHwnd_) {
       InvalidateRect(settingsHwnd_, nullptr, FALSE);
       NotifyWinEvent(EVENT_OBJECT_FOCUS, settingsHwnd_, OBJID_CLIENT,
                      settingsFocusIndex_ + 1);
     }
+  }
+
+  void NotifyAnimationLevelChanged() {
+    if (!settingsHwnd_) return;
+    const auto order = SettingsFocusOrder();
+    const auto item = std::find(order.begin(), order.end(),
+                                HitType::AnimationLevel);
+    if (item == order.end()) return;
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, settingsHwnd_, OBJID_CLIENT,
+                   static_cast<LONG>(std::distance(order.begin(), item)) + 1);
+  }
+
+  void SetAnimationLevel(AnimationLevel level) {
+    if (settings_.animationLevel == level) return;
+    settings_.animationLevel = level;
+    if (level == AnimationLevel::Off) {
+      SnapAllMotionToTargets();
+    } else if (level == AnimationLevel::Reduced) {
+      SnapSpatialMotionToTargets();
+    }
+    PersistSettings();
+    if (settingsHwnd_) InvalidateRect(settingsHwnd_, nullptr, FALSE);
+    NotifyAnimationLevelChanged();
+  }
+
+  void SetAnimationLevelFromSliderX(float x) {
+    const auto hit = std::find_if(
+        hits_.begin(), hits_.end(), [](const HitTarget& target) {
+          return target.type == HitType::AnimationLevel;
+        });
+    if (hit == hits_.end()) return;
+    const RectF track = AnimationSliderTrackRect(hit->rect);
+    const float progress = std::clamp(
+        (x - track.left) / std::max(1.0f, track.right - track.left), 0.0f,
+        1.0f);
+    const int index = static_cast<int>(std::lround(progress * 2.0f));
+    SetAnimationLevel(static_cast<AnimationLevel>(index));
   }
 
   bool PointerPressMatchesHit(const PointerPress& press, const HitTarget& hit,
@@ -7176,6 +9160,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settingsFocusIndex_ =
             static_cast<int>(std::distance(order.begin(), focused));
       }
+      if (hit->type == HitType::AnimationLevel) {
+        SetAnimationLevelFromSliderX(x);
+      }
     } else if (hit->type == HitType::ConfirmCancel) {
       confirmationFocus_ = 0;
     } else if (hit->type == HitType::ConfirmAction) {
@@ -7189,10 +9176,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   void OnPointerUp(HWND owner, float x, float y) {
     if (!pointerPress_ || pointerPress_->owner != owner) return;
     PointerPress press = std::move(*pointerPress_);
+    const bool animationSliderDrag =
+        owner == settingsHwnd_ && press.type == HitType::AnimationLevel;
     const bool activate = PointerPressMatchesAt(press, x, y);
     pointerPress_.reset();
     if (GetCapture() == owner) ReleaseCapture();
     InvalidateRect(owner, nullptr, FALSE);
+    if (animationSliderDrag) {
+      SetAnimationLevelFromSliderX(x);
+      return;
+    }
     if (!activate) return;
 
     if (owner == settingsHwnd_) {
@@ -7267,8 +9260,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         mi.rcWork.bottom - static_cast<int>(20 * scale) - physicalHeight;
     const int top = std::clamp(centerY - physicalHeight / 2, minTop,
                                std::max(minTop, maxTop));
-    SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, rc.left, top, width,
-                 physicalHeight, SWP_NOACTIVATE);
+    if (SpatialAnimationsAllowed()) {
+      if (!settingsBounds_.Active()) SnapWindowBounds(settingsBounds_, rc);
+      settingsBounds_.Retarget(rc.left, top, width, physicalHeight,
+                               kSettingsResizeSeconds, true);
+      RequestAnimationFrame();
+    } else {
+      SetWindowPos(settingsHwnd_, HWND_NOTOPMOST, rc.left, top, width,
+                   physicalHeight, SWP_NOACTIVATE);
+      RECT applied{};
+      GetWindowRect(settingsHwnd_, &applied);
+      SnapWindowBounds(settingsBounds_, applied);
+    }
     // Visible corners are drawn by Direct2D; no window region, so DirectComposition alpha stays intact.
   }
 
@@ -7289,6 +9292,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       feathercast::ui::SettingsController::SetScroll(
           settingsState_, nextScroll, SettingsMaxScroll());
+      RetargetSettingsScroll();
       return;
     }
   }
@@ -7309,6 +9313,26 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       const int next = (current + direction + count) % count;
       SelectSettingsCategory(kSettingsCategories[static_cast<size_t>(next)]);
       return;
+    }
+    if (focusedType == HitType::AnimationLevel) {
+      if (vk == VK_LEFT || vk == VK_DOWN) {
+        SetAnimationLevel(feathercast::settings::StepAnimationLevel(
+            settings_.animationLevel, -1));
+        return;
+      }
+      if (vk == VK_RIGHT || vk == VK_UP) {
+        SetAnimationLevel(feathercast::settings::StepAnimationLevel(
+            settings_.animationLevel, 1));
+        return;
+      }
+      if (vk == VK_HOME) {
+        SetAnimationLevel(AnimationLevel::Off);
+        return;
+      }
+      if (vk == VK_END) {
+        SetAnimationLevel(AnimationLevel::Full);
+        return;
+      }
     }
     if (vk == VK_LEFT && !focusedCategory) {
       feathercast::ui::SettingsController::SetFocus(
@@ -7375,6 +9399,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case HitType::SettingsShortcutCategory:
       case HitType::SettingsGeneralCategory:
       case HitType::SettingsResultsCategory:
+      case HitType::SettingsLibraryCategory:
       case HitType::SettingsPrivacyCategory:
       case HitType::SettingsExtensionsCategory:
       case HitType::SettingsAppearanceCategory:
@@ -7382,6 +9407,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (const auto category = SettingsCategoryForHit(type)) {
           SelectSettingsCategory(*category);
         }
+        break;
+      case HitType::ManageSnippets:
+        OpenLibraryManager(feathercast::library::ItemKind::Snippet);
+        break;
+      case HitType::ManageQuicklinks:
+        OpenLibraryManager(feathercast::library::ItemKind::Quicklink);
         break;
       case HitType::RecordShortcut:
         shortcutRecorder_.Reset();
@@ -7496,43 +9527,106 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settings_.privacyConsentVersion = 1;
         settings_.fileIndexEnabled = !settings_.fileIndexEnabled;
         if (!settings_.fileIndexEnabled) {
+          settings_.fileContentIndexEnabled = false;
           std::lock_guard lock(dataMutex_);
           fileIndex_.clear();
         }
         PersistSettings();
-        StartAppDiscovery();
+        ConfigureFileIndex();
         RequestSearch();
+        break;
+      case HitType::FileContentIndexToggle:
+        if (!settings_.fileContentIndexEnabled) {
+          const int answer = MessageBoxW(
+              settingsHwnd_,
+              L"FeatherCast will read supported text files only inside your "
+              L"selected local folders. It stores a local searchable token "
+              L"index, not the original text or excerpts. The index can still "
+              L"reveal words present in those files. Files are limited to 2 MiB "
+              L"and content indexing can be disabled or deleted at any time.",
+              L"Enable Search File Contents?",
+              MB_ICONINFORMATION | MB_OKCANCEL | MB_DEFBUTTON2);
+          if (answer != IDOK) break;
+        }
+        settings_.privacyConsentVersion = 1;
+        settings_.fileContentIndexEnabled =
+            !settings_.fileContentIndexEnabled;
+        PersistSettings();
+        ConfigureFileIndex();
         break;
       case HitType::FileIndexLimitDown:
         settings_.fileIndexMaxEntries = std::clamp(
             settings_.fileIndexMaxEntries - 1000,
             MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
         PersistSettings();
-        if (settings_.fileIndexEnabled) StartAppDiscovery();
+        if (settings_.fileIndexEnabled) ConfigureFileIndex();
         break;
       case HitType::FileIndexLimitUp:
         settings_.fileIndexMaxEntries = std::clamp(
             settings_.fileIndexMaxEntries + 1000,
             MIN_FILE_INDEX_ENTRIES, MAX_FILE_INDEX_ENTRIES);
         PersistSettings();
-        if (settings_.fileIndexEnabled) StartAppDiscovery();
+        if (settings_.fileIndexEnabled) ConfigureFileIndex();
         break;
       case HitType::AddFileRoot:
         if (const auto folder = PickIndexedFolder()) {
+          if (settings_.fileIndexRoots.empty()) {
+            settings_.fileIndexRoots = ResolvedFileIndexRoots();
+          }
           const std::wstring normalized = Lower(*folder);
           const bool exists = std::any_of(
               settings_.fileIndexRoots.begin(), settings_.fileIndexRoots.end(),
               [&](const std::wstring& root) { return Lower(root) == normalized; });
           if (!exists) settings_.fileIndexRoots.push_back(*folder);
           PersistSettings();
-          if (settings_.fileIndexEnabled) StartAppDiscovery();
+          if (settings_.fileIndexEnabled) ConfigureFileIndex();
+          ResizeSettingsWindow();
+        }
+        break;
+      case HitType::RemoveFileRoot:
+        {
+          const auto roots = ResolvedFileIndexRoots();
+          if (roots.size() <= 1) {
+            SetSettingsStatus(
+                StatusSeverity::Info,
+                L"At least one indexed folder is required. Add another folder first.");
+            break;
+          }
+          HMENU menu = CreatePopupMenu();
+          if (!menu) break;
+          for (std::size_t index = 0; index < roots.size(); ++index) {
+            const std::filesystem::path root(roots[index]);
+            std::wstring label = root.filename().wstring();
+            if (label.empty()) label = roots[index];
+            AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(index + 1),
+                        label.c_str());
+          }
+          RECT settingsRect{};
+          GetWindowRect(settingsHwnd_, &settingsRect);
+          const UINT selected = TrackPopupMenu(
+              menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+              settingsRect.left + 260, settingsRect.top + 180, 0,
+              settingsHwnd_, nullptr);
+          DestroyMenu(menu);
+          if (selected == 0 || selected > roots.size()) break;
+          settings_.fileIndexRoots = roots;
+          settings_.fileIndexRoots.erase(settings_.fileIndexRoots.begin() +
+                                         static_cast<std::ptrdiff_t>(selected - 1));
+          PersistSettings();
+          if (settings_.fileIndexEnabled) ConfigureFileIndex();
           ResizeSettingsWindow();
         }
         break;
       case HitType::ClearFileRoots:
         settings_.fileIndexRoots.clear();
         PersistSettings();
-        if (settings_.fileIndexEnabled) StartAppDiscovery();
+        if (settings_.fileIndexEnabled) ConfigureFileIndex();
+        break;
+      case HitType::RebuildFileIndex:
+        SetSettingsStatus(StatusSeverity::Info, L"Rebuilding the file index...");
+        if (!fileIndexService_.Rebuild()) {
+          ReportBackgroundFailure(L"The live file index worker is unavailable.");
+        }
         break;
       case HitType::DiagnosticsToggle:
         settings_.diagnosticsEnabled = !settings_.diagnosticsEnabled;
@@ -7616,10 +9710,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settings_.compactMode = !settings_.compactMode;
         PersistSettings();
         break;
-      case HitType::AnimationsToggle:
-        settings_.animationsEnabled = !settings_.animationsEnabled;
-        PersistSettings();
+      case HitType::AnimationLevel: {
+        const auto next = settings_.animationLevel == AnimationLevel::Full
+                              ? AnimationLevel::Off
+                              : feathercast::settings::StepAnimationLevel(
+                                    settings_.animationLevel, 1);
+        SetAnimationLevel(next);
         break;
+      }
       case HitType::AccentToggle:
         settings_.syncAccentColor = !settings_.syncAccentColor;
         PersistSettings();
@@ -7636,9 +9734,33 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void OnMouseWheel(int delta) {
-    if (view_ != View::Search || sections_.empty()) return;
+    if (view_ != View::Search) return;
+    if (previewOpen_) {
+      RECT client{};
+      GetClientRect(hwnd_, &client);
+      POINT cursor{};
+      GetCursorPos(&cursor);
+      ScreenToClient(hwnd_, &cursor);
+      const float scale = GetWindowScale(hwnd_);
+      const float x = static_cast<float>(cursor.x) / scale;
+      const float y = static_cast<float>(cursor.y) / scale;
+      const float width = static_cast<float>(client.right) / scale;
+      const float baseWidth = static_cast<float>(std::clamp(
+          settings_.overlayWidth, MIN_OVERLAY_WIDTH, MAX_OVERLAY_WIDTH));
+      const bool sideBySide = width >= baseWidth + 340.0f;
+      if (y >= kResultsTop && (!sideBySide || x >= baseWidth)) {
+        previewScroll_ = std::max(
+            0.0f, previewScroll_ -
+                      static_cast<float>(feathercast::motion::WheelDeltaPixels(delta)));
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+      }
+    }
+    if (sections_.empty()) return;
     const int previousScroll = scroll_;
-    const int nextScroll = scroll_ - delta / WHEEL_DELTA * 72;
+    const int nextScroll = static_cast<int>(std::lround(
+        static_cast<double>(scroll_) -
+        feathercast::motion::WheelDeltaPixels(delta)));
     RECT rc{};
     GetClientRect(hwnd_, &rc);
     const float scale = GetWindowScale(hwnd_);
@@ -7646,7 +9768,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     feathercast::ui::OverlayController::SetScroll(
         overlayState_, nextScroll,
         std::max(0, ResultsContentHeight() - visible));
-    if (scroll_ != previousScroll) SyncSelectionAnimationToTarget();
+    if (scroll_ != previousScroll) RetargetOverlayScroll();
     InvalidateRect(hwnd_, nullptr, FALSE);
   }
 
@@ -7666,8 +9788,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const float maxScroll = SettingsMaxScroll();
     if (maxScroll <= 0.0f) return;
     feathercast::ui::SettingsController::ScrollBy(
-        settingsState_, -static_cast<float>(delta) / WHEEL_DELTA * 60.0f,
+        settingsState_,
+        -static_cast<float>(
+            feathercast::motion::WheelDeltaPixels(delta, 60.0)),
         maxScroll);
+    RetargetSettingsScroll();
     InvalidateRect(settingsHwnd_, nullptr, FALSE);
   }
 
@@ -7764,7 +9889,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
-    if (response->closeOverlay) HideOverlay(false);
+    if (response->closeOverlay) HideOverlay(OverlayCloseReason::Action);
     switch (response->action) {
       case feathercast::extensions::HostActionType::OpenUrl:
       case feathercast::extensions::HostActionType::OpenPath:
@@ -7874,7 +9999,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (item.utility) {
       if (CopyTextToClipboard(item.utility->value)) {
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
       } else {
         SetOverlayStatus(StatusSeverity::Error,
                          L"Could not copy the utility result.");
@@ -7883,7 +10008,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (item.isRunCommand) {
-      HideOverlay(false);
+      HideOverlay(OverlayCloseReason::Action);
       launchExecutor_.Submit([runCommand = item.runCommand](std::stop_token) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         if (runCommand.kind == feathercast::run_command::Kind::OpenTarget) {
@@ -7899,7 +10024,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
     if (item.isCalculator || item.isConversion) {
       if (CopyTextToClipboard(item.calculationResult)) {
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         ShowTrayNotification(L"FeatherCast", L"Copied to clipboard.");
       } else {
         ShowTrayNotification(L"FeatherCast", L"Could not copy to clipboard.");
@@ -7908,7 +10033,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (item.isWebSearch) {
-      HideOverlay(false);
+      HideOverlay(OverlayCloseReason::Action);
       launchExecutor_.Submit([url = item.webSearchUrl](std::stop_token) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -7933,16 +10058,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     if (item.isWindow) {
-      HideOverlay(false);
+      HideOverlay(OverlayCloseReason::Action);
       FocusWindow(item.window.hwnd);
       return;
     }
 
-    HideOverlay(false);
+    HideOverlay(OverlayCloseReason::Action);
     auto appPtr = std::make_shared<AppEntry>(item.app);
     if (!launchExecutor_.Submit([this, appPtr, asAdmin, id = PrimaryAppId(item.app)](std::stop_token stopToken) {
       if (stopToken.stop_requested()) return;
-      DebugLaunchLog(L"Lambda: name='" + appPtr->name + L"' target='" + appPtr->launchTarget + L"'");
+      DebugLaunchLog(L"Launch worker started; type=" +
+                     std::to_wstring(static_cast<int>(appPtr->launchType)));
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
       const bool ok = this->LaunchApp(*appPtr, asAdmin && appPtr->adminSupported);
       if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok);
@@ -8052,17 +10178,35 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     feathercast::ui::OverlayController::ShowConfirmation(
         overlayState_,
         ConfirmationDialog{command, std::move(title), std::move(message),
-                           std::move(actionLabel)});
+                            std::move(actionLabel)});
+    confirmationClosing_ = false;
+    confirmationProgress_.Snap(0.0);
+    confirmationProgress_.Retarget(1.0, 0.130, FadeAnimationsAllowed());
     ApplyWindowSize();
+    RequestAnimationFrame();
     InvalidateRect(hwnd_, nullptr, FALSE);
     NotifyWinEvent(EVENT_OBJECT_FOCUS, hwnd_, OBJID_CLIENT, 1);
   }
 
-  void CancelConfirmation() {
+  void FinishCancelConfirmation() {
     if (!confirmation_) return;
+    confirmationClosing_ = false;
     feathercast::ui::OverlayController::CloseConfirmation(overlayState_);
+    confirmationProgress_.Snap(0.0);
     ApplyWindowSize();
     InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void CancelConfirmation() {
+    if (!confirmation_ || confirmationClosing_) return;
+    if (FadeAnimationsAllowed()) {
+      confirmationClosing_ = true;
+      CancelPointerPress(hwnd_);
+      confirmationProgress_.Retarget(0.0, 0.090, true);
+      RequestAnimationFrame();
+      return;
+    }
+    FinishCancelConfirmation();
   }
 
   void ActivateConfirmationChoice() {
@@ -8073,13 +10217,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
     const CommandKind command = confirmation_->command;
     confirmation_.reset();
+    confirmationClosing_ = false;
+    confirmationProgress_.Snap(0.0);
     confirmationFocus_ = 0;
     confirmationHover_ = -1;
     PerformConfirmedSystemAction(command);
   }
 
   void PerformConfirmedSystemAction(CommandKind command) {
-    HideOverlay(false);
+    HideOverlay(OverlayCloseReason::Action);
     switch (command) {
       case CommandKind::SleepPC:
         SetSuspendState(FALSE, FALSE, FALSE);
@@ -8161,7 +10307,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
         });
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         return;
       case CommandKind::OpenLocalDataFolder:
         launchExecutor_.Submit([path = LocalDataPath()](std::stop_token) {
@@ -8169,7 +10315,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
         });
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         return;
       case CommandKind::ReloadExtensions:
         launchExecutor_.Submit([this](std::stop_token stopToken) {
@@ -8181,7 +10327,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         });
         return;
       case CommandKind::CheckForUpdates:
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         StartUpdateCheck(true);
         return;
       case CommandKind::ClearClipboardHistory:
@@ -8194,16 +10340,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
         });
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         return;
       case CommandKind::ReloadSnippets:
-        {
-          auto snippets = LoadSnippets();
-          std::lock_guard lock(dataMutex_);
-          snippets_ = std::move(snippets);
-        }
-        MarkSearchDataChanged();
-        RequestSearch();
+        ReloadLibraryManagerData();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::OpenThemeFile:
@@ -8213,7 +10353,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
           CoUninitialize();
         });
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         return;
       case CommandKind::ReloadTheme:
         ReloadTheme();
@@ -8221,14 +10361,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
       case CommandKind::LockPC:
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         LockWorkStation();
         return;
       case CommandKind::SleepPC:
         return;
       case CommandKind::MuteAudio:
         if (feathercast::audio::ToggleDefaultOutputMute()) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not toggle audio mute.");
@@ -8245,7 +10385,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::VolumeUp:
         if (feathercast::audio::StepDefaultOutputVolume(true)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not increase the volume.");
@@ -8253,7 +10393,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::VolumeDown:
         if (feathercast::audio::StepDefaultOutputVolume(false)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not decrease the volume.");
@@ -8261,7 +10401,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::MediaPlayPause:
         if (SendVirtualKeyTap(VK_MEDIA_PLAY_PAUSE)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not send the media command.");
@@ -8269,7 +10409,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::MediaNext:
         if (SendVirtualKeyTap(VK_MEDIA_NEXT_TRACK)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not send the media command.");
@@ -8277,7 +10417,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::MediaPrevious:
         if (SendVirtualKeyTap(VK_MEDIA_PREV_TRACK)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not send the media command.");
@@ -8285,7 +10425,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::ShowDesktop:
         if (ToggleDesktop()) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not show the desktop.");
@@ -8294,7 +10434,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       case CommandKind::GenerateUuid:
         if (const auto uuid = GenerateUuidText();
             uuid && CopyTextToClipboard(*uuid)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not generate or copy the UUID.");
@@ -8317,24 +10457,35 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
 
       switch (item.action) {
+        case ActionKind::ArrangeWindow:
+          EnterActionMode(item);
+          return;
         case ActionKind::Switch:
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
           FocusWindow(target);
           return;
         case ActionKind::Minimize:
           ShowWindowAsync(target, SW_MINIMIZE);
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
           return;
         case ActionKind::MaximizeRestore:
           if (IsIconic(target) || IsZoomed(target)) ShowWindowAsync(target, SW_RESTORE);
           else ShowWindowAsync(target, SW_MAXIMIZE);
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
           return;
         case ActionKind::MoveWindowLeftHalf:
         case ActionKind::MoveWindowRightHalf:
         case ActionKind::MoveWindowTopHalf:
         case ActionKind::MoveWindowBottomHalf:
+        case ActionKind::MoveWindowLeftThird:
+        case ActionKind::MoveWindowCenterThird:
+        case ActionKind::MoveWindowRightThird:
+        case ActionKind::MoveWindowTopLeft:
+        case ActionKind::MoveWindowTopRight:
+        case ActionKind::MoveWindowBottomLeft:
+        case ActionKind::MoveWindowBottomRight:
         case ActionKind::CenterWindow:
+        case ActionKind::MoveWindowPreviousDisplay:
         case ActionKind::MoveWindowNextDisplay: {
           feathercast::window_layout::Layout layout =
               feathercast::window_layout::Layout::Center;
@@ -8351,6 +10502,30 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             case ActionKind::MoveWindowBottomHalf:
               layout = feathercast::window_layout::Layout::BottomHalf;
               break;
+            case ActionKind::MoveWindowLeftThird:
+              layout = feathercast::window_layout::Layout::LeftThird;
+              break;
+            case ActionKind::MoveWindowCenterThird:
+              layout = feathercast::window_layout::Layout::CenterThird;
+              break;
+            case ActionKind::MoveWindowRightThird:
+              layout = feathercast::window_layout::Layout::RightThird;
+              break;
+            case ActionKind::MoveWindowTopLeft:
+              layout = feathercast::window_layout::Layout::TopLeft;
+              break;
+            case ActionKind::MoveWindowTopRight:
+              layout = feathercast::window_layout::Layout::TopRight;
+              break;
+            case ActionKind::MoveWindowBottomLeft:
+              layout = feathercast::window_layout::Layout::BottomLeft;
+              break;
+            case ActionKind::MoveWindowBottomRight:
+              layout = feathercast::window_layout::Layout::BottomRight;
+              break;
+            case ActionKind::MoveWindowPreviousDisplay:
+              layout = feathercast::window_layout::Layout::PreviousDisplay;
+              break;
             case ActionKind::MoveWindowNextDisplay:
               layout = feathercast::window_layout::Layout::NextDisplay;
               break;
@@ -8358,7 +10533,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
               break;
           }
           if (ApplyWindowLayout(target, layout)) {
-            HideOverlay(false);
+            HideOverlay(OverlayCloseReason::Action);
             FocusWindow(target);
           } else {
             SetOverlayStatus(StatusSeverity::Error,
@@ -8368,7 +10543,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         }
         case ActionKind::CloseWindow:
           PostMessageW(target, WM_CLOSE, 0, 0);
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
           return;
         default:
           return;
@@ -8379,7 +10554,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
             std::get_if<TextActionPayload>(&item.actionTarget)) {
       if (item.action == ActionKind::CopyText) {
         if (CopyTextToClipboard(textTarget->value)) {
-          HideOverlay(false);
+          HideOverlay(OverlayCloseReason::Action);
         } else {
           SetOverlayStatus(StatusSeverity::Error,
                            L"Could not copy the selected text.");
@@ -8395,13 +10570,20 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const AppEntry& app = *appTarget;
     const std::wstring id = PrimaryAppId(app);
     switch (item.action) {
+      case ActionKind::Preview:
+        ExitActionMode();
+        previewOpen_ = true;
+        ApplyWindowSize();
+        ScheduleSelectedPreview();
+        return;
       case ActionKind::Open:
       case ActionKind::RunAsAdmin: {
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         auto appPtr = std::make_shared<AppEntry>(app);
         if (!launchExecutor_.Submit([this, appPtr, runAsAdmin = (item.action == ActionKind::RunAsAdmin), id](std::stop_token stopToken) {
           if (stopToken.stop_requested()) return;
-          DebugLaunchLog(L"LambdaAction: name='" + appPtr->name + L"' target='" + appPtr->launchTarget + L"'");
+          DebugLaunchLog(L"Action launch worker started; type=" +
+                         std::to_wstring(static_cast<int>(appPtr->launchType)));
           CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
           const bool ok = this->LaunchApp(*appPtr, runAsAdmin && appPtr->adminSupported);
           if (!stopToken.stop_requested()) NotifyLaunchCompleted(id, appPtr->name, ok);
@@ -8414,11 +10596,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       case ActionKind::OpenLocation:
         RevealAppLocation(app);
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
         return;
       case ActionKind::CopyPath:
         CopyTextToClipboard(AppPathForActions(app));
-        HideOverlay(false);
+        HideOverlay(OverlayCloseReason::Action);
+        return;
+      case ActionKind::EditAppAlias:
+        HideOverlay(OverlayCloseReason::Action);
+        OpenLibraryManager(feathercast::library::ItemKind::AppAlias, id);
         return;
       case ActionKind::Pin:
         if (!id.empty() && !ContainsValue(settings_.pinnedApps, id)) settings_.pinnedApps.insert(settings_.pinnedApps.begin(), id);
@@ -8558,7 +10744,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void PasteTextToLastActiveWindow(const std::wstring& text) {
-    HWND target = lastActiveWindow_;
+    HWND target = overlayRestoreCandidate_ ? overlayRestoreCandidate_->hwnd
+                                           : nullptr;
     const UINT existingFormats = CountClipboardFormats();
     ComPtr<IDataObject> previousClipboard;
     const HRESULT captureResult = OleGetClipboard(&previousClipboard);
@@ -8568,13 +10755,13 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
 
-    HideOverlay(false);
+    HideOverlay(OverlayCloseReason::Action);
     if (!CopyTextToClipboard(text)) {
       ShowTrayNotification(L"FeatherCast Paste", L"FeatherCast could not place the text on the clipboard.");
       return;
     }
     const DWORD temporarySequence = GetClipboardSequenceNumber();
-    lastActiveWindow_ = nullptr;
+    overlayRestoreCandidate_.reset();
 
     if (!launchExecutor_.Submit(
             [this, target, previousClipboard, existingFormats, temporarySequence](std::stop_token stopToken) {
@@ -8631,9 +10818,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   bool LaunchApp(const AppEntry& app, bool asAdmin) {
-    DebugLaunchLog(L"LaunchApp name='" + app.name + L"' type=" +
-                   std::to_wstring(static_cast<int>(app.launchType)) + L" target='" +
-                   app.launchTarget + L"' targetPath='" + app.targetPath + L"' admin=" +
+    DebugLaunchLog(L"LaunchApp type=" +
+                   std::to_wstring(static_cast<int>(app.launchType)) + L" admin=" +
                    (asAdmin ? L"1" : L"0"));
 
     if (app.launchType == LaunchType::Shell) {
@@ -8665,7 +10851,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         seiShell.lpVerb = L"runas";
         seiShell.lpFile = adminTarget.c_str();
         seiShell.nShow = SW_SHOWNORMAL;
-        DebugLaunchLog(L"  AppsFolder admin fallback target='" + adminTarget + L"'");
+        DebugLaunchLog(L"  AppsFolder admin fallback requested");
         if (ShellExecuteExW(&seiShell)) return true;
         // Never silently downgrade an explicit elevated launch to a normal one.
         return false;
@@ -8693,7 +10879,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // handle: open the shell item directly rather than via explorer.exe.
       const std::wstring target = L"shell:AppsFolder\\" + app.launchTarget;
       HINSTANCE result = ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-      DebugLaunchLog(L"  fallback ShellExecute target='" + target + L"' result=" +
+      DebugLaunchLog(L"  fallback ShellExecute result=" +
                      std::to_wstring(reinterpret_cast<intptr_t>(result)));
       return reinterpret_cast<intptr_t>(result) > 32;
     }
@@ -8720,7 +10906,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     sei.lpDirectory = cwd.empty() ? nullptr : cwd.c_str();
     sei.nShow = SW_SHOWNORMAL;
     BOOL ok = ShellExecuteExW(&sei);
-    DebugLaunchLog(L"  Shortcut/Exe file='" + file + L"' ok=" + std::to_wstring(ok) +
+    DebugLaunchLog(L"  Shortcut/Exe ok=" + std::to_wstring(ok) +
                    L" err=" + std::to_wstring(GetLastError()) +
                    L" hInst=" + std::to_wstring(reinterpret_cast<intptr_t>(sei.hInstApp)));
     return ok == TRUE;
@@ -8770,7 +10956,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::search::SnapshotCoordinator snapshotCoordinator_;
   feathercast::runtime::UiEventQueue<DiscoveryResult> discoveryEvents_;
   feathercast::discovery_runtime::DiscoveryService discoveryService_;
-  feathercast::runtime::UiEventQueue<std::wstring> iconEvents_;
+  feathercast::runtime::UiEventQueue<feathercast::files::IndexStatus>
+      fileIndexEvents_;
+  feathercast::files::FileIndexService fileIndexService_;
+  feathercast::runtime::UiEventQueue<ResultsCollection> fileSearchEvents_;
+  feathercast::files::FileSearchService fileSearchService_;
+  feathercast::runtime::UiEventQueue<feathercast::preview::Result>
+      previewEvents_;
+  feathercast::preview::PreviewService previewService_;
+  feathercast::runtime::UiEventQueue<feathercast::runtime::DecodedIcon>
+      iconEvents_;
   feathercast::runtime::IconResolver iconResolver_;
   feathercast::runtime::UiEventQueue<NetworkEvent> networkEvents_;
   feathercast::runtime::CurrencyService<CurrencyRates> currencyService_;
@@ -8787,14 +10982,18 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool hadLegacyOperationalData_ = false;
   UINT taskbarCreatedMessage_ = 0;
   ULONGLONG lastShortcutToggleTick_ = 0;
-  bool pendingShortcutToggle_ = false;
+  std::uint64_t nextShortcutToggleRequestId_ = 0;
+  std::uint64_t pendingShortcutToggleRequestId_ = 0;
+  std::deque<ShortcutToggleRequest> shortcutToggleRequests_;
+  feathercast::interaction::OverlayFocusSession overlayFocusSession_;
+  bool overlayReactivationQueued_ = false;
   Settings settings_;
   bool settingsPersistenceBlocked_ = false;
   bool settingsRecoveredFromInvalidFile_ = false;
   std::wstring startupSettingsNotice_;
   std::optional<StatusMessage> settingsStatus_;
   ShortcutSpec shortcut_;
-  HWND lastActiveWindow_ = nullptr;
+  std::optional<RestoreCandidate> overlayRestoreCandidate_;
   HWND volumeRestoreWindow_ = nullptr;
   bool visible_ = false;
   bool volumeVisible_ = false;
@@ -8806,15 +11005,46 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   bool systemAnimationsEnabled_ = true;
   bool suppressHide_ = false;
   LARGE_INTEGER qpcFrequency_{};
-  LONGLONG animStartQpc_ = 0;
   LONGLONG lastAnimationFrameQpc_ = 0;
-  LONGLONG lastSelectionFrameQpc_ = 0;
   bool animating_ = false;
   bool animationFrameQueued_ = false;
+  bool animationLoopRunning_ = false;
+  feathercast::motion::AnimationTimeline overlayRevealTimeline_;
+  feathercast::motion::ScalarAnimation overlayOpacity_;
+  feathercast::motion::ScalarAnimation settingsOpacity_;
+  feathercast::motion::ScalarAnimation volumeOpacity_;
+  feathercast::motion::ScalarAnimation confirmationProgress_;
+  feathercast::motion::ScalarAnimation pendingResultsOpacity_;
+  feathercast::motion::ScalarAnimation overlayVisualScroll_;
+  feathercast::motion::ScalarAnimation settingsVisualScroll_;
+  feathercast::motion::ScalarAnimation settingsPageProgress_;
+  feathercast::motion::ScalarAnimation settingsCategoryTop_;
+  feathercast::motion::ScalarAnimation volumeVisualPercent_;
+  feathercast::motion::AnimatedBounds overlayBounds_;
+  feathercast::motion::AnimatedBounds settingsBounds_;
+  feathercast::motion::AnimatedBounds volumeBounds_;
+  feathercast::motion::PendingNavigation pendingNavigation_;
+  std::map<HitType, feathercast::motion::ScalarAnimation> switchAnimations_;
+  struct ResultElementMotion {
+    feathercast::motion::ScalarAnimation offsetY;
+    feathercast::motion::ScalarAnimation opacity;
+  };
+  std::map<std::wstring, ResultElementMotion> resultRowMotion_;
+  std::map<std::wstring, ResultElementMotion> resultHeaderMotion_;
+  std::wstring displayedQuery_;
+  bool overlayClosing_ = false;
+  bool settingsClosing_ = false;
+  bool volumeClosing_ = false;
+  bool confirmationClosing_ = false;
+  std::optional<PendingOverlayClose> pendingOverlayClose_;
+  HWND pendingVolumeRestore_ = nullptr;
+  bool surfaceResizeFailed_ = false;
+  bool forceWarp_ = false;
+  unsigned deviceLossCount_ = 0;
+  bool renderRecoveryQueued_ = false;
   float visualSelectedY_ = -1.0f;
   bool animatingSelection_ = false;
   double selectionSettleSeconds_ = 0.090;
-  bool selectionTimerActive_ = false;
   feathercast::ui::OverlayState overlayState_;
   View& view_ = overlayState_.view;
   HMONITOR overlayMonitor_ = nullptr;
@@ -8859,6 +11089,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::deque<LaunchCompletion> completedLaunches_;
   std::atomic<bool> appsReady_ = false;
   std::uint64_t discoveryGeneration_ = 0;
+  std::uint64_t fileIndexGeneration_ = 0;
+  std::uint64_t previewGeneration_ = 0;
   uint64_t snapshotScheduledRevision_ = 0;
   feathercast::interaction::SearchPresentationState searchPresentation_;
   // Cached query-independent search corpus, rebuilt when the published data
@@ -8871,8 +11103,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::vector<AppEntry> apps_;
   std::vector<WindowEntry> windows_;
   std::vector<AppEntry> fileIndex_;
+  std::optional<feathercast::files::IndexStatus> fileIndexStatus_;
+  bool previewOpen_ = false;
+  float previewScroll_ = 0.0f;
+  std::optional<feathercast::preview::Result> previewResult_;
+  ComPtr<ID2D1Bitmap> previewBitmap_;
   std::vector<AppEntry> systemFolders_;
   std::vector<feathercast::snippets::Snippet> snippets_;
+  feathercast::snippets_io::FileFingerprint snippetsFingerprint_;
+  bool snippetsWritable_ = true;
+  std::wstring snippetsLoadMessage_;
   std::vector<ClipboardEntry> clipboardHistory_;
   unsigned long long clipboardSerial_ = 0;
   std::optional<std::wstring> internalClipboardText_;
@@ -8895,6 +11135,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   };
   std::list<std::wstring> iconLru_;
   std::unordered_map<std::wstring, IconCacheEntry> iconBitmaps_;
+  std::unordered_map<std::wstring, feathercast::runtime::DecodedIcon>
+      pendingDecodedIcons_;
   static constexpr size_t kIconCacheCap = 256;
 
   ComPtr<IDWriteFactory> dwriteFactory_;
@@ -8919,10 +11161,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   ID2D1RenderTarget* activeRT_ = nullptr;
   // Per-render-target cache of solid-color brushes, keyed by packed RGBA.
   std::unordered_map<ID2D1RenderTarget*, std::unordered_map<uint32_t, ComPtr<ID2D1SolidColorBrush>>> brushCache_;
+  HRESULT lastBrushFailure_ = S_OK;
   ComPtr<ID2D1DeviceContext> activeDC_;  // QI of activeRT_ for color-emoji DrawText, when available
   ComPtr<ID2D1StrokeStyle> resultIconStroke_;
   ComPtr<IDWriteTextFormat> inputFormat_;
   ComPtr<IDWriteTextFormat> rowFormat_;
+  ComPtr<IDWriteTextFormat> calculationResultFormat_;
   ComPtr<IDWriteTextFormat> subFormat_;
   ComPtr<IDWriteTextFormat> sectionFormat_;
   ComPtr<IDWriteTextFormat> footerFormat_;
@@ -8938,7 +11182,126 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
 }  // namespace
 
+int RunFeatherCastSelfTest() {
+  const HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(coHr)) return 10;
+
+  ComPtr<IDWriteFactory> writeFactory;
+  const HRESULT writeHr = DWriteCreateFactory(
+      DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+      reinterpret_cast<IUnknown**>(writeFactory.GetAddressOf()));
+
+  ComPtr<IWICImagingFactory> imagingFactory;
+  const HRESULT imagingHr = CoCreateInstance(
+      CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+      IID_PPV_ARGS(&imagingFactory));
+
+  ComPtr<ID2D1Factory1> d2dFactory;
+  const HRESULT d2dHr = D2D1CreateFactory(
+      D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory.GetAddressOf());
+  if (FAILED(writeHr) || FAILED(imagingHr) || FAILED(d2dHr)) {
+    d2dFactory.Reset();
+    imagingFactory.Reset();
+    writeFactory.Reset();
+    CoUninitialize();
+    return 11;
+  }
+
+  ComPtr<ID3D11Device> d3dDevice;
+  ComPtr<ID3D11DeviceContext> d3dContext;
+  ComPtr<ID2D1Device> d2dDevice;
+  ComPtr<ID2D1DeviceContext> renderContext;
+  auto recreateDevice = [&]() -> HRESULT {
+    renderContext.Reset();
+    d2dDevice.Reset();
+    d3dContext.Reset();
+    d3dDevice.Reset();
+    D3D_FEATURE_LEVEL featureLevel{};
+    HRESULT result = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        &d3dDevice, &featureLevel, &d3dContext);
+    if (FAILED(result)) return result;
+    ComPtr<IDXGIDevice> dxgiDevice;
+    result = d3dDevice.As(&dxgiDevice);
+    if (FAILED(result)) return result;
+    result = d2dFactory->CreateDevice(dxgiDevice.Get(), &d2dDevice);
+    if (FAILED(result)) return result;
+    return d2dDevice->CreateDeviceContext(
+        D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &renderContext);
+  };
+
+  // A windowless render-target lifecycle stress test. Recreating the complete
+  // WARP stack every 50 iterations simulates recovery from device loss; varied
+  // target sizes, DPI values, colors and text formats cover resize, DPI and
+  // theme/high-contrast invalidation without creating or focusing any HWND.
+  HRESULT lifecycleResult = S_OK;
+  for (unsigned cycle = 0; cycle < 500; ++cycle) {
+    if (cycle % 50 == 0) {
+      lifecycleResult = recreateDevice();
+      if (FAILED(lifecycleResult)) break;
+    }
+    const float dpiValues[] = {96.0f, 120.0f, 144.0f, 192.0f};
+    const float dpi = dpiValues[cycle % ARRAYSIZE(dpiValues)];
+    const UINT width = 480 + (cycle % 9) * 37;
+    const UINT height = 240 + (cycle % 7) * 29;
+    ComPtr<ID2D1Bitmap1> target;
+    const auto properties = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                          D2D1_ALPHA_MODE_PREMULTIPLIED),
+        dpi, dpi);
+    lifecycleResult = renderContext->CreateBitmap(
+        D2D1::SizeU(width, height), nullptr, 0, &properties, &target);
+    if (FAILED(lifecycleResult)) break;
+    renderContext->SetTarget(target.Get());
+    renderContext->SetDpi(dpi, dpi);
+
+    ComPtr<IDWriteTextFormat> format;
+    lifecycleResult = writeFactory->CreateTextFormat(
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        14.0f + static_cast<float>(cycle % 3), L"en-US", &format);
+    if (FAILED(lifecycleResult)) break;
+    ComPtr<ID2D1SolidColorBrush> brush;
+    const bool highContrastPass = (cycle % 2) != 0;
+    lifecycleResult = renderContext->CreateSolidColorBrush(
+        highContrastPass ? D2D1::ColorF(D2D1::ColorF::White)
+                         : D2D1::ColorF(0.24f, 0.52f, 0.96f, 1.0f),
+        &brush);
+    if (FAILED(lifecycleResult)) break;
+    renderContext->BeginDraw();
+    renderContext->Clear(
+        highContrastPass ? D2D1::ColorF(D2D1::ColorF::Black)
+                         : D2D1::ColorF(0.04f, 0.05f, 0.07f, 1.0f));
+    static constexpr wchar_t kText[] = L"FeatherCast lifecycle";
+    renderContext->DrawTextW(
+        kText, ARRAYSIZE(kText) - 1, format.Get(),
+        D2D1::RectF(8.0f, 8.0f, static_cast<float>(width - 8),
+                    static_cast<float>(height - 8)),
+        brush.Get());
+    lifecycleResult = renderContext->EndDraw();
+    renderContext->SetTarget(nullptr);
+    if (FAILED(lifecycleResult)) break;
+  }
+
+  renderContext.Reset();
+  d2dDevice.Reset();
+  d3dContext.Reset();
+  d3dDevice.Reset();
+  d2dFactory.Reset();
+  imagingFactory.Reset();
+  writeFactory.Reset();
+  CoUninitialize();
+  return SUCCEEDED(lifecycleResult) ? 0 : 12;
+}
+
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
+  const std::wstring cmdLineStr = cmdLine ? cmdLine : L"";
+  if (cmdLineStr.find(L"--self-test") != std::wstring::npos) {
+    return RunFeatherCastSelfTest();
+  }
+
   UniqueHandle mutex(CreateMutexW(nullptr, TRUE, kMutexName));
   if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
     for (int attempt = 0; attempt < 40; ++attempt) {
@@ -8957,7 +11320,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     return 1;
   }
 
-  std::wstring cmdLineStr = cmdLine ? cmdLine : L"";
   FeatherCastApp app(instance, cmdLineStr);
   return app.Run();
 }

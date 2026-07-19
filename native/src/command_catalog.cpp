@@ -26,8 +26,12 @@ app::DisplayItem ActionItem(app::ActionKind kind, std::wstring label,
   item.commandKeywords = {label, detail};
   item.commandName = std::move(label);
   item.commandDetail = std::move(detail);
-  item.actionTarget = target.isWindow ? app::ActionTarget{target.window}
-                                      : app::ActionTarget{target.app};
+  if (target.isAction) {
+    item.actionTarget = target.actionTarget;
+  } else {
+    item.actionTarget = target.isWindow ? app::ActionTarget{target.window}
+                                        : app::ActionTarget{target.app};
+  }
   return item;
 }
 
@@ -180,6 +184,37 @@ std::vector<app::DisplayItem> BuildCommandItems() {
 std::vector<app::DisplayItem> BuildActions(
     const app::DisplayItem& target, const app::Settings& settings) {
   std::vector<app::DisplayItem> actions;
+  if (target.isAction && target.action == app::ActionKind::ArrangeWindow) {
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowLeftHalf,
+                                 L"Left Half", L"Fill the left half", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowRightHalf,
+                                 L"Right Half", L"Fill the right half", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowTopHalf,
+                                 L"Top Half", L"Fill the top half", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowBottomHalf,
+                                 L"Bottom Half", L"Fill the bottom half", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowLeftThird,
+                                 L"Left Third", L"Fill the left third", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowCenterThird,
+                                 L"Center Third", L"Fill the center third", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowRightThird,
+                                 L"Right Third", L"Fill the right third", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowTopLeft,
+                                 L"Top Left Quarter", L"Fill the top-left quarter", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowTopRight,
+                                 L"Top Right Quarter", L"Fill the top-right quarter", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowBottomLeft,
+                                 L"Bottom Left Quarter", L"Fill the bottom-left quarter", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowBottomRight,
+                                 L"Bottom Right Quarter", L"Fill the bottom-right quarter", target));
+    actions.push_back(ActionItem(app::ActionKind::CenterWindow,
+                                 L"Center", L"Center without resizing", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowPreviousDisplay,
+                                 L"Previous Display", L"Move to the previous monitor", target));
+    actions.push_back(ActionItem(app::ActionKind::MoveWindowNextDisplay,
+                                 L"Next Display", L"Move to the next monitor", target));
+    return actions;
+  }
   if (target.isCommand || target.isAction || target.isExtension ||
       target.isCapability || target.isRunCommand || target.isWebSearch) {
     return actions;
@@ -192,24 +227,9 @@ std::vector<app::DisplayItem> BuildActions(
     actions.push_back(ActionItem(app::ActionKind::MaximizeRestore,
                                  L"Maximize or Restore Window",
                                  L"Toggle window state", target));
-    actions.push_back(ActionItem(app::ActionKind::MoveWindowLeftHalf,
-                                 L"Move to Left Half",
-                                 L"Fill the left half of the work area", target));
-    actions.push_back(ActionItem(app::ActionKind::MoveWindowRightHalf,
-                                 L"Move to Right Half",
-                                 L"Fill the right half of the work area", target));
-    actions.push_back(ActionItem(app::ActionKind::MoveWindowTopHalf,
-                                 L"Move to Top Half",
-                                 L"Fill the top half of the work area", target));
-    actions.push_back(ActionItem(app::ActionKind::MoveWindowBottomHalf,
-                                 L"Move to Bottom Half",
-                                 L"Fill the bottom half of the work area", target));
-    actions.push_back(ActionItem(app::ActionKind::CenterWindow,
-                                 L"Center Window",
-                                 L"Center the window without enlarging it", target));
-    actions.push_back(ActionItem(app::ActionKind::MoveWindowNextDisplay,
-                                 L"Move to Next Display",
-                                 L"Move the window to the next monitor", target));
+    actions.push_back(ActionItem(app::ActionKind::ArrangeWindow,
+                                 L"Arrange Window...",
+                                 L"Choose a half, third, quarter, or display", target));
     actions.push_back(ActionItem(app::ActionKind::CloseWindow, L"Close Window",
                                  L"Send close request", target));
     return actions;
@@ -240,6 +260,11 @@ std::vector<app::DisplayItem> BuildActions(
                                      L"Paste this value into the previous app", value));
     return actions;
   }
+  if (target.app.source == L"file") {
+    actions.push_back(ActionItem(app::ActionKind::Preview, L"Preview",
+                                 L"Show text, image, or metadata preview",
+                                 target));
+  }
   actions.push_back(ActionItem(app::ActionKind::Open, L"Open",
                                L"Launch " + target.app.name, target));
   if (target.app.adminSupported) {
@@ -257,6 +282,12 @@ std::vector<app::DisplayItem> BuildActions(
       !target.app.launchTarget.empty()) {
     actions.push_back(ActionItem(app::ActionKind::CopyPath, L"Copy Path",
                                  L"Copy app shortcut or target path", target));
+  }
+  if (!target.app.id.empty() && target.app.source != L"quicklink" &&
+      target.app.source != L"file") {
+    actions.push_back(ActionItem(app::ActionKind::EditAppAlias,
+                                 L"Add or Edit Alias",
+                                 L"Choose another search name for this app", target));
   }
   actions.push_back(
       HasAppKey(settings.pinnedApps, target.app)

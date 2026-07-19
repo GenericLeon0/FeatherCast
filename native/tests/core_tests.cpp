@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <map>
 #include <set>
 #include <string_view>
@@ -29,6 +30,7 @@
 using feathercast::core::ScoreItem;
 using feathercast::core::ScoreText;
 using feathercast::core::Search;
+using feathercast::core::MatchClass;
 using feathercast::core::SearchOptions;
 using feathercast::core::SearchPrepared;
 using feathercast::core::SearchItem;
@@ -643,6 +645,116 @@ int main() {
     assert(SearchPrepared(L"terminal", prepared, {}, options).empty());
   }
 
+  {
+    auto matchClassFor = [](const std::wstring& query,
+                            const SearchItem& item) {
+      const std::wstring normalized = feathercast::core::Normalize(query);
+      return feathercast::core::ScorePreparedItemDetailed(
+                 normalized, feathercast::core::TokensNormalized(normalized),
+                 feathercast::core::PrepareSearchItem(item), {})
+          .matchClass;
+    };
+
+    SearchItem exactItem;
+    exactItem.name = L"Terminal";
+    assert(matchClassFor(L"terminal", exactItem) == MatchClass::ExactName);
+    assert(matchClassFor(L"term", exactItem) == MatchClass::NamePrefix);
+
+    SearchItem boundaryItem;
+    boundaryItem.name = L"Visual Studio Code";
+    assert(matchClassFor(L"studio", boundaryItem) ==
+           MatchClass::NameBoundary);
+    assert(matchClassFor(L"visual code", boundaryItem) ==
+           MatchClass::NameBoundary);
+
+    SearchItem fieldItem;
+    fieldItem.name = L"Console Host";
+    fieldItem.keywords = {L"shell terminal"};
+    assert(matchClassFor(L"shell", fieldItem) == MatchClass::FieldPrefix);
+
+    assert(matchClassFor(L"termainl", exactItem) == MatchClass::Typo);
+    assert(matchClassFor(L"trm", exactItem) == MatchClass::General);
+    assert(matchClassFor(L"xyz", exactItem) == MatchClass::None);
+
+    auto referenceDistance = [](const std::wstring& a,
+                                const std::wstring& b) {
+      const size_t rows = a.size() + 1;
+      const size_t columns = b.size() + 1;
+      std::vector<int> matrix(rows * columns, 0);
+      auto at = [&](size_t row, size_t column) -> int& {
+        return matrix[row * columns + column];
+      };
+      for (size_t row = 0; row < rows; ++row) at(row, 0) = static_cast<int>(row);
+      for (size_t column = 0; column < columns; ++column) {
+        at(0, column) = static_cast<int>(column);
+      }
+      for (size_t row = 1; row < rows; ++row) {
+        for (size_t column = 1; column < columns; ++column) {
+          const int cost = a[row - 1] == b[column - 1] ? 0 : 1;
+          at(row, column) = std::min(
+              {at(row - 1, column) + 1, at(row, column - 1) + 1,
+               at(row - 1, column - 1) + cost});
+          if (row > 1 && column > 1 &&
+              a[row - 1] == b[column - 2] &&
+              a[row - 2] == b[column - 1]) {
+            at(row, column) =
+                std::min(at(row, column), at(row - 2, column - 2) + 1);
+          }
+        }
+      }
+      return at(a.size(), b.size());
+    };
+
+    std::vector<std::wstring> shortStrings{L""};
+    for (int length = 1; length <= 4; ++length) {
+      for (int bits = 0; bits < (1 << length); ++bits) {
+        std::wstring value;
+        for (int bit = 0; bit < length; ++bit) {
+          value.push_back((bits & (1 << bit)) != 0 ? L'b' : L'a');
+        }
+        shortStrings.push_back(std::move(value));
+      }
+    }
+    for (const auto& a : shortStrings) {
+      for (const auto& b : shortStrings) {
+        const int exact = referenceDistance(a, b);
+        for (const int maximum : {1, 2}) {
+          const int bounded = feathercast::core::DamerauLevenshteinDistance(
+              a, b, maximum);
+          if (bounded != std::min(exact, maximum + 1)) {
+            std::wcerr << L"distance mismatch a=" << a << L" b=" << b
+                       << L" max=" << maximum << L" expected="
+                       << std::min(exact, maximum + 1) << L" actual="
+                       << bounded << L"\n";
+          }
+          assert(bounded == std::min(exact, maximum + 1));
+        }
+      }
+    }
+  }
+
+  {
+    std::vector<feathercast::core::PreparedSearchItem> corpus;
+    for (int i = 0; i < 300; ++i) {
+      SearchItem item;
+      item.id = L"item:" + std::to_wstring(i);
+      item.name = i % 3 == 0 ? L"Application Studio " + std::to_wstring(i)
+                             : L"Utility Application " + std::to_wstring(i);
+      item.keywords = {L"application", L"tool"};
+      item.pinned = i % 29 == 0;
+      item.usageCount = i % 17;
+      corpus.push_back(feathercast::core::PrepareSearchItem(item));
+    }
+    SearchOptions unlimited;
+    const auto all = SearchPrepared(L"application", corpus, {}, unlimited);
+    SearchOptions limitedOptions;
+    limitedOptions.limit = 17;
+    const auto limited =
+        SearchPrepared(L"application", corpus, {}, limitedOptions);
+    assert(limited.size() == 17);
+    assert(std::equal(limited.begin(), limited.end(), all.begin()));
+  }
+
   const double base = ScoreItem(L"notepad", notepad, {});
   const double recent = ScoreItem(L"notepad", notepad, {L"notepad"});
   assert(recent > base);
@@ -675,20 +787,29 @@ int main() {
   visualStudioCode.keywords = {L"code"};
   visualStudioCode.usageCount = 20;
   visualStudioCode.lastUsed = 1000;
-  assert(ScoreItem(L"code", visualStudioCode, {L"vscode"}) > ScoreItem(L"code", codeBlocks, {}));
+  assert(ScoreItem(L"code", codeBlocks, {}) >
+         ScoreItem(L"code", visualStudioCode, {L"vscode"}));
 
   {
     const long long now = 1750000000;
 
-    // A frequently used, recently launched app must beat a cold prefix match
-    // even without a matching keyword.
+    // Personalization cannot promote a weaker boundary match over a name
+    // prefix; it only reorders results within the same match class.
     SearchItem dailyDriver;
     dailyDriver.id = L"vscode-daily";
     dailyDriver.kind = L"app";
     dailyDriver.name = L"Visual Studio Code";
     dailyDriver.usageCount = 30;
     dailyDriver.lastUsed = now;
-    assert(ScoreItem(L"code", dailyDriver, {L"vscode-daily"}, now) > ScoreItem(L"code", codeBlocks, {}, now));
+    assert(ScoreItem(L"code", codeBlocks, {}, now) >
+           ScoreItem(L"code", dailyDriver, {L"vscode-daily"}, now));
+
+    SearchItem coldBoundary = dailyDriver;
+    coldBoundary.id = L"cold-boundary";
+    coldBoundary.usageCount = 0;
+    coldBoundary.lastUsed = 0;
+    assert(ScoreItem(L"code", dailyDriver, {L"vscode-daily"}, now) >
+           ScoreItem(L"code", coldBoundary, {}, now));
 
     // Recency decays over time.
     SearchItem aged = dailyDriver;
@@ -763,7 +884,7 @@ int main() {
     original.appAliases[std::wstring(L"vs") + wchar_t(0xE4)] = L"line1\nline2\t\"quoted\"";  // key with a-umlaut
     original.usageStats[L"app:one"] = {42, 1750000000};
     original.compactMode = true;
-    original.animationsEnabled = false;
+    original.animationLevel = fs::AnimationLevel::Reduced;
     original.customAccentColor = L"#ff0000";
     original.lastUpdateAttempt = 1234567890000;
     original.lastUpdateCheck = 1234567890123;
@@ -790,7 +911,7 @@ int main() {
     assert(copy.usageStats.at(L"app:one").launches == 42);
     assert(copy.usageStats.at(L"app:one").lastUsed == 1750000000);
     assert(copy.compactMode == original.compactMode);
-    assert(copy.animationsEnabled == original.animationsEnabled);
+    assert(copy.animationLevel == original.animationLevel);
     assert(copy.customAccentColor == original.customAccentColor);
     assert(copy.lastUpdateAttempt == original.lastUpdateAttempt);
     assert(copy.lastUpdateCheck == original.lastUpdateCheck);
@@ -806,10 +927,65 @@ int main() {
     assert(copy.fileIndexRoots == original.fileIndexRoots);
     assert(copy.diagnosticsEnabled == original.diagnosticsEnabled);
     assert(copy.searchEngines == original.searchEngines);
+    fs::Settings noSearchEngines;
+    noSearchEngines.searchEngines.clear();
+    const auto emptySearchEngines =
+        fs::ParseSettings(fs::SerializeSettings(noSearchEngines));
+    assert(emptySearchEngines.searchEngines.empty());
+    assert(fs::ParseSettings(R"({"searchEngines": {}})")
+               .searchEngines.empty());
+    assert(!fs::ParseSettings("{}").searchEngines.empty());
     assert(copy.quicklinks.size() == 1);
     assert(copy.quicklinks[0].keyword == L"docs");
     assert(copy.quicklinks[0].name == L"My \"Docs\"");
     assert(copy.quicklinks[0].target == L"C:\\Users\\Leon\\Docs");
+
+    for (const auto level : {fs::AnimationLevel::Off,
+                             fs::AnimationLevel::Reduced,
+                             fs::AnimationLevel::Full}) {
+      fs::Settings animationSettings;
+      animationSettings.animationLevel = level;
+      const std::string serialized = fs::SerializeSettings(animationSettings);
+      assert(fs::ParseSettings(serialized).animationLevel == level);
+      const std::string legacyValue =
+          level == fs::AnimationLevel::Off
+              ? "\"animationsEnabled\": false"
+              : "\"animationsEnabled\": true";
+      assert(serialized.find(legacyValue) != std::string::npos);
+    }
+
+    assert(fs::ParseSettings("{}").animationLevel == fs::AnimationLevel::Full);
+    assert(fs::ParseSettings(R"({"animationsEnabled": false})")
+               .animationLevel == fs::AnimationLevel::Off);
+    assert(fs::ParseSettings(R"({"animationsEnabled": true})")
+               .animationLevel == fs::AnimationLevel::Full);
+    assert(fs::ParseSettings(
+               R"({"animationLevel": "reduced", "animationsEnabled": false})")
+               .animationLevel == fs::AnimationLevel::Reduced);
+    assert(fs::ParseSettings(
+               R"({"animationLevel": "invalid", "animationsEnabled": false})")
+               .animationLevel == fs::AnimationLevel::Off);
+
+    assert(!fs::AnimationAllowed(fs::AnimationLevel::Off,
+                                 fs::AnimationKind::Fade));
+    assert(fs::AnimationAllowed(fs::AnimationLevel::Reduced,
+                                fs::AnimationKind::Fade));
+    assert(fs::AnimationAllowed(fs::AnimationLevel::Reduced,
+                                fs::AnimationKind::ControlFeedback));
+    assert(!fs::AnimationAllowed(fs::AnimationLevel::Reduced,
+                                 fs::AnimationKind::Spatial));
+    assert(fs::AnimationAllowed(fs::AnimationLevel::Full,
+                                fs::AnimationKind::Spatial));
+    assert(!fs::AnimationAllowed(fs::AnimationLevel::Full,
+                                 fs::AnimationKind::Fade, false, false));
+    assert(!fs::AnimationAllowed(fs::AnimationLevel::Full,
+                                 fs::AnimationKind::Fade, true, true));
+    assert(fs::StepAnimationLevel(fs::AnimationLevel::Off, -1) ==
+           fs::AnimationLevel::Off);
+    assert(fs::StepAnimationLevel(fs::AnimationLevel::Off, 1) ==
+           fs::AnimationLevel::Reduced);
+    assert(fs::StepAnimationLevel(fs::AnimationLevel::Full, 1) ==
+           fs::AnimationLevel::Full);
 
     // Malformed/edge inputs fall back to defaults without crashing.
     assert(fs::ParseSettings("").shortcut == L"Alt+Space");
@@ -872,6 +1048,7 @@ int main() {
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Alt+Space"), false));
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Super"), false));
     assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Super"), true));
+    assert(ShouldHandleInLowLevelHook(ParseShortcut(L"Alt"), true));
     assert(!ShouldHandleInLowLevelHook(ParseShortcut(L"none"), false));
   }
 
@@ -923,13 +1100,27 @@ int main() {
   {
     const auto super = ParseShortcut(L"Super");
     ShortcutRuntime runtime;
-    AssertPassOnly(runtime.Handle(super, VK_LWIN, true, false, Mods(false, false, false, true)));
+    AssertPassOnly(runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true)));
+
+    const auto repeat = runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true));
+    AssertPassOnly(repeat);
+
     const auto release = runtime.Handle(super, VK_LWIN, false, true, Mods());
     assert(!release.consume);
     assert(release.toggle);
     assert(release.suppressWinStart);
     assert(release.deferToggleUntilWinRelease);
     AssertPassOnly(runtime.Handle(super, VK_LWIN, false, true, Mods()));
+
+    AssertPassOnly(runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true)));
+    const auto reopenRelease = runtime.Handle(super, VK_LWIN, false, true, Mods());
+    assert(!reopenRelease.consume);
+    assert(reopenRelease.toggle);
+    assert(reopenRelease.suppressWinStart);
+    assert(reopenRelease.deferToggleUntilWinRelease);
   }
 
   {
@@ -947,10 +1138,16 @@ int main() {
   {
     const auto super = ParseShortcut(L"Super");
     ShortcutRuntime runtime;
-    AssertPassOnly(runtime.Handle(super, VK_LWIN, true, false, Mods(false, false, false, true)));
-    AssertPassOnly(runtime.Handle(super, L'E', true, false, Mods(false, false, false, true)));
-    AssertPassOnly(runtime.Handle(super, L'E', false, true, Mods(false, false, false, true)));
-    AssertPassOnly(runtime.Handle(super, VK_LWIN, false, true, Mods()));
+    AssertPassOnly(runtime.Handle(
+        super, VK_LWIN, true, false, Mods(false, false, false, true)));
+    const auto chordDown = runtime.Handle(
+        super, VK_LEFT, true, false, Mods(false, false, false, true));
+    AssertPassOnly(chordDown);
+    const auto chordUp = runtime.Handle(
+        super, VK_LEFT, false, true, Mods(false, false, false, true));
+    AssertPassOnly(chordUp);
+    const auto winUp = runtime.Handle(super, VK_LWIN, false, true, Mods());
+    AssertPassOnly(winUp);
   }
 
   {
@@ -961,7 +1158,6 @@ int main() {
     assert(open.consume);
     assert(open.toggle);
     assert(open.suppressWinStart);
-    assert(!open.deferToggleUntilWinRelease);
     const auto repeat = runtime.Handle(superSpace, VK_SPACE, true, false, Mods(false, false, false, true));
     assert(repeat.consume);
     assert(!repeat.toggle);
@@ -997,7 +1193,7 @@ int main() {
     ShortcutRuntime altRuntime;
     AssertPassOnly(altRuntime.Handle(alt, VK_MENU, true, false, Mods(false, true)));
     const auto altRelease = altRuntime.Handle(alt, VK_MENU, false, true, Mods());
-    assert(altRelease.consume);
+    assert(!altRelease.consume);
     assert(altRelease.toggle);
     assert(!altRelease.suppressWinStart);
     assert(!altRelease.deferToggleUntilWinRelease);

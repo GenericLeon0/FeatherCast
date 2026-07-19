@@ -85,8 +85,18 @@ int main() {
   assert(launch.Submit([&](std::stop_token) { events.Push(1); }));
 
   feathercast::runtime::IconResolver icons(
-      [&](std::wstring key) { events.Push(std::move(key)); });
-  icons.Start(1, [](const std::wstring&, std::stop_token) { return true; });
+      [&](feathercast::runtime::DecodedIcon icon) {
+        events.Push(std::move(icon.key));
+      });
+  icons.Start(1, [](const std::wstring& key, std::stop_token) {
+    feathercast::runtime::DecodedIcon icon;
+    icon.key = key;
+    icon.width = 1;
+    icon.height = 1;
+    icon.stride = 4;
+    icon.pixels.resize(4);
+    return std::optional{std::move(icon)};
+  });
   assert(icons.Queue(L"fake-icon"));
 
   std::size_t delivered = 0;

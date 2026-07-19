@@ -1,11 +1,53 @@
 #include "background_services.hpp"
 
 #include <objbase.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <utility>
 
 namespace feathercast::runtime {
+
+std::optional<DecodedIcon> DecodePngIcon(
+    IWICImagingFactory* factory, const std::filesystem::path& path,
+    const std::wstring& key) {
+  if (!factory) return std::nullopt;
+  Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+  if (FAILED(factory->CreateDecoderFromFilename(
+          path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad,
+          decoder.GetAddressOf()))) {
+    return std::nullopt;
+  }
+  Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) return std::nullopt;
+  Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory->CreateFormatConverter(converter.GetAddressOf())) ||
+      FAILED(converter->Initialize(
+          frame.Get(), GUID_WICPixelFormat32bppPBGRA,
+          WICBitmapDitherTypeNone, nullptr, 0,
+          WICBitmapPaletteTypeMedianCut))) {
+    return std::nullopt;
+  }
+  UINT width = 0;
+  UINT height = 0;
+  if (FAILED(converter->GetSize(&width, &height)) || width == 0 ||
+      height == 0 || width > 512 || height > 512) {
+    return std::nullopt;
+  }
+  DecodedIcon icon;
+  icon.key = key;
+  icon.width = width;
+  icon.height = height;
+  icon.stride = width * 4u;
+  icon.pixels.resize(static_cast<std::size_t>(icon.stride) * height);
+  if (FAILED(converter->CopyPixels(
+          nullptr, icon.stride, static_cast<UINT>(icon.pixels.size()),
+          icon.pixels.data()))) {
+    return std::nullopt;
+  }
+  return icon;
+}
 
 void LaunchService::Start(std::size_t workers, ErrorHandler errorHandler) {
   executor_.Start(workers, std::move(errorHandler));
@@ -19,8 +61,8 @@ bool LaunchService::Submit(Task task) {
   return executor_.Submit(std::move(task));
 }
 
-IconResolver::IconResolver(Completed completed)
-    : completed_(std::move(completed)) {}
+IconResolver::IconResolver(Completed completed, Failed failed)
+    : completed_(std::move(completed)), failed_(std::move(failed)) {}
 
 IconResolver::~IconResolver() {
   Stop();
@@ -77,10 +119,20 @@ void IconResolver::ClearPending() {
 }
 
 void IconResolver::WorkerLoop(std::stop_token stopToken) {
-  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(coResult)) {
+    if (failed_) {
+      try {
+        failed_(std::make_exception_ptr(
+            std::runtime_error("icon worker COM initialization failed")));
+      } catch (...) {}
+    }
+    return;
+  }
   for (;;) {
     std::wstring key;
     Resolve resolve;
+    std::optional<DecodedIcon> decoded;
     {
       std::unique_lock lock(mutex_);
       cv_.wait(lock, [&] {
@@ -91,12 +143,24 @@ void IconResolver::WorkerLoop(std::stop_token stopToken) {
       jobs_.pop_front();
       resolve = resolve_;
     }
-    if (!stopToken.stop_requested()) resolve(key, stopToken);
+    try {
+      if (!stopToken.stop_requested()) decoded = resolve(key, stopToken);
+    } catch (...) {
+      if (failed_) {
+        try { failed_(std::current_exception()); } catch (...) {}
+      }
+    }
     {
       std::lock_guard lock(mutex_);
       pending_.erase(key);
     }
-    if (!stopToken.stop_requested() && completed_) completed_(std::move(key));
+    if (!stopToken.stop_requested() && decoded && completed_) {
+      try { completed_(std::move(*decoded)); } catch (...) {
+        if (failed_) {
+          try { failed_(std::current_exception()); } catch (...) {}
+        }
+      }
+    }
   }
   CoUninitialize();
 }

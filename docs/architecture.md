@@ -16,6 +16,14 @@ may mutate live window state.
 - `PersistenceService` serializes settings and SQLite work and drains writes at
   orderly shutdown.
 - `DiscoveryService` coalesces refreshes and suppresses stale generations.
+- `FileIndexService` owns recursive fixed-local-root crawling, one asynchronous
+  `ReadDirectoryChangesW` watcher per root, burst coalescing, reconciliation,
+  cancellation, and bounded retries. It emits typed batches/status only.
+- `FileSearchService` owns the read-only WAL SQLite connection used for
+  generation-safe `@files` FTS queries. Root search never calls FTS.
+- `PreviewService` reads bounded metadata/text/image payloads on demand and
+  suppresses stale generations. WIC decoding produces CPU pixels; Direct2D
+  bitmap creation remains on the UI thread.
 - `SearchCoordinator` coalesces queries; `SnapshotCoordinator` prepares
   immutable corpus snapshots by revision. `search_pipeline::ComputeResults`
   is the pure query-to-sections engine shared by the app and headless tests.
@@ -24,6 +32,10 @@ may mutate live window state.
   runtime network adapter.
 - Command and setting descriptor catalogs provide stable IDs, labels,
   availability metadata, focus order, and confirmation policy.
+- The Library model owns snippet/quicklink validation and ordering. Snippet I/O
+  preserves the existing JSON format, performs atomic replacement, and detects
+  external file changes. The native manager/editor UI lives outside the Win32
+  composition root and reports successful mutations back as typed operations.
 - The capability catalog describes built-in feature discovery, examples, and
   typed guide actions without changing search-provider or plugin contracts.
 - Result actions carry a typed app, window, or text payload. Window geometry,
@@ -61,9 +73,11 @@ rejected.
 Shutdown is idempotent and ordered:
 
 1. Mark the app as stopping so notifiers stop posting window messages.
-2. Stop launch, discovery, search, snapshot, currency, update, extension, and
-   icon workers; each service requests cancellation and joins its threads.
-3. Drain serialized persistence work and close the database.
+2. Stop launch, discovery, file-index watchers, preview, file-search, search,
+   snapshot, currency, update, extension, and icon workers; each service
+   requests cancellation and joins its threads.
+3. Drain serialized persistence work and close the database. The read-only FTS
+   connection always closes before the persistence writer.
 4. Close event queues so late producer results are rejected.
 5. Release render resources, hooks, tray state, and windows on the UI thread.
 
@@ -75,13 +89,17 @@ window.
 - `%APPDATA%\FeatherCast`: settings, snippets, themes, and user plugins.
 - `%LOCALAPPDATA%\FeatherCast`: SQLite operational data, icon cache, updates,
   currency cache, and diagnostics.
-- Settings JSON writes `"schemaVersion": 1`. A missing version is version 0.
+- Settings JSON writes `"schemaVersion": 2`. A missing version is version 0.
   Files newer than the supported version are preserved and automatic saving is
   blocked.
-- SQLite uses schema versioning, busy timeouts, integrity checks, and corrupt
-  database quarantine. Clipboard text and previews remain protected with
-  user-scoped Windows DPAPI.
+- SQLite schema v3 gives indexed files stable IDs and uses an FTS5
+  `contentless_delete` table whose row IDs match file IDs. Migration creates a
+  database backup because clipboard data shares the file. SQLite uses WAL,
+  busy timeouts, integrity checks, and corrupt database quarantine. Clipboard
+  text and previews remain protected with user-scoped Windows DPAPI.
 - Native plugin ABI v1/v2 and plugin-host isolation remain unchanged.
+- Plugin health exposes availability, consecutive failure strikes, and the last
+  in-memory error without changing plugin manifests or the ABI.
 
 ## Change Rules
 

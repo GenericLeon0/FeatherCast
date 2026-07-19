@@ -4,6 +4,7 @@
 // round-trip can be unit-tested. Clamping of overlayWidth/maxResults stays at
 // the call sites in main.cpp next to the MIN/MAX constants.
 
+#include <algorithm>
 #include <map>
 #include <cmath>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "extension_protocol.hpp"  // Utf8ToWide / WideToUtf8
@@ -18,7 +20,63 @@
 
 namespace feathercast::settings {
 
-inline constexpr int kCurrentSettingsSchemaVersion = 1;
+inline constexpr int kCurrentSettingsSchemaVersion = 2;
+
+enum class AnimationLevel {
+  Off,
+  Reduced,
+  Full,
+};
+
+enum class AnimationKind {
+  Fade,
+  Spatial,
+  ControlFeedback,
+};
+
+inline constexpr std::string_view AnimationLevelKey(AnimationLevel level) {
+  switch (level) {
+    case AnimationLevel::Off: return "off";
+    case AnimationLevel::Reduced: return "reduced";
+    case AnimationLevel::Full: return "full";
+  }
+  return "full";
+}
+
+inline constexpr std::wstring_view AnimationLevelLabel(AnimationLevel level) {
+  switch (level) {
+    case AnimationLevel::Off: return L"Off";
+    case AnimationLevel::Reduced: return L"Reduced";
+    case AnimationLevel::Full: return L"Full";
+  }
+  return L"Full";
+}
+
+inline constexpr std::optional<AnimationLevel> ParseAnimationLevel(
+    std::string_view value) {
+  if (value == "off") return AnimationLevel::Off;
+  if (value == "reduced") return AnimationLevel::Reduced;
+  if (value == "full") return AnimationLevel::Full;
+  return std::nullopt;
+}
+
+inline constexpr AnimationLevel StepAnimationLevel(AnimationLevel level,
+                                                   int direction) {
+  const int current = static_cast<int>(level);
+  return static_cast<AnimationLevel>(
+      std::clamp(current + direction, static_cast<int>(AnimationLevel::Off),
+                 static_cast<int>(AnimationLevel::Full)));
+}
+
+inline constexpr bool AnimationAllowed(AnimationLevel level,
+                                       AnimationKind kind,
+                                       bool systemAnimationsEnabled = true,
+                                       bool highContrast = false) {
+  if (!systemAnimationsEnabled || highContrast || level == AnimationLevel::Off) {
+    return false;
+  }
+  return level == AnimationLevel::Full || kind != AnimationKind::Spatial;
+}
 
 // A user-defined keyword that opens a URL, file, or folder directly.
 struct Quicklink {
@@ -27,9 +85,20 @@ struct Quicklink {
   std::wstring target;
 };
 
+inline std::map<std::wstring, std::wstring> DefaultSearchEngines() {
+  return {
+      {L"g", L"https://www.google.com/search?q=%s"},
+      {L"ddg", L"https://duckduckgo.com/?q=%s"},
+      {L"yt", L"https://www.youtube.com/results?search_query=%s"},
+      {L"gh", L"https://github.com/search?q=%s"},
+      {L"w", L"https://en.wikipedia.org/w/index.php?search=%s"},
+  };
+}
+
 struct PrivacySettings {
   bool clipboardEnabled = false;
   bool fileIndexEnabled = false;
+  bool fileContentIndexEnabled = false;
   std::vector<std::wstring> roots;
   int retention = 50;
 };
@@ -46,7 +115,7 @@ struct Settings {
   };
   std::map<std::wstring, UsageStat> usageStats;
   bool compactMode = false;
-  bool animationsEnabled = true;
+  AnimationLevel animationLevel = AnimationLevel::Full;
   bool syncAccentColor = true;
   std::wstring customAccentColor = L"#5b6cff";
   bool startOnStartup = false;
@@ -64,23 +133,20 @@ struct Settings {
   bool clipboardHistoryEnabled = false;
   int clipboardHistoryLimit = 50;
   bool fileIndexEnabled = false;
+  bool fileContentIndexEnabled = false;
   int fileIndexMaxEntries = 5000;
   std::vector<std::wstring> fileIndexRoots;
   bool diagnosticsEnabled = false;
   // Web search prefixes: keyword -> URL template containing "%s" for the query.
-  std::map<std::wstring, std::wstring> searchEngines = {
-    {L"g", L"https://www.google.com/search?q=%s"},
-    {L"ddg", L"https://duckduckgo.com/?q=%s"},
-    {L"yt", L"https://www.youtube.com/results?search_query=%s"},
-    {L"gh", L"https://github.com/search?q=%s"},
-    {L"w", L"https://en.wikipedia.org/w/index.php?search=%s"},
-  };
+  std::map<std::wstring, std::wstring> searchEngines =
+      DefaultSearchEngines();
   std::vector<Quicklink> quicklinks;
 
   PrivacySettings Privacy() const {
     return {
       clipboardHistoryEnabled,
       fileIndexEnabled,
+      fileContentIndexEnabled,
       fileIndexRoots,
       clipboardHistoryLimit,
     };
@@ -257,7 +323,16 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
     }
   }
   ReadBool(*root, "compactMode", settings.compactMode);
-  ReadBool(*root, "animationsEnabled", settings.animationsEnabled);
+  bool legacyAnimationsEnabled = true;
+  ReadBool(*root, "animationsEnabled", legacyAnimationsEnabled);
+  settings.animationLevel = legacyAnimationsEnabled ? AnimationLevel::Full
+                                                    : AnimationLevel::Off;
+  if (const Value* animationLevel = root->Find("animationLevel");
+      animationLevel && animationLevel->type == Value::Type::String) {
+    if (const auto parsed = ParseAnimationLevel(animationLevel->str)) {
+      settings.animationLevel = *parsed;
+    }
+  }
   ReadBool(*root, "syncAccentColor", settings.syncAccentColor);
   ReadString(*root, "customAccentColor", settings.customAccentColor);
   ReadBool(*root, "startOnStartup", settings.startOnStartup);
@@ -273,11 +348,13 @@ inline Settings ParseSettingsRoot(const std::optional<Value>& root) {
   ReadBool(*root, "clipboardHistoryEnabled", settings.clipboardHistoryEnabled);
   ReadInt(*root, "clipboardHistoryLimit", settings.clipboardHistoryLimit);
   ReadBool(*root, "fileIndexEnabled", settings.fileIndexEnabled);
+  ReadBool(*root, "fileContentIndexEnabled", settings.fileContentIndexEnabled);
   ReadInt(*root, "fileIndexMaxEntries", settings.fileIndexMaxEntries);
   settings.fileIndexRoots = ReadStringArray(*root, "fileIndexRoots");
   ReadBool(*root, "diagnosticsEnabled", settings.diagnosticsEnabled);
-  if (auto engines = ReadStringObject(*root, "searchEngines"); !engines.empty()) {
-    settings.searchEngines = std::move(engines);
+  if (const Value* engines = root->Find("searchEngines");
+      engines && engines->type == Value::Type::Object) {
+    settings.searchEngines = ReadStringObject(*root, "searchEngines");
   }
   if (const Value* links = root->Find("quicklinks"); links && links->type == Value::Type::Array) {
     for (const auto& element : links->array) {
@@ -384,7 +461,11 @@ inline std::string SerializeSettings(const Settings& settings) {
   }
   out << "},\n";
   out << "  \"compactMode\": " << (settings.compactMode ? "true" : "false") << ",\n";
-  out << "  \"animationsEnabled\": " << (settings.animationsEnabled ? "true" : "false") << ",\n";
+  out << "  \"animationLevel\": \"" << AnimationLevelKey(settings.animationLevel)
+      << "\",\n";
+  out << "  \"animationsEnabled\": "
+      << (settings.animationLevel != AnimationLevel::Off ? "true" : "false")
+      << ",\n";
   out << "  \"syncAccentColor\": " << (settings.syncAccentColor ? "true" : "false") << ",\n";
   out << "  \"customAccentColor\": \"" << JsonEscape(settings.customAccentColor) << "\",\n";
   out << "  \"startOnStartup\": " << (settings.startOnStartup ? "true" : "false") << ",\n";
@@ -400,6 +481,8 @@ inline std::string SerializeSettings(const Settings& settings) {
   out << "  \"clipboardHistoryEnabled\": " << (settings.clipboardHistoryEnabled ? "true" : "false") << ",\n";
   out << "  \"clipboardHistoryLimit\": " << settings.clipboardHistoryLimit << ",\n";
   out << "  \"fileIndexEnabled\": " << (settings.fileIndexEnabled ? "true" : "false") << ",\n";
+  out << "  \"fileContentIndexEnabled\": "
+      << (settings.fileContentIndexEnabled ? "true" : "false") << ",\n";
   out << "  \"fileIndexMaxEntries\": " << settings.fileIndexMaxEntries << ",\n";
   out << "  \"fileIndexRoots\": ";
   detail::WriteStringArray(out, settings.fileIndexRoots);

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -22,8 +23,9 @@ class SearchCoordinator {
   using Processor =
       std::function<app::ResultsCollection(const app::QueryRequest&)>;
   using ResultSink = std::function<void(app::ResultsCollection)>;
+  using ErrorSink = std::function<void(std::exception_ptr)>;
 
-  explicit SearchCoordinator(ResultSink resultSink = {});
+  explicit SearchCoordinator(ResultSink resultSink = {}, ErrorSink errorSink = {});
   ~SearchCoordinator();
 
   SearchCoordinator(const SearchCoordinator&) = delete;
@@ -38,6 +40,7 @@ class SearchCoordinator {
   void WorkerLoop(std::stop_token stopToken);
 
   ResultSink resultSink_;
+  ErrorSink errorSink_;
   Processor processor_;
   std::jthread worker_;
   std::mutex mutex_;
@@ -52,8 +55,9 @@ class SnapshotCoordinator {
   using Builder = std::function<std::shared_ptr<const app::SearchSnapshot>(
       const app::Settings&)>;
   using ResultSink = std::function<void(app::SnapshotBuildResult)>;
+  using ErrorSink = std::function<void(std::exception_ptr)>;
 
-  explicit SnapshotCoordinator(ResultSink resultSink = {});
+  explicit SnapshotCoordinator(ResultSink resultSink = {}, ErrorSink errorSink = {});
   ~SnapshotCoordinator();
 
   SnapshotCoordinator(const SnapshotCoordinator&) = delete;
@@ -67,6 +71,7 @@ class SnapshotCoordinator {
   void WorkerLoop(std::stop_token stopToken);
 
   ResultSink resultSink_;
+  ErrorSink errorSink_;
   Builder builder_;
   std::jthread worker_;
   std::mutex mutex_;

@@ -11,7 +11,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-double RunCorpus(size_t count, int iterations) {
+double RunCorpus(size_t count, int iterations,
+                 const std::vector<std::wstring>& queries) {
   std::vector<feathercast::core::PreparedSearchItem> items;
   items.reserve(count);
   for (size_t i = 0; i < count; ++i) {
@@ -33,7 +34,7 @@ double RunCorpus(size_t count, int iterations) {
     options.now = 1750000000;
     const auto start = Clock::now();
     const auto results = feathercast::core::SearchPrepared(
-        i % 2 == 0 ? L"visual code" : L"application 42", items, {}, options);
+        queries[static_cast<size_t>(i) % queries.size()], items, {}, options);
     const auto end = Clock::now();
     if (results.empty()) return -1.0;
     samples.push_back(std::chrono::duration<double, std::milli>(end - start).count());
@@ -46,13 +47,27 @@ double RunCorpus(size_t count, int iterations) {
 }  // namespace
 
 int main() {
-  const double p95At5k = RunCorpus(5000, 30);
-  const double p95At50k = RunCorpus(50000, 20);
+  const std::vector<std::wstring> normalQueries = {
+      L"visual code", L"application 42"};
+  const std::vector<std::wstring> typoQueries = {
+      L"aplication", L"visual studoi"};
+  const double p95At5k = RunCorpus(5000, 30, normalQueries);
+  const double p95At50k = RunCorpus(50000, 20, normalQueries);
+  const double typoP95At5k = RunCorpus(5000, 30, typoQueries);
+  const double typoP95At50k = RunCorpus(50000, 20, typoQueries);
   std::cout << "search_p95_5k_ms=" << p95At5k << "\n";
   std::cout << "search_p95_50k_ms=" << p95At50k << "\n";
-  if (p95At5k < 0 || p95At50k < 0) return 1;
+  std::cout << "search_typo_p95_5k_ms=" << typoP95At5k << "\n";
+  std::cout << "search_typo_p95_50k_ms=" << typoP95At50k << "\n";
+  if (p95At5k < 0 || p95At50k < 0 || typoP95At5k < 0 ||
+      typoP95At50k < 0) {
+    return 1;
+  }
 #ifdef NDEBUG
-  if (p95At5k > 10.0 || p95At50k > 50.0) return 2;
+  if (p95At5k > 10.0 || p95At50k > 50.0 || typoP95At5k > 10.0 ||
+      typoP95At50k > 50.0) {
+    return 2;
+  }
 #endif
   return 0;
 }

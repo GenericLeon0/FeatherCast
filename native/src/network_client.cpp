@@ -58,12 +58,13 @@ std::optional<HttpsUrlParts> ParseHttpsUrl(const std::wstring& url) {
 bool IsSuccessful(HINTERNET request) {
   DWORD status = 0;
   DWORD size = sizeof(status);
-  return !WinHttpQueryHeaders(
-             request,
-             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-             WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
-             WINHTTP_NO_HEADER_INDEX) ||
-         (status >= 200 && status < 300);
+  const bool queried = WinHttpQueryHeaders(
+                           request,
+                           WINHTTP_QUERY_STATUS_CODE |
+                               WINHTTP_QUERY_FLAG_NUMBER,
+                           WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                           WINHTTP_NO_HEADER_INDEX) != FALSE;
+  return IsSuccessfulStatusQuery(queried, status);
 }
 
 }  // namespace

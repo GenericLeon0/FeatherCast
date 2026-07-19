@@ -5,18 +5,35 @@
 #include <condition_variable>
 #include <atomic>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <stop_token>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 #include <deque>
+#include <cstdint>
+
+struct IWICImagingFactory;
 
 namespace feathercast::runtime {
+
+struct DecodedIcon {
+  std::wstring key;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t stride = 0;
+  std::vector<std::uint8_t> pixels;
+};
+
+std::optional<DecodedIcon> DecodePngIcon(
+    ::IWICImagingFactory* factory, const std::filesystem::path& path,
+    const std::wstring& key);
 
 template <typename Result>
 class SingleOperationService {
@@ -120,10 +137,12 @@ class LaunchService {
 
 class IconResolver {
  public:
-  using Resolve = std::function<bool(const std::wstring&, std::stop_token)>;
-  using Completed = std::function<void(std::wstring)>;
+  using Resolve = std::function<std::optional<DecodedIcon>(
+      const std::wstring&, std::stop_token)>;
+  using Completed = std::function<void(DecodedIcon)>;
+  using Failed = std::function<void(std::exception_ptr)>;
 
-  explicit IconResolver(Completed completed = {});
+  explicit IconResolver(Completed completed = {}, Failed failed = {});
   ~IconResolver();
 
   IconResolver(const IconResolver&) = delete;
@@ -138,6 +157,7 @@ class IconResolver {
   void WorkerLoop(std::stop_token stopToken);
 
   Completed completed_;
+  Failed failed_;
   Resolve resolve_;
   std::mutex mutex_;
   std::condition_variable cv_;

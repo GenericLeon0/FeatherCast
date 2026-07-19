@@ -24,6 +24,12 @@ struct FileIndexEntry {
   long long lastWriteTime = 0;
   long long size = 0;
   long long indexedAt = 0;
+  long long id = 0;
+  std::wstring root;
+  int contentState = 0;
+  long long contentBytes = 0;
+  long long scanGeneration = 0;
+  std::wstring contentText;
 };
 
 struct ClipboardEntry {
@@ -126,15 +132,16 @@ class Storage {
       return false;
     }
     const int schemaVersion = ReadSchemaVersion();
-    if (schemaVersion < 0 || schemaVersion > 2) {
-      if (schemaVersion > 2) {
+    if (schemaVersion < 0 || schemaVersion > 3) {
+      if (schemaVersion > 3) {
         SetError(SQLITE_ERROR, "database schema is newer than this FeatherCast build");
       }
       Close();
       return false;
     }
-    if (schemaVersion < 2 && HasTable("clipboard_history") &&
-        !BackupBeforeMigration(path)) {
+    if (schemaVersion < 3 &&
+        (HasTable("clipboard_history") || HasTable("file_index")) &&
+        !BackupBeforeMigration(path, schemaVersion < 2 ? 2 : 3)) {
       Close();
       return false;
     }
@@ -160,7 +167,10 @@ class Storage {
         !Exec("CREATE INDEX IF NOT EXISTS idx_clipboard_history_recent "
               "ON clipboard_history(captured_at DESC, id DESC);") ||
         !MigrateSchema(schemaVersion) ||
-        !Exec("PRAGMA user_version=2;") ||
+        !Exec("CREATE VIRTUAL TABLE IF NOT EXISTS file_content_fts USING fts5("
+              "content, content='', contentless_delete=1, "
+              "tokenize='unicode61 remove_diacritics 2');") ||
+        !Exec("PRAGMA user_version=3;") ||
         !Exec("COMMIT;")) {
       Exec("ROLLBACK;");
       Close();
@@ -185,7 +195,8 @@ class Storage {
 
     Statement stmt;
     if (!stmt.Prepare(db_,
-                      "SELECT path, name, is_directory, icon_key, last_write_time, size, indexed_at "
+                      "SELECT id, path, name, is_directory, icon_key, last_write_time, size, "
+                      "indexed_at, root, content_state, content_bytes, scan_generation "
                       "FROM file_index ORDER BY name COLLATE NOCASE LIMIT ?;")) {
       return out;
     }
@@ -193,13 +204,18 @@ class Storage {
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
       FileIndexEntry entry;
-      entry.path = ColumnText(stmt.get(), 0);
-      entry.name = ColumnText(stmt.get(), 1);
-      entry.isDirectory = sqlite3_column_int(stmt.get(), 2) != 0;
-      entry.iconKey = ColumnText(stmt.get(), 3);
-      entry.lastWriteTime = sqlite3_column_int64(stmt.get(), 4);
-      entry.size = sqlite3_column_int64(stmt.get(), 5);
-      entry.indexedAt = sqlite3_column_int64(stmt.get(), 6);
+      entry.id = sqlite3_column_int64(stmt.get(), 0);
+      entry.path = ColumnText(stmt.get(), 1);
+      entry.name = ColumnText(stmt.get(), 2);
+      entry.isDirectory = sqlite3_column_int(stmt.get(), 3) != 0;
+      entry.iconKey = ColumnText(stmt.get(), 4);
+      entry.lastWriteTime = sqlite3_column_int64(stmt.get(), 5);
+      entry.size = sqlite3_column_int64(stmt.get(), 6);
+      entry.indexedAt = sqlite3_column_int64(stmt.get(), 7);
+      entry.root = ColumnText(stmt.get(), 8);
+      entry.contentState = sqlite3_column_int(stmt.get(), 9);
+      entry.contentBytes = sqlite3_column_int64(stmt.get(), 10);
+      entry.scanGeneration = sqlite3_column_int64(stmt.get(), 11);
       out.push_back(std::move(entry));
     }
     return out;
@@ -212,12 +228,26 @@ class Storage {
     Statement stmt;
     if (!stmt.Prepare(db_,
                       "INSERT INTO file_index "
-                      "(path, name, is_directory, icon_key, last_write_time, size, indexed_at) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                      "(path, name, is_directory, icon_key, last_write_time, size, indexed_at, "
+                      "root, content_state, content_bytes, scan_generation) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                       "ON CONFLICT(path) DO UPDATE SET "
                       "name=excluded.name, is_directory=excluded.is_directory, "
                       "icon_key=excluded.icon_key, last_write_time=excluded.last_write_time, "
-                      "size=excluded.size, indexed_at=excluded.indexed_at;")) {
+                      "size=excluded.size, indexed_at=excluded.indexed_at, root=excluded.root, "
+                      "content_state=excluded.content_state, content_bytes=excluded.content_bytes, "
+                      "scan_generation=excluded.scan_generation;")) {
+      Exec("ROLLBACK;");
+      return false;
+    }
+    Statement identity;
+    Statement removeContent;
+    Statement insertContent;
+    if (!identity.Prepare(db_, "SELECT id FROM file_index WHERE path=?;") ||
+        !removeContent.Prepare(
+            db_, "DELETE FROM file_content_fts WHERE rowid=?;") ||
+        !insertContent.Prepare(
+            db_, "INSERT INTO file_content_fts(rowid, content) VALUES (?, ?);")) {
       Exec("ROLLBACK;");
       return false;
     }
@@ -232,9 +262,38 @@ class Storage {
       sqlite3_bind_int64(stmt.get(), 5, entry.lastWriteTime);
       sqlite3_bind_int64(stmt.get(), 6, entry.size);
       sqlite3_bind_int64(stmt.get(), 7, entry.indexedAt);
+      BindText(stmt.get(), 8, entry.root);
+      sqlite3_bind_int(stmt.get(), 9, entry.contentState);
+      sqlite3_bind_int64(stmt.get(), 10, entry.contentBytes);
+      sqlite3_bind_int64(stmt.get(), 11, entry.scanGeneration);
       if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         Exec("ROLLBACK;");
         return false;
+      }
+      sqlite3_reset(identity.get());
+      sqlite3_clear_bindings(identity.get());
+      BindText(identity.get(), 1, entry.path);
+      if (sqlite3_step(identity.get()) != SQLITE_ROW) {
+        Exec("ROLLBACK;");
+        return false;
+      }
+      const auto rowId = sqlite3_column_int64(identity.get(), 0);
+      sqlite3_reset(removeContent.get());
+      sqlite3_clear_bindings(removeContent.get());
+      sqlite3_bind_int64(removeContent.get(), 1, rowId);
+      if (sqlite3_step(removeContent.get()) != SQLITE_DONE) {
+        Exec("ROLLBACK;");
+        return false;
+      }
+      if (!entry.contentText.empty()) {
+        sqlite3_reset(insertContent.get());
+        sqlite3_clear_bindings(insertContent.get());
+        sqlite3_bind_int64(insertContent.get(), 1, rowId);
+        BindText(insertContent.get(), 2, entry.contentText);
+        if (sqlite3_step(insertContent.get()) != SQLITE_DONE) {
+          Exec("ROLLBACK;");
+          return false;
+        }
       }
     }
 
@@ -249,7 +308,14 @@ class Storage {
         Exec("ROLLBACK;");
         return false;
       }
+      if (!Exec("DELETE FROM file_content_fts WHERE rowid NOT IN (SELECT id FROM file_index);")) {
+        Exec("ROLLBACK;");
+        return false;
+      }
     } else if (!Exec("DELETE FROM file_index;")) {
+      Exec("ROLLBACK;");
+      return false;
+    } else if (!Exec("DELETE FROM file_content_fts;")) {
       Exec("ROLLBACK;");
       return false;
     }
@@ -266,7 +332,13 @@ class Storage {
   }
 
   bool ClearFileIndex() {
-    return Exec("DELETE FROM file_index;");
+    if (!Exec("BEGIN IMMEDIATE;")) return false;
+    if (!Exec("DELETE FROM file_content_fts;") ||
+        !Exec("DELETE FROM file_index;") || !Exec("COMMIT;")) {
+      Exec("ROLLBACK;");
+      return false;
+    }
+    return true;
   }
 
   std::vector<ClipboardEntry> LoadClipboardHistory(size_t limit = 50) const {
@@ -438,9 +510,10 @@ class Storage {
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
   }
 
-  bool BackupBeforeMigration(const std::filesystem::path& path) {
+  bool BackupBeforeMigration(const std::filesystem::path& path,
+                             int targetVersion) {
     auto backupPath = path;
-    backupPath += L".pre-v2.bak";
+    backupPath += L".pre-v" + std::to_wstring(targetVersion) + L".bak";
     std::error_code ec;
     if (std::filesystem::exists(backupPath, ec)) return true;
 
@@ -471,51 +544,77 @@ class Storage {
   }
 
   bool MigrateSchema(int version) {
-    if (version >= 2) return true;
-    if (!Exec("ALTER TABLE clipboard_history "
-              "ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';") ||
-        !Exec("ALTER TABLE clipboard_history "
-              "ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;")) {
-      return false;
-    }
-
-    std::vector<std::tuple<long long, std::wstring, std::wstring>> rows;
-    Statement read;
-    if (!read.Prepare(db_,
-                      "SELECT id, text, preview FROM clipboard_history "
-                      "WHERE encrypted=0;")) {
-      CaptureError();
-      return false;
-    }
-    while (sqlite3_step(read.get()) == SQLITE_ROW) {
-      rows.emplace_back(sqlite3_column_int64(read.get(), 0),
-                        ColumnText(read.get(), 1), ColumnText(read.get(), 2));
-    }
-
-    Statement update;
-    if (!update.Prepare(
-            db_,
-            "UPDATE clipboard_history SET text=?, preview=?, content_hash=?, "
-            "encrypted=1 WHERE id=?;")) {
-      CaptureError();
-      return false;
-    }
-    for (const auto& [id, text, preview] : rows) {
-      const auto protectedText = ProtectText(text);
-      const auto protectedPreview = ProtectText(preview);
-      const auto contentHash = ContentHash(text);
-      if (!protectedText || !protectedPreview || !contentHash) {
-        SetError(SQLITE_ERROR, "failed to protect clipboard data during migration");
+    if (version < 2) {
+      if (!Exec("ALTER TABLE clipboard_history "
+                "ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';") ||
+          !Exec("ALTER TABLE clipboard_history "
+                "ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;")) {
         return false;
       }
-      sqlite3_reset(update.get());
-      sqlite3_clear_bindings(update.get());
-      BindText(update.get(), 1, *protectedText);
-      BindText(update.get(), 2, *protectedPreview);
-      BindText(update.get(), 3, *contentHash);
-      sqlite3_bind_int64(update.get(), 4, id);
-      if (sqlite3_step(update.get()) != SQLITE_DONE) {
+
+      std::vector<std::tuple<long long, std::wstring, std::wstring>> rows;
+      Statement read;
+      if (!read.Prepare(db_,
+                        "SELECT id, text, preview FROM clipboard_history "
+                        "WHERE encrypted=0;")) {
         CaptureError();
+        return false;
+      }
+      while (sqlite3_step(read.get()) == SQLITE_ROW) {
+        rows.emplace_back(sqlite3_column_int64(read.get(), 0),
+                          ColumnText(read.get(), 1), ColumnText(read.get(), 2));
+      }
+
+      Statement update;
+      if (!update.Prepare(
+              db_,
+              "UPDATE clipboard_history SET text=?, preview=?, content_hash=?, "
+              "encrypted=1 WHERE id=?;")) {
+        CaptureError();
+        return false;
+      }
+      for (const auto& [id, text, preview] : rows) {
+        const auto protectedText = ProtectText(text);
+        const auto protectedPreview = ProtectText(preview);
+        const auto contentHash = ContentHash(text);
+        if (!protectedText || !protectedPreview || !contentHash) {
+          SetError(SQLITE_ERROR, "failed to protect clipboard data during migration");
+          return false;
+        }
+        sqlite3_reset(update.get());
+        sqlite3_clear_bindings(update.get());
+        BindText(update.get(), 1, *protectedText);
+        BindText(update.get(), 2, *protectedPreview);
+        BindText(update.get(), 3, *contentHash);
+        sqlite3_bind_int64(update.get(), 4, id);
+        if (sqlite3_step(update.get()) != SQLITE_DONE) {
+          CaptureError();
+          return false;
+        }
+      }
+    }
+
+    if (version < 3) {
+      if (!Exec("ALTER TABLE file_index RENAME TO file_index_v2;") ||
+          !Exec("CREATE TABLE file_index ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "path TEXT NOT NULL COLLATE NOCASE UNIQUE,"
+                "name TEXT NOT NULL,"
+                "is_directory INTEGER NOT NULL,"
+                "icon_key TEXT NOT NULL,"
+                "last_write_time INTEGER NOT NULL,"
+                "size INTEGER NOT NULL,"
+                "indexed_at INTEGER NOT NULL,"
+                "root TEXT NOT NULL DEFAULT '',"
+                "content_state INTEGER NOT NULL DEFAULT 0,"
+                "content_bytes INTEGER NOT NULL DEFAULT 0,"
+                "scan_generation INTEGER NOT NULL DEFAULT 0"
+                ");") ||
+          !Exec("INSERT INTO file_index "
+                "(path,name,is_directory,icon_key,last_write_time,size,indexed_at) "
+                "SELECT path,name,is_directory,icon_key,last_write_time,size,indexed_at "
+                "FROM file_index_v2;") ||
+          !Exec("DROP TABLE file_index_v2;")) {
         return false;
       }
     }

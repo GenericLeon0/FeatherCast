@@ -10,8 +10,13 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 - Open-window switching with foreground restore for minimized windows
 - Open-window actions for screen halves, centering, and moving to the next display
 - Token-aware fuzzy search ranked for launcher usage
-- Optional local file/folder indexing and clipboard history
+- Search scopes: `@files`, `@apps`, `@windows`, `@commands`, `@clipboard`, and `@snippets`
+- Optional recursive live indexing for explicitly selected local folders
+- Separately enabled local full-text search for supported text and source files
+- On-demand text, image, and metadata preview pane
+- Optional local clipboard history
 - Calculator, unit/currency conversion, emoji, symbols, snippets, quicklinks, and web-search prefixes
+- Native Library manager for creating, editing, and deleting snippets and quicklinks
 - Local time, date, ISO-week, Unix-time, and UUID utilities
 - Searchable Windows settings plus volume, media playback, and Show Desktop commands
 - Searchable “Discover FeatherCast” guide with feature examples and shortcuts
@@ -34,6 +39,8 @@ AI chat and AI provider settings were removed in the native remake.
 | Launch selected app or focus selected window | `Enter` |
 | Launch selected app as administrator | `Ctrl+Shift+Enter` |
 | Open result actions | `Tab`, `Right`, or `Ctrl+K` |
+| Preview an indexed file | `Ctrl+Space` |
+| Scroll an open preview | `Ctrl+PageUp` / `Ctrl+PageDown`, or the mouse wheel over it |
 | Return from actions or a browse view | `Left` or `Esc` |
 | Close overlay | `Esc` |
 | Open Settings | Gear button or tray menu |
@@ -43,6 +50,13 @@ Useful searches include `time`, `date`, `week number`, `unix timestamp`,
 `generate uuid`, `display settings`, `volume up`, and `play or pause media`.
 Open the action panel on a window result to arrange it, or on a text result to
 copy or paste its value.
+
+Type `@` to choose a search scope. A complete leading scope token limits the
+query without changing normal root-search ranking. `@files` searches indexed
+names and paths; when local content indexing is enabled, it also adds deduplicated
+`Content match` results. An empty `@files` query shows recently modified files.
+Press `Esc` once to remove an active scope, or `Ctrl+Space` on a file result to
+open its preview.
 
 The tray icon runs in the background. Left-click opens search; right-click opens the menu.
 
@@ -81,11 +95,28 @@ Machine-local operational data is stored under `%LOCALAPPDATA%\FeatherCast`:
 - `updates/` stores verified update installers
 - update and opt-in diagnostic logs
 
-Clipboard history and file indexing are disabled until explicitly enabled in Settings. Settings exposes clipboard retention, file-index limits, custom roots, diagnostics, and data-clearing controls. File indexing defaults to Desktop, Documents, and Downloads when no custom roots are selected.
+Clipboard history and file indexing are disabled until explicitly enabled in
+Settings. File indexing is recursive, watches only selected fixed local drives,
+and skips hidden, system, and reparse entries. It defaults to Desktop, Documents,
+and Downloads when no custom roots are selected.
+
+Full-text indexing has a separate Privacy opt-in. It reads supported text/source
+files up to 2 MiB each and at most 256 MiB in total, then stores a local
+contentless FTS token index—not original text or excerpts. Preview content is
+read only on demand and is never persisted or logged. Image previews are limited
+to BMP, GIF, ICO, JPEG, PNG, and TIFF, 25 MiB, and 40 megapixels. Settings provides
+root management, index status, rebuild, disable, and delete controls.
+
+This release intentionally does not index network drives, browser data, cloud
+content, PDFs, Office documents, OCR output, or Shell preview handlers.
 
 FeatherCast contacts GitHub Releases for enabled update checks and `open.er-api.com` for cached currency rates. Update installation is disabled in builds that do not contain an allowed Authenticode signer certificate pin. Plugins are native code running with the current user’s permissions and should only be installed from trusted sources.
 
 Older AI-related fields are ignored and are not written back by the native app.
+
+Snippets and quicklinks can be managed from **Settings > Library**. The JSON
+files remain available as an expert and recovery path; FeatherCast refuses to
+overwrite an invalid or externally changed `snippets.json` until it is reloaded.
 
 ## Icons
 

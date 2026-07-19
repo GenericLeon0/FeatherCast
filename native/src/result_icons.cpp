@@ -69,6 +69,7 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
   using app::ActionKind;
   switch (kind) {
     case ActionKind::Open: return ResultIcon::ExternalLink;
+    case ActionKind::Preview: return ResultIcon::Eye;
     case ActionKind::RunAsAdmin: return ResultIcon::Shield;
     case ActionKind::OpenLocation: return ResultIcon::Folder;
     case ActionKind::CopyPath:
@@ -85,8 +86,18 @@ ResultIcon ActionIcon(app::ActionKind kind) noexcept {
     case ActionKind::MoveWindowRightHalf: return ResultIcon::WindowRight;
     case ActionKind::MoveWindowTopHalf: return ResultIcon::WindowTop;
     case ActionKind::MoveWindowBottomHalf: return ResultIcon::WindowBottom;
+    case ActionKind::MoveWindowLeftThird: return ResultIcon::WindowLeft;
+    case ActionKind::MoveWindowCenterThird: return ResultIcon::Center;
+    case ActionKind::MoveWindowRightThird: return ResultIcon::WindowRight;
+    case ActionKind::MoveWindowTopLeft: return ResultIcon::WindowTop;
+    case ActionKind::MoveWindowTopRight: return ResultIcon::WindowTop;
+    case ActionKind::MoveWindowBottomLeft: return ResultIcon::WindowBottom;
+    case ActionKind::MoveWindowBottomRight: return ResultIcon::WindowBottom;
     case ActionKind::CenterWindow: return ResultIcon::Center;
+    case ActionKind::ArrangeWindow: return ResultIcon::WindowLayout;
+    case ActionKind::MoveWindowPreviousDisplay:
     case ActionKind::MoveWindowNextDisplay: return ResultIcon::MultiMonitor;
+    case ActionKind::EditAppAlias: return ResultIcon::Edit;
     case ActionKind::PasteText: return ResultIcon::Clipboard;
     case ActionKind::None: return ResultIcon::Actions;
   }

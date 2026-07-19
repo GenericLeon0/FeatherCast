@@ -53,3 +53,4 @@ cpack --config build-native/CPackConfig.cmake -C Release
 - Keep UI text and comments in English.
 - Keep the app Windows-native; do not add Electron, WebView, Qt, or Node runtime dependencies without explicit approval.
 - Regenerate app icons through `scripts/gen-icons.ps1`; do not hand-edit generated icon files.
+- After making app changes, always rebuild and restart FeatherCast with the newest successful build so the user can test the changes immediately.

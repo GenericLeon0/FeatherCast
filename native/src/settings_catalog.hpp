@@ -8,7 +8,7 @@
 
 namespace feathercast::settings_catalog {
 
-enum class ControlKind { Toggle, Decrement, Increment, Action, Custom };
+enum class ControlKind { Toggle, Slider, Decrement, Increment, Action, Custom };
 enum class Requirement {
   Always,
   PendingShortcut,

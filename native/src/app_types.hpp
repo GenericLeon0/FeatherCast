@@ -5,6 +5,7 @@
 #include "extension_protocol.hpp"
 #include "run_command.hpp"
 #include "settings.hpp"
+#include "search_scope.hpp"
 #include "snippets.hpp"
 #include "symbols.hpp"
 
@@ -31,6 +32,7 @@ enum class SettingsCategory {
   Shortcut,
   General,
   Results,
+  Library,
   Privacy,
   Extensions,
   Appearance,
@@ -54,6 +56,7 @@ enum class HitType {
   SettingsShortcutCategory,
   SettingsGeneralCategory,
   SettingsResultsCategory,
+  SettingsLibraryCategory,
   SettingsPrivacyCategory,
   SettingsExtensionsCategory,
   SettingsAppearanceCategory,
@@ -62,7 +65,7 @@ enum class HitType {
   SaveShortcut,
   ClearShortcut,
   CompactToggle,
-  AnimationsToggle,
+  AnimationLevel,
   AccentToggle,
   AccentColor,
   StartupToggle,
@@ -73,10 +76,13 @@ enum class HitType {
   ClipboardLimitDown,
   ClipboardLimitUp,
   FileIndexToggle,
+  FileContentIndexToggle,
   FileIndexLimitDown,
   FileIndexLimitUp,
   AddFileRoot,
+  RemoveFileRoot,
   ClearFileRoots,
+  RebuildFileIndex,
   DiagnosticsToggle,
   ClearClipboardData,
   ClearFileIndexData,
@@ -90,6 +96,8 @@ enum class HitType {
   OverlayWidthUp,
   MaxResultsDown,
   MaxResultsUp,
+  ManageSnippets,
+  ManageQuicklinks,
 };
 
 enum class CommandKind {
@@ -202,12 +210,23 @@ enum class ActionKind {
   Minimize,
   MaximizeRestore,
   CloseWindow,
+  ArrangeWindow,
   MoveWindowLeftHalf,
   MoveWindowRightHalf,
   MoveWindowTopHalf,
   MoveWindowBottomHalf,
+  MoveWindowLeftThird,
+  MoveWindowCenterThird,
+  MoveWindowRightThird,
+  MoveWindowTopLeft,
+  MoveWindowTopRight,
+  MoveWindowBottomLeft,
+  MoveWindowBottomRight,
   CenterWindow,
+  MoveWindowPreviousDisplay,
   MoveWindowNextDisplay,
+  EditAppAlias,
+  Preview,
   CopyText,
   PasteText,
 };
@@ -262,6 +281,7 @@ struct AppEntry {
   long long fileLastWriteTime = 0;
   long long fileSize = 0;
   long long fileIndexedAt = 0;
+  bool fileContentMatch = false;
   std::vector<std::wstring> keywords;
 };
 
@@ -450,21 +470,18 @@ struct SnapshotBuildResult {
 
 struct DiscoveryRequest {
   std::uint64_t generation = 0;
-  bool fileIndexEnabled = false;
-  std::size_t fileIndexLimit = 0;
-  std::vector<std::wstring> configuredRoots;
 };
 
 struct DiscoveryResult {
   std::uint64_t generation = 0;
   std::vector<AppEntry> apps;
-  std::vector<AppEntry> fileIndex;
-  bool fileIndexBuilt = false;
 };
 
 struct QueryRequest {
   unsigned long long generation = 0;
   std::wstring query;
+  feathercast::search_scope::Scope scope =
+      feathercast::search_scope::Scope::All;
   bool empty = false;
   bool actionMode = false;
   BrowseView browseView = BrowseView::None;

@@ -133,6 +133,8 @@ v1 plugins are still accepted. The host keeps the native ABI shape unchanged and
 - A response must be no larger than 1 MiB.
 - Plugin exceptions and access violations are caught by the host and returned as errors.
 - If a plugin process exits, times out, or has host I/O failures, FeatherCast restarts the plugin host and records a strike. Three consecutive strikes mark the plugin unavailable until extensions are reloaded. A successful request resets the strike count.
+- Settings > Extensions shows each plugin as Available, Degraded, or Unavailable
+  together with its version and latest in-memory failure reason.
 - FeatherCast runs at most four plugin queries concurrently.
 - Each plugin host is assigned to a kill-on-close Windows Job Object with one active process and a 256 MiB process-memory limit.
 - Logs are written to `%APPDATA%\FeatherCast\extension-log.txt`.

@@ -260,8 +260,22 @@ int wmain(int argc, wchar_t** argv) {
 
     manager.RequestQuery(L"slow-one", 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    {
+      const auto health = manager.Health();
+      assert(health.size() == 1);
+      assert(health[0].available);
+      assert(health[0].failureStrikes == 1);
+      assert(health[0].lastError == L"plugin host timed out");
+    }
     manager.RequestQuery(L"demo-after-timeout", 2);
     assert(WaitForPluginResult(manager, L"demo-after-timeout", L"Demo Result", std::chrono::seconds(3)));
+    {
+      const auto health = manager.Health();
+      assert(health.size() == 1);
+      assert(health[0].available);
+      assert(health[0].failureStrikes == 0);
+      assert(health[0].lastError.empty());
+    }
 
     manager.RequestQuery(L"slow-disable-one", 3);
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
@@ -272,6 +286,13 @@ int wmain(int argc, wchar_t** argv) {
     manager.RequestQuery(L"demo-after-disable", 6);
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     assert(manager.CachedResultsFor(L"demo-after-disable").empty());
+    {
+      const auto health = manager.Health();
+      assert(health.size() == 1);
+      assert(!health[0].available);
+      assert(health[0].failureStrikes >= 3);
+      assert(!health[0].lastError.empty());
+    }
 
     manager.Shutdown();
     std::filesystem::remove_all(tempRoot, ec);

@@ -87,6 +87,8 @@ class PersistenceService {
   void Stop(bool drainPending = true);
 
   bool SaveSettings(settings::Settings settings);
+  bool SaveSettingsAndWait(settings::Settings settings,
+                           std::wstring* error = nullptr);
   bool PruneClipboard(std::size_t limit);
   bool ReplaceFileIndex(std::vector<storage::FileIndexEntry> entries);
   bool UpdateFileIndex(std::vector<storage::FileIndexEntry> entries);

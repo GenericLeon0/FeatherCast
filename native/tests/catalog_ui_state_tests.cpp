@@ -225,6 +225,30 @@ int main() {
   settingValues.compactMode = true;
   assert(feathercast::settings_catalog::Checked(
       feathercast::app::HitType::CompactToggle, settingValues));
+  const auto* animation = feathercast::settings_catalog::Find(
+      feathercast::app::HitType::AnimationLevel);
+  assert(animation);
+  assert(animation->kind ==
+         feathercast::settings_catalog::ControlKind::Slider);
+  const auto generalControls = feathercast::settings_catalog::FocusOrder(
+      feathercast::app::SettingsCategory::General, context);
+  assert(std::count(generalControls.begin(), generalControls.end(),
+                    feathercast::app::HitType::AnimationLevel) == 1);
+  const auto libraryControls = feathercast::settings_catalog::FocusOrder(
+      feathercast::app::SettingsCategory::Library, context);
+  assert(libraryControls.size() == 2);
+  assert(libraryControls[0] == feathercast::app::HitType::ManageSnippets);
+  assert(libraryControls[1] == feathercast::app::HitType::ManageQuicklinks);
+  const auto snippetsCapability = std::find_if(
+      feathercast::capabilities::Catalog().begin(),
+      feathercast::capabilities::Catalog().end(), [](const auto& item) {
+        return item.stableId == L"snippets";
+      });
+  assert(snippetsCapability != feathercast::capabilities::Catalog().end());
+  assert(snippetsCapability->action.kind ==
+         feathercast::app::CapabilityActionKind::OpenSettings);
+  assert(snippetsCapability->action.settingsCategory ==
+         feathercast::app::SettingsCategory::Library);
 
   feathercast::ui::OverlayState overlay;
   overlay.status = feathercast::app::StatusMessage{

@@ -4,8 +4,8 @@
 
 namespace feathercast::search {
 
-SearchCoordinator::SearchCoordinator(ResultSink resultSink)
-    : resultSink_(std::move(resultSink)) {}
+SearchCoordinator::SearchCoordinator(ResultSink resultSink, ErrorSink errorSink)
+    : resultSink_(std::move(resultSink)), errorSink_(std::move(errorSink)) {}
 
 SearchCoordinator::~SearchCoordinator() {
   Stop();
@@ -68,17 +68,34 @@ void SearchCoordinator::WorkerLoop(std::stop_token stopToken) {
       processor = processor_;
     }
     request.latestGeneration = &latestGeneration_;
-    auto result = processor(request);
+    app::ResultsCollection result;
+    try {
+      result = processor(request);
+    } catch (...) {
+      if (errorSink_) {
+        try { errorSink_(std::current_exception()); } catch (...) {}
+      }
+      continue;
+    }
     if (request.generation !=
         latestGeneration_.load(std::memory_order_acquire)) {
       continue;
     }
-    if (resultSink_) resultSink_(std::move(result));
+    if (resultSink_) {
+      try {
+        resultSink_(std::move(result));
+      } catch (...) {
+        if (errorSink_) {
+          try { errorSink_(std::current_exception()); } catch (...) {}
+        }
+      }
+    }
   }
 }
 
-SnapshotCoordinator::SnapshotCoordinator(ResultSink resultSink)
-    : resultSink_(std::move(resultSink)) {}
+SnapshotCoordinator::SnapshotCoordinator(ResultSink resultSink,
+                                         ErrorSink errorSink)
+    : resultSink_(std::move(resultSink)), errorSink_(std::move(errorSink)) {}
 
 SnapshotCoordinator::~SnapshotCoordinator() {
   Stop();
@@ -134,13 +151,27 @@ void SnapshotCoordinator::WorkerLoop(std::stop_token stopToken) {
       pending_.reset();
       builder = builder_;
     }
-    auto snapshot = builder(request.settings);
+    std::shared_ptr<const app::SearchSnapshot> snapshot;
+    try {
+      snapshot = builder(request.settings);
+    } catch (...) {
+      if (errorSink_) {
+        try { errorSink_(std::current_exception()); } catch (...) {}
+      }
+      continue;
+    }
     if (request.revision !=
         latestRevision_.load(std::memory_order_acquire)) {
       continue;
     }
     if (resultSink_) {
-      resultSink_({request.revision, std::move(snapshot)});
+      try {
+        resultSink_({request.revision, std::move(snapshot)});
+      } catch (...) {
+        if (errorSink_) {
+          try { errorSink_(std::current_exception()); } catch (...) {}
+        }
+      }
     }
   }
 }

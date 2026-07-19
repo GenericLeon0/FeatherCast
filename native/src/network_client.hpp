@@ -8,6 +8,11 @@
 
 namespace feathercast::network {
 
+constexpr bool IsSuccessfulStatusQuery(bool headerQuerySucceeded,
+                                       unsigned long status) {
+  return headerQuerySucceeded && status >= 200 && status < 300;
+}
+
 std::optional<std::string> HttpsGet(const std::wstring& host,
                                     const std::wstring& path);
 std::optional<std::string> HttpsGetUrl(

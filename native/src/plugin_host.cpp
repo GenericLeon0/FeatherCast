@@ -72,6 +72,9 @@ std::string HandleRequest(HandleJsonFn fn, uint32_t pluginApiVersion, const std:
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 2 && argv[1] && wcscmp(argv[1], L"--self-test") == 0) {
+    return 0;
+  }
   if (argc < 2 || !argv[1] || !argv[1][0]) return 2;
 
   HMODULE dll = LoadLibraryExW(argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);

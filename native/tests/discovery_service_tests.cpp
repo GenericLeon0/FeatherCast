@@ -2,6 +2,7 @@
 #include "test_framework.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -47,5 +48,46 @@ int main() {
   assert(!service.IsCurrent(2));
   service.Stop();
   assert(!service.Refresh(second));
+
+  std::atomic<int> errors = 0;
+  std::uint64_t recovered = 0;
+  feathercast::discovery_runtime::DiscoveryService resilient(
+      [&](feathercast::app::DiscoveryResult result) {
+        {
+          std::lock_guard lock(mutex);
+          recovered = result.generation;
+        }
+        cv.notify_all();
+      },
+      [&](std::exception_ptr) {
+        ++errors;
+        cv.notify_all();
+      });
+  resilient.Start([](const feathercast::app::DiscoveryRequest& request,
+                     std::stop_token) {
+    if (request.generation == 10) {
+      throw std::runtime_error("discovery failure");
+    }
+    feathercast::app::DiscoveryResult result;
+    result.generation = request.generation;
+    return std::optional{std::move(result)};
+  });
+  feathercast::app::DiscoveryRequest failing;
+  failing.generation = 10;
+  assert(resilient.Refresh(failing));
+  {
+    std::unique_lock lock(mutex);
+    assert(cv.wait_for(lock, std::chrono::seconds(2),
+                       [&] { return errors == 1; }));
+  }
+  feathercast::app::DiscoveryRequest recovery;
+  recovery.generation = 11;
+  assert(resilient.Refresh(recovery));
+  {
+    std::unique_lock lock(mutex);
+    assert(cv.wait_for(lock, std::chrono::seconds(2),
+                       [&] { return recovered == 11; }));
+  }
+  resilient.Stop();
   return 0;
 }

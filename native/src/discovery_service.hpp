@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -18,8 +19,9 @@ class DiscoveryService {
   using Worker = std::function<std::optional<app::DiscoveryResult>(
       const app::DiscoveryRequest&, std::stop_token)>;
   using ResultSink = std::function<void(app::DiscoveryResult)>;
+  using ErrorSink = std::function<void(std::exception_ptr)>;
 
-  explicit DiscoveryService(ResultSink resultSink = {});
+  explicit DiscoveryService(ResultSink resultSink = {}, ErrorSink errorSink = {});
   ~DiscoveryService();
 
   DiscoveryService(const DiscoveryService&) = delete;
@@ -35,6 +37,7 @@ class DiscoveryService {
   void WorkerLoop(std::stop_token stopToken);
 
   ResultSink resultSink_;
+  ErrorSink errorSink_;
   Worker workerFunction_;
   std::jthread worker_;
   std::mutex mutex_;

@@ -353,6 +353,11 @@ inline HotKeySpec ToHotKeySpec(const ShortcutSpec& shortcut) {
   return hotKey;
 }
 
+inline bool IsExclusiveWinShortcut(const ShortcutSpec& shortcut) {
+  return shortcut.valid && shortcut.singleModifier &&
+         shortcut.singleModifierVk == VK_LWIN;
+}
+
 inline bool ShouldHandleInLowLevelHook(const ShortcutSpec& shortcut, bool registeredHotKeyActive) {
   if (!shortcut.valid) return false;
   if (shortcut.singleModifier) return true;
@@ -370,8 +375,9 @@ class ShortcutRuntime {
                            (shortcut.singleModifierVk == VK_LWIN && (vk == VK_LWIN || vk == VK_RWIN));
       if (down) {
         if (matches) {
+          const bool firstPress = !singleModifierDown_;
           singleModifierDown_ = true;
-          singleModifierChord_ = false;
+          if (firstPress) singleModifierChord_ = false;
           return {};
         }
         if (singleModifierDown_) singleModifierChord_ = true;
@@ -380,7 +386,6 @@ class ShortcutRuntime {
         if (singleModifierDown_ && !singleModifierChord_) {
           result.toggle = true;
           result.suppressWinStart = shortcut.singleModifierVk == VK_LWIN;
-          result.consume = !result.suppressWinStart;
           result.deferToggleUntilWinRelease = result.suppressWinStart;
         }
         singleModifierDown_ = false;

@@ -7,6 +7,7 @@
 #include "emoji.hpp"
 #include "extension_protocol.hpp"
 #include "run_command.hpp"
+#include "search_scope.hpp"
 #include "symbols.hpp"
 
 #include <algorithm>
@@ -126,6 +127,52 @@ UtilityKind UtilityKindFor(const std::wstring& stableId) {
   return UtilityKind::LocalTime;
 }
 
+bool MatchesScope(const DisplayItem& item, search_scope::Scope scope) {
+  const bool plainApp = !item.isWindow && !item.isCommand && !item.isSnippet &&
+                        !item.isClipboard && !item.isAction &&
+                        !item.isExtension && !item.utility;
+  switch (scope) {
+    case search_scope::Scope::All: return true;
+    case search_scope::Scope::Apps:
+      return plainApp && item.app.source != L"file" &&
+             item.app.source != L"system-folder";
+    case search_scope::Scope::Windows: return item.isWindow;
+    case search_scope::Scope::Files:
+      return plainApp && item.app.source == L"file";
+    case search_scope::Scope::Commands: return item.isCommand;
+    case search_scope::Scope::Clipboard: return item.isClipboard;
+    case search_scope::Scope::Snippets: return item.isSnippet;
+  }
+  return false;
+}
+
+std::wstring ScopeTitle(search_scope::Scope scope, bool empty) {
+  using search_scope::Scope;
+  switch (scope) {
+    case Scope::Apps: return L"Apps";
+    case Scope::Windows: return L"Open windows";
+    case Scope::Files: return empty ? L"Recently modified" : L"Names & paths";
+    case Scope::Commands: return L"Commands";
+    case Scope::Clipboard: return L"Clipboard History";
+    case Scope::Snippets: return L"Snippets";
+    case Scope::All: return L"Results";
+  }
+  return L"Results";
+}
+
+DisplayItem ScopeSuggestion(const search_scope::Descriptor& descriptor) {
+  DisplayItem item;
+  item.isCapability = true;
+  item.capability.stableId = L"scope:" + std::wstring(descriptor.token);
+  item.capability.category = L"SEARCH SCOPES";
+  item.capability.title = std::wstring(descriptor.token) + L" — " +
+                          std::wstring(descriptor.label);
+  item.capability.summary = std::wstring(descriptor.detail);
+  item.capability.action.kind = CapabilityActionKind::SeedQuery;
+  item.capability.action.query = std::wstring(descriptor.token) + L" ";
+  return item;
+}
+
 }  // namespace
 
 app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
@@ -196,6 +243,41 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       for (const auto index : order) hits.push_back(request.actions[index]);
       addSection(L"Actions", take(hits));
     }
+  } else if (const auto suggestions = search_scope::Suggestions(request.query);
+             !suggestions.empty()) {
+    std::vector<DisplayItem> items;
+    for (const auto* descriptor : suggestions) {
+      items.push_back(ScopeSuggestion(*descriptor));
+    }
+    addSection(L"Search scopes", take(items));
+  } else if (request.scope != search_scope::Scope::All) {
+    std::vector<DisplayItem> hits;
+    if (request.empty) {
+      for (const auto& item : snapshot->pool) {
+        if (MatchesScope(item, request.scope)) hits.push_back(item);
+      }
+      if (request.scope == search_scope::Scope::Files) {
+        std::sort(hits.begin(), hits.end(), [](const auto& left, const auto& right) {
+          return left.app.fileLastWriteTime > right.app.fileLastWriteTime;
+        });
+      }
+    } else {
+      core::SearchOptions options;
+      options.limit = snapshot->pool.size();
+      options.now = request.now;
+      options.generation = request.generation;
+      options.latestGeneration = request.latestGeneration;
+      const auto order = core::SearchPrepared(request.query,
+                                               snapshot->searchItems,
+                                               request.recentIds, options);
+      for (const auto index : order) {
+        if (MatchesScope(snapshot->pool[index], request.scope)) {
+          hits.push_back(snapshot->pool[index]);
+          if (hits.size() >= static_cast<std::size_t>(request.limit)) break;
+        }
+      }
+    }
+    addSection(ScopeTitle(request.scope, request.empty), take(hits));
   } else if (request.empty) {
     addSection(L"Pinned", take(snapshot->pinned, 12));
     addSection(L"Recently used", take(snapshot->recent, 8));

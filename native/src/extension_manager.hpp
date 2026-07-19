@@ -30,6 +30,7 @@ struct PluginHealth {
   std::filesystem::path directory;
   bool available = false;
   int failureStrikes = 0;
+  std::wstring lastError;
 };
 
 class ExtensionManager {
@@ -150,11 +151,12 @@ class ExtensionManager {
     return {};
   }
 
-  std::vector<PluginHealth> Health() {
+  std::vector<PluginHealth> Health() const {
     std::vector<PluginHealth> out;
     std::lock_guard pluginsLock(pluginsMutex_);
     out.reserve(plugins_.size());
     for (const auto& plugin : plugins_) {
+      std::lock_guard healthLock(plugin->healthMutex);
       out.push_back({
           plugin->manifest.id,
           plugin->manifest.name,
@@ -162,6 +164,7 @@ class ExtensionManager {
           plugin->manifest.directory,
           plugin->available.load(),
           plugin->failureStrikes.load(),
+          plugin->lastError,
       });
     }
     return out;
@@ -193,6 +196,8 @@ class ExtensionManager {
     Manifest manifest;
     std::atomic<bool> available = true;
     std::atomic<int> failureStrikes = 0;
+    mutable std::mutex healthMutex;
+    std::wstring lastError;
     HANDLE process = nullptr;
     HANDLE job = nullptr;
     HANDLE stdinWrite = nullptr;
@@ -251,7 +256,12 @@ class ExtensionManager {
           runningGeneration_ = pending.generation;
         }
 
-        auto results = QueryPlugins(pending.query, stopToken);
+        std::vector<QueryResultItem> results;
+        try {
+          results = QueryPlugins(pending.query, stopToken);
+        } catch (...) {
+          Log(L"plugin query coordinator failed; the launcher kept running");
+        }
         {
           std::lock_guard cacheLock(cacheMutex_);
           if (cache_.size() > 32) cache_.clear();
@@ -284,32 +294,40 @@ class ExtensionManager {
     workers.reserve(workerCount);
     for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
       workers.emplace_back([&](std::stop_token workerStop) {
-        for (;;) {
-          const size_t pluginIndex = nextPlugin.fetch_add(1, std::memory_order_relaxed);
-          if (pluginIndex >= plugins.size()) return;
-          const auto& plugin = plugins[pluginIndex];
-        if (workerStop.stop_requested() || stopToken.stop_requested() || stop_.load() ||
-            !plugin->available.load()) {
-            continue;
-        }
+        try {
+          for (;;) {
+            const size_t pluginIndex =
+                nextPlugin.fetch_add(1, std::memory_order_relaxed);
+            if (pluginIndex >= plugins.size()) return;
+            const auto& plugin = plugins[pluginIndex];
+            if (workerStop.stop_requested() || stopToken.stop_requested() ||
+                stop_.load() || !plugin->available.load()) {
+              continue;
+            }
 
-        std::string response;
-        if (!SendRequest(*plugin, BuildQueryRequestJson(plugin->manifest, dataDir_, query, kDefaultQueryLimit),
-                         std::chrono::milliseconds(250), response)) {
-            continue;
-        }
+            std::string response;
+            if (!SendRequest(
+                    *plugin,
+                    BuildQueryRequestJson(plugin->manifest, dataDir_, query,
+                                          kDefaultQueryLimit),
+                    std::chrono::milliseconds(250), response)) {
+              continue;
+            }
 
-        auto parsed = ParseQueryResponse(response, kDefaultQueryLimit);
-        if (!parsed) {
-          Log(plugin->manifest.id + L": invalid query response");
-            continue;
-        }
-        std::lock_guard resultsLock(resultsMutex);
-        for (auto& item : parsed->items) {
-          item.pluginId = plugin->manifest.id;
-          item.pluginName = plugin->manifest.name;
-          results.push_back(std::move(item));
-        }
+            auto parsed = ParseQueryResponse(response, kDefaultQueryLimit);
+            if (!parsed) {
+              Log(plugin->manifest.id + L": invalid query response");
+              continue;
+            }
+            std::lock_guard resultsLock(resultsMutex);
+            for (auto& item : parsed->items) {
+              item.pluginId = plugin->manifest.id;
+              item.pluginName = plugin->manifest.name;
+              results.push_back(std::move(item));
+            }
+          }
+        } catch (...) {
+          Log(L"plugin query worker failed; remaining plugins were skipped");
         }
       });
     }
@@ -500,10 +518,16 @@ class ExtensionManager {
 
   void RecordRequestSuccess(Plugin& plugin) {
     plugin.failureStrikes.store(0);
+    std::lock_guard healthLock(plugin.healthMutex);
+    plugin.lastError.clear();
   }
 
   void RecordRequestFailure(Plugin& plugin, const std::wstring& reason) {
     const int strikes = plugin.failureStrikes.fetch_add(1) + 1;
+    {
+      std::lock_guard healthLock(plugin.healthMutex);
+      plugin.lastError = reason;
+    }
     Log(plugin.manifest.id + L": " + reason + L" (strike " +
         std::to_wstring(strikes) + L"/3)");
     StopProcess(plugin);
@@ -517,6 +541,10 @@ class ExtensionManager {
     Log(plugin.manifest.id + L": " + reason);
     plugin.available.store(false);
     plugin.failureStrikes.store(3);
+    {
+      std::lock_guard healthLock(plugin.healthMutex);
+      plugin.lastError = reason;
+    }
     StopProcess(plugin);
   }
 
@@ -553,7 +581,7 @@ class ExtensionManager {
   mutable std::mutex cacheMutex_;
   std::map<std::wstring, std::vector<QueryResultItem>> cache_;
 
-  std::mutex pluginsMutex_;
+  mutable std::mutex pluginsMutex_;
   std::vector<std::shared_ptr<Plugin>> plugins_;
 
   std::jthread queryThread_;

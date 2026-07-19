@@ -4,8 +4,8 @@
 
 namespace feathercast::discovery_runtime {
 
-DiscoveryService::DiscoveryService(ResultSink resultSink)
-    : resultSink_(std::move(resultSink)) {}
+DiscoveryService::DiscoveryService(ResultSink resultSink, ErrorSink errorSink)
+    : resultSink_(std::move(resultSink)), errorSink_(std::move(errorSink)) {}
 
 DiscoveryService::~DiscoveryService() {
   Stop();
@@ -77,12 +77,28 @@ void DiscoveryService::WorkerLoop(std::stop_token stopToken) {
       pending_.reset();
       worker = workerFunction_;
     }
-    auto result = worker(request, stopToken);
+    std::optional<app::DiscoveryResult> result;
+    try {
+      result = worker(request, stopToken);
+    } catch (...) {
+      if (errorSink_) {
+        try { errorSink_(std::current_exception()); } catch (...) {}
+      }
+      continue;
+    }
     if (!result || stopToken.stop_requested() ||
         !IsCurrent(request.generation)) {
       continue;
     }
-    if (resultSink_) resultSink_(std::move(*result));
+    if (resultSink_) {
+      try {
+        resultSink_(std::move(*result));
+      } catch (...) {
+        if (errorSink_) {
+          try { errorSink_(std::current_exception()); } catch (...) {}
+        }
+      }
+    }
   }
 }
 

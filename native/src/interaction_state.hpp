@@ -6,6 +6,91 @@
 
 namespace feathercast::interaction {
 
+enum class OverlayFocusPhase {
+  Idle,
+  Acquiring,
+  Stabilizing,
+  Closing,
+};
+
+class OverlayFocusSession {
+ public:
+  static constexpr std::uint64_t kGuardDurationMs = 300;
+
+  std::uint64_t Begin(std::uint64_t now) {
+    ++generation_;
+    phase_ = OverlayFocusPhase::Acquiring;
+    deadline_ = now + kGuardDurationMs;
+    activationAttempts_ = 0;
+    return generation_;
+  }
+
+  bool GuardActive(std::uint64_t now) const {
+    return (phase_ == OverlayFocusPhase::Acquiring ||
+            phase_ == OverlayFocusPhase::Stabilizing) &&
+           now < deadline_;
+  }
+
+  bool AcceptsExternalCandidate(std::uint64_t now) const {
+    return GuardActive(now);
+  }
+
+  void RecordActivationAttempt(bool activated) {
+    ++activationAttempts_;
+    if (activated && phase_ == OverlayFocusPhase::Acquiring) {
+      phase_ = OverlayFocusPhase::Stabilizing;
+    }
+  }
+
+  void Expire(std::uint64_t now) {
+    if (!GuardActive(now) && phase_ != OverlayFocusPhase::Closing) {
+      phase_ = OverlayFocusPhase::Idle;
+    }
+  }
+
+  void BeginClosing() { phase_ = OverlayFocusPhase::Closing; }
+
+  bool CanFinishClose(std::uint64_t generation) const {
+    return phase_ == OverlayFocusPhase::Closing && generation == generation_;
+  }
+
+  void End() { phase_ = OverlayFocusPhase::Idle; }
+
+  OverlayFocusPhase Phase() const { return phase_; }
+  std::uint64_t Generation() const { return generation_; }
+  std::uint64_t Deadline() const { return deadline_; }
+  int ActivationAttempts() const { return activationAttempts_; }
+
+ private:
+  OverlayFocusPhase phase_ = OverlayFocusPhase::Idle;
+  std::uint64_t generation_ = 0;
+  std::uint64_t deadline_ = 0;
+  int activationAttempts_ = 0;
+};
+
+struct OverlayRestoreIdentity {
+  std::uintptr_t window = 0;
+  std::uint32_t processId = 0;
+  std::uint32_t threadId = 0;
+  std::uint64_t generation = 0;
+};
+
+inline bool OverlayRestoreIdentityMatches(
+    const OverlayRestoreIdentity& expected, std::uintptr_t currentWindow,
+    std::uint32_t currentProcessId, std::uint32_t currentThreadId,
+    std::uint64_t currentGeneration) {
+  return expected.window != 0 && expected.window == currentWindow &&
+         expected.processId == currentProcessId &&
+         expected.threadId == currentThreadId &&
+         expected.generation == currentGeneration;
+}
+
+inline bool ShouldAttemptOverlayRestore(bool explicitDismiss,
+                                        bool overlayStillForeground,
+                                        bool candidateValid) {
+  return explicitDismiss && overlayStillForeground && candidateValid;
+}
+
 class SearchPresentationState {
  public:
   std::uint64_t NextRequest() { return ++requested_; }

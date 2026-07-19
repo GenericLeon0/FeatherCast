@@ -10,7 +10,15 @@ enum class Layout {
   RightHalf,
   TopHalf,
   BottomHalf,
+  LeftThird,
+  CenterThird,
+  RightThird,
+  TopLeft,
+  TopRight,
+  BottomLeft,
+  BottomRight,
   Center,
+  PreviousDisplay,
   NextDisplay,
 };
 
@@ -34,6 +42,10 @@ inline std::size_t NextIndex(std::size_t current, std::size_t count) {
   return count == 0 ? 0 : (current + 1) % count;
 }
 
+inline std::size_t PreviousIndex(std::size_t current, std::size_t count) {
+  return count == 0 ? 0 : (current + count - 1) % count;
+}
+
 inline Rect ClampSizeAndCenter(Rect window, const Rect& workArea) {
   const int width = std::min(window.Width(), workArea.Width());
   const int height = std::min(window.Height(), workArea.Height());
@@ -49,6 +61,8 @@ inline Rect Compute(Layout layout, const Rect& window,
   const int height = sourceWorkArea.Height();
   const int middleX = sourceWorkArea.left + width / 2;
   const int middleY = sourceWorkArea.top + height / 2;
+  const int firstThirdX = sourceWorkArea.left + width / 3;
+  const int secondThirdX = sourceWorkArea.left + (width * 2) / 3;
 
   switch (layout) {
     case Layout::LeftHalf:
@@ -63,8 +77,26 @@ inline Rect Compute(Layout layout, const Rect& window,
     case Layout::BottomHalf:
       return {sourceWorkArea.left, middleY, sourceWorkArea.right,
               sourceWorkArea.bottom};
+    case Layout::LeftThird:
+      return {sourceWorkArea.left, sourceWorkArea.top, firstThirdX,
+              sourceWorkArea.bottom};
+    case Layout::CenterThird:
+      return {firstThirdX, sourceWorkArea.top, secondThirdX,
+              sourceWorkArea.bottom};
+    case Layout::RightThird:
+      return {secondThirdX, sourceWorkArea.top, sourceWorkArea.right,
+              sourceWorkArea.bottom};
+    case Layout::TopLeft:
+      return {sourceWorkArea.left, sourceWorkArea.top, middleX, middleY};
+    case Layout::TopRight:
+      return {middleX, sourceWorkArea.top, sourceWorkArea.right, middleY};
+    case Layout::BottomLeft:
+      return {sourceWorkArea.left, middleY, middleX, sourceWorkArea.bottom};
+    case Layout::BottomRight:
+      return {middleX, middleY, sourceWorkArea.right, sourceWorkArea.bottom};
     case Layout::Center:
       return ClampSizeAndCenter(window, sourceWorkArea);
+    case Layout::PreviousDisplay:
     case Layout::NextDisplay: {
       const int targetWidth = std::min(window.Width(), targetWorkArea.Width());
       const int targetHeight = std::min(window.Height(), targetWorkArea.Height());

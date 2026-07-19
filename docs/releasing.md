@@ -6,7 +6,7 @@ FeatherCast releases are distributed through GitHub Releases for `GenericLeon0/F
 
 Pushing a tag `vX.Y.Z` triggers `.github/workflows/ci.yml`: it builds, runs tests, packages via CPack, generates `.sha256` sidecars, and creates a **draft** GitHub Release with all assets attached. The updater ignores drafts, so verify the draft and publish it manually. The manual flow below remains as fallback.
 
-Release tags require the `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD` secrets plus the `FEATHERCAST_EXPECTED_PUBLISHER` and `FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS` repository variables. The thumbprint variable is a semicolon-separated list of SHA-256 signer-certificate thumbprints; keep the old and new certificates listed together during rotation. CI signs and timestamps the application, plugin host, and installer; the updater rejects installers whose trusted signer certificate is not pinned.
+Release tags require the `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD` secrets plus the `FEATHERCAST_EXPECTED_PUBLISHER` and `FEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS` repository variables. The thumbprint variable is a semicolon-separated list of SHA-256 signer-certificate thumbprints; keep the old and new certificates listed together during rotation. A tag build fails before packaging when any value is missing. CI signs and timestamps the application, plugin host, and installer, then verifies their status, publisher, timestamp, and certificate pin. The updater rejects installers whose trusted signer certificate is not pinned.
 
 ## Build And Test
 
@@ -27,7 +27,15 @@ cmake -S . -B build-native -A x64 `
   "-DFEATHERCAST_ALLOWED_SIGNER_THUMBPRINTS=<sha256 thumbprint>"
 ```
 
-A build without a signer thumbprint can check for releases but will not download or launch an installer.
+A local or pull-request build without a signer thumbprint can check for releases but will not download or launch an installer. Such a build must never be published as a stable release.
+
+Release binaries use the static MSVC runtime. Before packaging, CI audits PE
+dependencies and runs these side-effect-free startup checks:
+
+```powershell
+build-native\Release\FeatherCast.exe --self-test
+build-native\Release\FeatherCastPluginHost.exe --self-test
+```
 
 The configured package filename is:
 
@@ -75,3 +83,10 @@ The updater will not run an installer unless the `.sha256` asset exists and matc
 4. Create a GitHub Release tagged `vX.Y.Z`.
 5. Upload the installer and sidecar assets.
 6. Verify `Check for Updates` from the previous version detects the new release.
+
+## 0.6 Upgrade Note
+
+The published 0.6 installer was unsigned and its binary contains no trusted
+signer pin. Users of that build must download and install 0.7 manually from the
+GitHub Release page once. Signed 0.7 installations can use the verified in-app
+update path for later releases.

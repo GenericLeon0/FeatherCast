@@ -82,11 +82,19 @@ int main() {
     }));
   }
 
+  settings.quicklinks.push_back(
+      {L"docs", L"Documentation", L"https://example.com/docs"});
+  std::wstring blockingError;
+  assert(service.SaveSettingsAndWait(settings, &blockingError));
+  assert(blockingError.empty());
+
   service.Stop(true);
   const auto loaded =
       feathercast::settings_io::LoadSettingsFile(root / L"settings.json");
   assert(loaded.status == feathercast::settings::ParseStatus::Valid);
   assert(loaded.value.shortcut == L"Ctrl+Shift+Space");
+  assert(loaded.value.quicklinks.size() == 1);
+  assert(loaded.value.quicklinks[0].keyword == L"docs");
 
   std::filesystem::remove_all(root, ec);
   assert(!ec);

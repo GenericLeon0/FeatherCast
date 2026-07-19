@@ -1,6 +1,7 @@
 #include "persistence_service.hpp"
 
 #include <exception>
+#include <future>
 #include <utility>
 
 namespace feathercast::persistence {
@@ -77,6 +78,30 @@ bool PersistenceService::SaveSettings(settings::Settings settings) {
     settingsSaveScheduled_ = false;
   }
   return false;
+}
+
+bool PersistenceService::SaveSettingsAndWait(settings::Settings settings,
+                                             std::wstring* error) {
+  using Result = std::pair<bool, std::wstring>;
+  auto completion = std::make_shared<std::promise<Result>>();
+  auto ready = completion->get_future();
+  if (!executor_.Submit(
+          [this, settings = std::move(settings), completion](std::stop_token token) {
+            if (token.stop_requested()) {
+              completion->set_value({false, L"The persistence worker is stopping."});
+              return;
+            }
+            std::wstring detail;
+            const bool succeeded =
+                settings_io::SaveSettingsFile(settingsPath_, settings, &detail);
+            completion->set_value({succeeded, std::move(detail)});
+          })) {
+    if (error) *error = L"The persistence worker is unavailable.";
+    return false;
+  }
+  auto [succeeded, detail] = ready.get();
+  if (!succeeded && error) *error = std::move(detail);
+  return succeeded;
 }
 
 bool PersistenceService::PruneClipboard(std::size_t limit) {

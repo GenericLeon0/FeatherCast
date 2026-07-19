@@ -35,10 +35,15 @@ int main() {
     assert(versioned.documentVersion == 1);
     assert(versioned.value.shortcut == L"Ctrl+Alt+Space");
 
+    const auto current = settings::ParseSettingsDocument(
+        R"({"schemaVersion":2,"fileContentIndexEnabled":true})");
+    assert(current.status == settings::ParseStatus::Valid);
+    assert(current.value.fileContentIndexEnabled);
+
     const auto future = settings::ParseSettingsDocument(
-        R"({"schemaVersion":2,"shortcut":"DoNotLoad"})");
+        R"({"schemaVersion":3,"shortcut":"DoNotLoad"})");
     assert(future.status == settings::ParseStatus::UnsupportedVersion);
-    assert(future.documentVersion == 2);
+    assert(future.documentVersion == 3);
     assert(future.value.shortcut == L"Alt+Space");
 
     assert(settings::ParseSettingsDocument(R"({"schemaVersion":1.5})").status ==
@@ -59,7 +64,7 @@ int main() {
 
     assert(settings::ParseSettings(R"({"shortcut":)").shortcut == L"Alt+Space");
     const auto serialized = settings::SerializeSettings(settings::Settings{});
-    assert(serialized.find("\"schemaVersion\": 1") != std::string::npos);
+    assert(serialized.find("\"schemaVersion\": 2") != std::string::npos);
   }
 
   {

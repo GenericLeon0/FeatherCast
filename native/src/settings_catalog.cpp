@@ -14,6 +14,8 @@ const std::vector<CategoryDescriptor>& Categories() {
        L"General", L"General settings"},
       {SettingsCategory::Results, HitType::SettingsResultsCategory,
        L"Results", L"Results settings"},
+      {SettingsCategory::Library, HitType::SettingsLibraryCategory,
+       L"Library", L"Snippet and quicklink library"},
       {SettingsCategory::Privacy, HitType::SettingsPrivacyCategory,
        L"Privacy", L"Privacy settings"},
       {SettingsCategory::Extensions, HitType::SettingsExtensionsCategory,
@@ -48,9 +50,9 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"general.compact", SettingsCategory::General, HitType::CompactToggle,
        ControlKind::Toggle, L"Compact Mode",
        L"Show only the search bar at rest; results expand below.", L"Compact mode"},
-      {L"general.animations", SettingsCategory::General, HitType::AnimationsToggle,
-       ControlKind::Toggle, L"Enable Animations",
-       L"Animate results when the search opens.", L"Enable animations"},
+      {L"general.animations", SettingsCategory::General, HitType::AnimationLevel,
+       ControlKind::Slider, L"Animation",
+       L"Choose how much interface motion FeatherCast uses.", L"Animation level"},
       {L"results.windows", SettingsCategory::Results, HitType::ShowWindowsToggle,
        ControlKind::Toggle, L"Open Window Results",
        L"Include currently open windows in search results.", L"Open window results"},
@@ -69,6 +71,14 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"results.maximum.up", SettingsCategory::Results, HitType::MaxResultsUp,
        ControlKind::Increment, L"Max Results", L"Maximum number of results to show.",
        L"Increase maximum results"},
+      {L"library.snippets", SettingsCategory::Library, HitType::ManageSnippets,
+       ControlKind::Action, L"Manage Snippets",
+       L"Create, edit, and delete reusable text snippets.",
+       L"Manage snippets"},
+      {L"library.quicklinks", SettingsCategory::Library, HitType::ManageQuicklinks,
+       ControlKind::Action, L"Manage Quicklinks",
+       L"Create, edit, and delete keyword shortcuts for URLs, files, and folders.",
+       L"Manage quicklinks"},
       {L"privacy.clipboard", SettingsCategory::Privacy, HitType::ClipboardHistoryToggle,
        ControlKind::Toggle, L"Clipboard History",
        L"Store copied text locally for launcher search and paste.", L"Clipboard history"},
@@ -83,6 +93,11 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"privacy.file-index", SettingsCategory::Privacy, HitType::FileIndexToggle,
        ControlKind::Toggle, L"Files & Folders Index",
        L"Index selected local folders for launcher search.", L"Files and folders index"},
+      {L"privacy.file-content", SettingsCategory::Privacy,
+       HitType::FileContentIndexToggle, ControlKind::Toggle,
+       L"Search File Contents",
+       L"Build a local searchable token index for supported text files.",
+       L"Search file contents", Requirement::FileIndexEnabled},
       {L"privacy.file-limit.down", SettingsCategory::Privacy, HitType::FileIndexLimitDown,
        ControlKind::Decrement, L"File Index Limit",
        L"Maximum number of files and folders stored locally.",
@@ -94,10 +109,18 @@ const std::vector<SettingDescriptor>& Catalog() {
       {L"privacy.add-root", SettingsCategory::Privacy, HitType::AddFileRoot,
        ControlKind::Action, L"Add Indexed Folder", L"Add a folder to the local index.",
        L"Add file index folder", Requirement::FileIndexEnabled},
+      {L"privacy.remove-root", SettingsCategory::Privacy, HitType::RemoveFileRoot,
+       ControlKind::Action, L"Remove Indexed Folder",
+       L"Remove one configured folder from the local index.",
+       L"Remove indexed folder", Requirement::FileIndexEnabled},
       {L"privacy.default-roots", SettingsCategory::Privacy, HitType::ClearFileRoots,
        ControlKind::Action, L"Use Default Folders",
        L"Index Desktop, Documents, and Downloads.", L"Use default file index folders",
        Requirement::FileIndexEnabled},
+      {L"privacy.rebuild-files", SettingsCategory::Privacy,
+       HitType::RebuildFileIndex, ControlKind::Action, L"Rebuild File Index",
+       L"Reconcile selected folders and rebuild searchable content.",
+       L"Rebuild file index", Requirement::FileIndexEnabled},
       {L"privacy.diagnostics", SettingsCategory::Privacy, HitType::DiagnosticsToggle,
        ControlKind::Toggle, L"Diagnostics",
        L"Write bounded troubleshooting logs without queries or clipboard text.",
@@ -181,11 +204,12 @@ bool Checked(app::HitType hit, const app::Settings& settings) {
     case HitType::StartupToggle: return settings.startOnStartup;
     case HitType::UpdateChecksToggle: return settings.updateChecksEnabled;
     case HitType::CompactToggle: return settings.compactMode;
-    case HitType::AnimationsToggle: return settings.animationsEnabled;
     case HitType::ShowWindowsToggle: return settings.showOpenWindows;
     case HitType::ShowStoreAppsToggle: return settings.showStoreApps;
     case HitType::ClipboardHistoryToggle: return settings.clipboardHistoryEnabled;
     case HitType::FileIndexToggle: return settings.fileIndexEnabled;
+    case HitType::FileContentIndexToggle:
+      return settings.fileContentIndexEnabled;
     case HitType::DiagnosticsToggle: return settings.diagnosticsEnabled;
     case HitType::AccentToggle: return settings.syncAccentColor;
     default: return false;
@@ -215,7 +239,7 @@ bool ValidateCatalog(std::wstring* error) {
       return false;
     }
   }
-  return Categories().size() == 7;
+  return Categories().size() == 8;
 }
 
 }  // namespace feathercast::settings_catalog

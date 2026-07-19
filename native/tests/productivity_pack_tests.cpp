@@ -2,6 +2,7 @@
 #include "audio_volume.hpp"
 #include "command_catalog.hpp"
 #include "core.hpp"
+#include "network_client.hpp"
 #include "search_pipeline.hpp"
 #include "test_framework.hpp"
 #include "system_settings.hpp"
@@ -73,6 +74,21 @@ int main() {
   assert(feathercast::window_layout::Compute(Layout::BottomHalf, window, work,
                                               work) ==
          (Rect{-1920, 540, 1, 1081}));
+  assert(feathercast::window_layout::Compute(Layout::LeftThird, window, work,
+                                              work) ==
+         (Rect{-1920, 0, -1280, 1081}));
+  assert(feathercast::window_layout::Compute(Layout::CenterThird, window, work,
+                                              work) ==
+         (Rect{-1280, 0, -640, 1081}));
+  assert(feathercast::window_layout::Compute(Layout::RightThird, window, work,
+                                              work) ==
+         (Rect{-640, 0, 1, 1081}));
+  assert(feathercast::window_layout::Compute(Layout::TopLeft, window, work,
+                                              work) ==
+         (Rect{-1920, 0, -960, 540}));
+  assert(feathercast::window_layout::Compute(Layout::BottomRight, window, work,
+                                              work) ==
+         (Rect{-960, 540, 1, 1081}));
   assert(feathercast::window_layout::Compute(
              Layout::Center, Rect{0, 0, 3000, 2000}, work, work) == work);
 
@@ -88,10 +104,18 @@ int main() {
   assert(feathercast::window_layout::NextIndex(0, 3) == 1);
   assert(feathercast::window_layout::NextIndex(2, 3) == 0);
   assert(feathercast::window_layout::NextIndex(0, 0) == 0);
+  assert(feathercast::window_layout::PreviousIndex(0, 3) == 2);
+  assert(feathercast::window_layout::PreviousIndex(2, 3) == 1);
+  assert(feathercast::window_layout::PreviousIndex(0, 0) == 0);
   assert(feathercast::window_layout::Compute(
              Layout::NextDisplay, Rect{200, 200, 400, 400},
              Rect{0, 0, 1000, 1000}, Rect{1000, 100, 3000, 1100}) ==
          (Rect{1500, 300, 1700, 500}));
+  assert(feathercast::network::IsSuccessfulStatusQuery(true, 200));
+  assert(feathercast::network::IsSuccessfulStatusQuery(true, 299));
+  assert(!feathercast::network::IsSuccessfulStatusQuery(true, 300));
+  assert(!feathercast::network::IsSuccessfulStatusQuery(true, 404));
+  assert(!feathercast::network::IsSuccessfulStatusQuery(false, 204));
 
   feathercast::clock_utilities::ClockSnapshot clock;
   clock.localDate = std::chrono::year{2026} / std::chrono::July / 17;
@@ -180,21 +204,47 @@ int main() {
   windowItem.window.name = L"Test Window";
   const auto windowActions = feathercast::commands::BuildActions(
       windowItem, feathercast::app::Settings{});
+  assert(HasAction(windowActions,
+                   feathercast::app::ActionKind::ArrangeWindow));
+  const auto arrange = std::find_if(
+      windowActions.begin(), windowActions.end(), [](const auto& item) {
+        return item.action == feathercast::app::ActionKind::ArrangeWindow;
+      });
+  assert(arrange != windowActions.end());
+  const auto arrangeActions = feathercast::commands::BuildActions(
+      *arrange, feathercast::app::Settings{});
   for (const auto kind : {
            feathercast::app::ActionKind::MoveWindowLeftHalf,
            feathercast::app::ActionKind::MoveWindowRightHalf,
            feathercast::app::ActionKind::MoveWindowTopHalf,
            feathercast::app::ActionKind::MoveWindowBottomHalf,
+           feathercast::app::ActionKind::MoveWindowLeftThird,
+           feathercast::app::ActionKind::MoveWindowCenterThird,
+           feathercast::app::ActionKind::MoveWindowRightThird,
+           feathercast::app::ActionKind::MoveWindowTopLeft,
+           feathercast::app::ActionKind::MoveWindowTopRight,
+           feathercast::app::ActionKind::MoveWindowBottomLeft,
+           feathercast::app::ActionKind::MoveWindowBottomRight,
            feathercast::app::ActionKind::CenterWindow,
+           feathercast::app::ActionKind::MoveWindowPreviousDisplay,
            feathercast::app::ActionKind::MoveWindowNextDisplay,
   }) {
-    assert(HasAction(windowActions, kind));
+    assert(HasAction(arrangeActions, kind));
   }
-  for (const auto& action : windowActions) {
+  for (const auto& action : arrangeActions) {
     const auto* target =
         std::get_if<feathercast::app::WindowEntry>(&action.actionTarget);
     assert(target && target->hwnd == windowItem.window.hwnd);
   }
+
+  feathercast::app::DisplayItem appItem;
+  appItem.app.id = L"app:test";
+  appItem.app.name = L"Test App";
+  appItem.app.source = L"start-menu";
+  const auto appActions = feathercast::commands::BuildActions(
+      appItem, feathercast::app::Settings{});
+  assert(HasAction(appActions,
+                   feathercast::app::ActionKind::EditAppAlias));
 
   feathercast::app::DisplayItem calculation;
   calculation.isCalculator = true;
@@ -357,6 +407,19 @@ int main() {
   assert(volumeControlResults.flatItems.front().isCommand);
   assert(volumeControlResults.flatItems.front().command ==
          feathercast::app::CommandKind::VolumeControl);
+
+  request.searchEngines = {
+      {L"docs", L"https://example.com/search?q=%s"},
+  };
+  request.query = L"docs overlay crash";
+  const auto webResults =
+      feathercast::search_pipeline::ComputeResults(request);
+  const auto webResult = std::find_if(
+      webResults.flatItems.begin(), webResults.flatItems.end(),
+      [](const auto& item) { return item.isWebSearch; });
+  assert(webResult != webResults.flatItems.end());
+  assert(webResult->webSearchUrl ==
+         L"https://example.com/search?q=overlay+crash");
 
   std::atomic<unsigned long long> newest{request.generation + 1};
   request.query = L"notepad";
