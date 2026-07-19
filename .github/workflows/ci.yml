@@ -101,10 +101,14 @@ jobs:
             $env:SIGNER_THUMBPRINTS
           )
           $configured = @($values | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
-          if ($configured -ne $values.Count) {
-            throw "Stable release tags require the signing certificate, password, expected publisher, and signer thumbprint pins."
+          if ($configured -ne 0 -and $configured -ne $values.Count) {
+            throw "Release signing is only partially configured. Configure all certificate secrets and publisher variables, or none of them."
           }
-          "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $enabled = if ($configured -eq $values.Count) { 'true' } else { 'false' }
+          "enabled=$enabled" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($enabled -eq 'false') {
+            Write-Warning "Publishing unsigned release artifacts. In-app installation remains disabled for builds without signer pins."
+          }
 
       - name: Prepare signing certificate
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
@@ -132,7 +136,7 @@ jobs:
           }
 
       - name: Verify signed application identities
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}
@@ -191,7 +195,7 @@ jobs:
           signtool verify /pa /v $installer.FullName
 
       - name: Verify signed installer identity
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           EXPECTED_PUBLISHER: ${{ vars.FEATHERCAST_EXPECTED_PUBLISHER }}

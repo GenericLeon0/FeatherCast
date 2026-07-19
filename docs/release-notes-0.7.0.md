@@ -18,13 +18,16 @@ Existing installations migrate their local SQLite data to schema v3 after a
 backup. Full-text indexing stays disabled after upgrade until explicitly
 enabled; clipboard data remains preserved and DPAPI-protected.
 
-Release packages are now self-contained through the static MSVC runtime. Stable
-releases require timestamped Authenticode signatures whose publisher and signer
-certificate match the pins embedded in the application.
+Release packages are now self-contained through the static MSVC runtime. This
+0.7.0 publication is unsigned because repository signing credentials are not
+configured, so Windows may show an unknown-publisher warning. It is intended for
+manual installation from the official GitHub Release page. The in-app updater
+continues to require timestamped Authenticode signatures whose publisher and
+signer certificate match pins embedded in the application.
 
 ## Manual upgrade from 0.6
 
 The 0.6 installer was unsigned and that build cannot securely install an update
-inside the app. Download the signed 0.7 installer from the official GitHub
-Release page and run it once manually. Future updates from a signed 0.7 build
-can use FeatherCast's verified in-app updater.
+inside the app. Download the unsigned 0.7.0 installer from the official GitHub
+Release page and run it manually. A future signed build with embedded signer
+pins can use FeatherCast's verified in-app updater.
