@@ -178,6 +178,14 @@ jobs:
             build-native/Release/FeatherCast.pdb
             build-native/Release/FeatherCastPluginHost.pdb
 
+      - name: Install NSIS
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress --limit-output
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { throw "NSIS installation did not provide makensis.exe." }
+
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         run: cpack --config build-native/CPackConfig.cmake -C Release
