@@ -314,12 +314,15 @@ jobs:
           & $portableHost.FullName --self-test
           if ($LASTEXITCODE -ne 0) { throw "Portable plugin host self-test failed." }
 
-          $identities = @(
-            Get-ChildItem 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
-              Where-Object PSChildName -eq 'FeatherCast'
-            Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
-              Where-Object PSChildName -eq 'FeatherCast'
+          $uninstallRoots = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
           )
+          $identities = @($uninstallRoots | ForEach-Object {
+            Get-ChildItem $_ -ErrorAction SilentlyContinue |
+              Where-Object PSChildName -eq 'FeatherCast'
+          })
           if ($identities.Count -ne 1) {
             throw "Expected one FeatherCast uninstall identity after upgrade; found $($identities.Count)."
           }
