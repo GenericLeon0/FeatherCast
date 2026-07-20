@@ -214,6 +214,10 @@ int main() {
     assert(!error);
     const auto deepFile = deep / L"deep.txt";
     WriteBytes(deepFile, {'d', 'e', 'e', 'p'});
+    const auto generated = indexedRoot / L"build" / L"generated.txt";
+    std::filesystem::create_directories(generated.parent_path(), error);
+    assert(!error);
+    WriteBytes(generated, {'g', 'e', 'n'});
 
     std::mutex mutex;
     std::condition_variable ready;
@@ -239,6 +243,7 @@ int main() {
       assert(ready.wait_for(lock, std::chrono::seconds(5),
                             [&] { return contains(deepFile); }));
     }
+    assert(!contains(generated));
 
     const auto watched = deep / L"watched.txt";
     WriteBytes(watched, {'n', 'e', 'w'});
@@ -263,6 +268,57 @@ int main() {
       assert(ready.wait_for(lock, std::chrono::seconds(5),
                             [&] { return !contains(renamed); }));
     }
+    index.Stop();
+  }
+
+  {
+    const auto limitedRoot = root / L"limited-root";
+    std::filesystem::create_directories(limitedRoot, error);
+    assert(!error);
+    const auto oldFile = limitedRoot / L"old.txt";
+    const auto middleFile = limitedRoot / L"middle.txt";
+    const auto newestFile = limitedRoot / L"newest.txt";
+    WriteBytes(oldFile, {'o'});
+    WriteBytes(middleFile, {'m'});
+    WriteBytes(newestFile, {'n'});
+    const auto baseTime = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(
+        oldFile, baseTime - std::chrono::seconds(3), error);
+    assert(!error);
+    std::filesystem::last_write_time(
+        middleFile, baseTime - std::chrono::seconds(2), error);
+    assert(!error);
+    std::filesystem::last_write_time(newestFile, baseTime, error);
+    assert(!error);
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    feathercast::files::IndexStatus latest;
+    feathercast::files::FileIndexService index(
+        [&](feathercast::files::IndexStatus status) {
+          {
+            std::lock_guard lock(mutex);
+            latest = std::move(status);
+          }
+          ready.notify_all();
+        });
+    index.Start();
+    assert(index.Reconfigure({30, {limitedRoot.wstring()}, 2, false}));
+    {
+      std::unique_lock lock(mutex);
+      assert(ready.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return latest.generation == 30; }));
+    }
+    assert(latest.entries.size() == 2);
+    const auto contains = [&](const std::filesystem::path& path) {
+      return std::any_of(latest.entries.begin(), latest.entries.end(),
+                         [&](const auto& entry) {
+                           return std::filesystem::path(entry.path) == path;
+                         });
+    };
+    assert(contains(middleFile));
+    assert(contains(newestFile));
+    assert(!contains(oldFile));
     index.Stop();
   }
 

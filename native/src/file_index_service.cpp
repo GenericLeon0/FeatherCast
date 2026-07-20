@@ -9,7 +9,7 @@
 #include <cwctype>
 #include <deque>
 #include <filesystem>
-#include <set>
+#include <queue>
 
 namespace feathercast::files {
 namespace {
@@ -23,6 +23,32 @@ long long NowMilliseconds() {
 std::wstring RootOf(const std::filesystem::path& path) {
   return path.root_path().wstring();
 }
+
+bool IsGeneratedDirectory(const std::filesystem::path& path) {
+  std::wstring name = path.filename().wstring();
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+  return name == L".git" || name == L".hg" || name == L".svn" ||
+         name == L"node_modules" || name == L"build" ||
+         name == L"build-native" || name == L"bin" || name == L"obj" ||
+         name == L"target" || name == L"out" || name == L"dist" ||
+         name == L".cache";
+}
+
+bool NewerEntry(const storage::FileIndexEntry& left,
+                const storage::FileIndexEntry& right) {
+  if (left.lastWriteTime != right.lastWriteTime) {
+    return left.lastWriteTime > right.lastWriteTime;
+  }
+  return left.path < right.path;
+}
+
+struct OlderEntryFirst {
+  bool operator()(const storage::FileIndexEntry& left,
+                  const storage::FileIndexEntry& right) const {
+    return NewerEntry(left, right);
+  }
+};
 
 bool FixedLocalRoot(const std::filesystem::path& path) {
   const auto root = RootOf(path);
@@ -241,8 +267,12 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
   IndexStatus status;
   status.generation = request.generation;
   const long long scan = NowMilliseconds();
-  std::vector<storage::FileIndexEntry> discovered;
-  std::set<std::wstring> seen;
+  // Keep only the newest `limit` entries while traversing. The previous
+  // implementation retained every path and trimmed only after the complete
+  // recursive scan, which made a large Documents tree consume hundreds of MB.
+  std::priority_queue<storage::FileIndexEntry,
+                      std::vector<storage::FileIndexEntry>, OlderEntryFirst>
+      newest;
 
   for (const auto& configured : request.roots) {
     if (token.stop_requested() || !IsCurrent(request.generation)) return status;
@@ -273,12 +303,11 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
         }
         const bool directoryEntry =
             (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        if (directoryEntry) pending.push_back(path);
+        if (directoryEntry) {
+          if (IsGeneratedDirectory(path)) continue;
+          pending.push_back(path);
+        }
         const auto normalizedPath = path.lexically_normal();
-        std::wstring key = normalizedPath.wstring();
-        std::transform(key.begin(), key.end(), key.begin(),
-                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-        if (!seen.insert(key).second) continue;
 
         storage::FileIndexEntry entry;
         entry.path = normalizedPath.wstring();
@@ -296,11 +325,23 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
           const auto bytes = std::filesystem::file_size(normalizedPath, ec);
           if (!ec) entry.size = static_cast<long long>(bytes);
         }
-        discovered.push_back(std::move(entry));
+        if (request.limit == 0) continue;
+        if (newest.size() < request.limit) {
+          newest.push(std::move(entry));
+        } else if (NewerEntry(entry, newest.top())) {
+          newest.pop();
+          newest.push(std::move(entry));
+        }
       }
     }
   }
 
+  std::vector<storage::FileIndexEntry> discovered;
+  discovered.reserve(newest.size());
+  while (!newest.empty()) {
+    discovered.push_back(newest.top());
+    newest.pop();
+  }
   std::sort(discovered.begin(), discovered.end(), [](const auto& left,
                                                        const auto& right) {
     if (left.lastWriteTime != right.lastWriteTime) {
@@ -308,8 +349,6 @@ IndexStatus FileIndexService::Scan(const IndexRequest& request,
     }
     return left.path < right.path;
   });
-  if (discovered.size() > request.limit) discovered.resize(request.limit);
-
   if (request.contentEnabled) {
     for (auto& entry : discovered) {
       if (token.stop_requested()) return status;
