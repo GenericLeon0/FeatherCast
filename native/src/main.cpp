@@ -14,6 +14,7 @@
 #include "extension_manager.hpp"
 #include "file_index_service.hpp"
 #include "file_search_service.hpp"
+#include "game_discovery.hpp"
 #include "interaction_state.hpp"
 #include "json.hpp"
 #include "library.hpp"
@@ -3693,27 +3694,114 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     std::vector<AppEntry> apps;
     std::map<std::wstring, size_t> identities;
 
+    auto canonicalPathKey = [](const std::filesystem::path& path) {
+      if (path.empty()) return std::wstring{};
+      std::error_code ec;
+      auto canonical = std::filesystem::weakly_canonical(path, ec);
+      std::wstring value = Lower((ec ? path.lexically_normal() : canonical).wstring());
+      while (value.size() > 3 && (value.back() == L'\\' || value.back() == L'/')) {
+        value.pop_back();
+      }
+      return value;
+    };
+
+    auto pathIsInside = [](const std::wstring& child,
+                           const std::wstring& directory) {
+      if (child.size() <= directory.size() ||
+          child.compare(0, directory.size(), directory) != 0) {
+        return false;
+      }
+      return child[directory.size()] == L'\\' || child[directory.size()] == L'/';
+    };
+
     auto addUnique = [&](AppEntry entry) {
       if (entry.id.empty() || entry.name.empty()) return;
-      std::wstring identity;
-      if (!entry.appUserModelId.empty()) identity = L"aumid:" + Lower(entry.appUserModelId);
-      else if (!entry.targetPath.empty()) identity = L"target:" + Lower(entry.targetPath);
-      else if (!entry.launchTarget.empty()) identity = L"launch:" + Lower(entry.launchTarget);
-      else identity = L"id:" + Lower(entry.id);
+      std::vector<std::wstring> candidateIdentities;
+      if (!entry.appUserModelId.empty()) {
+        candidateIdentities.push_back(L"aumid:" + Lower(entry.appUserModelId));
+      }
+      if (!entry.targetPath.empty()) {
+        candidateIdentities.push_back(L"target:" + Lower(entry.targetPath));
+      }
+      if (entry.isGame && !entry.path.empty()) {
+        candidateIdentities.push_back(
+            L"install:" + canonicalPathKey(entry.path));
+      }
+      if (!entry.isGame && !entry.launchTarget.empty()) {
+        candidateIdentities.push_back(L"launch:" + Lower(entry.launchTarget));
+      }
+      candidateIdentities.push_back(L"id:" + Lower(entry.id));
 
-      if (const auto found = identities.find(identity); found != identities.end()) {
-        auto& existing = apps[found->second];
+      std::optional<size_t> foundIndex;
+      for (const auto& identity : candidateIdentities) {
+        if (const auto found = identities.find(identity);
+            found != identities.end()) {
+          foundIndex = found->second;
+          break;
+        }
+      }
+
+      // A provider usually knows the installation root while a Start Menu
+      // shortcut knows the concrete game executable. Correlate those without
+      // using directory identity for ordinary apps, which could collapse two
+      // unrelated executables installed beside each other.
+      if (!foundIndex && entry.isGame && !entry.path.empty()) {
+        const std::wstring installPath = canonicalPathKey(entry.path);
+        for (size_t index = 0; index < apps.size(); ++index) {
+          const std::wstring targetPath = canonicalPathKey(apps[index].targetPath);
+          if (!targetPath.empty() && pathIsInside(targetPath, installPath)) {
+            foundIndex = index;
+            break;
+          }
+        }
+      }
+
+      if (foundIndex) {
+        auto& existing = apps[*foundIndex];
+        if (entry.isGame && !existing.isGame) {
+          const std::wstring visibleName = existing.name;
+          const std::wstring localIcon = existing.iconKey;
+          const std::wstring localTarget = existing.targetPath;
+          const bool adminSupported = existing.adminSupported || entry.adminSupported;
+          const bool systemEssential = existing.systemEssential || entry.systemEssential;
+          entry.name = visibleName;
+          if (!localIcon.empty()) entry.iconKey = localIcon;
+          if (entry.targetPath.empty()) entry.targetPath = localTarget;
+          entry.adminSupported = adminSupported;
+          entry.systemEssential = systemEssential;
+          entry.keywords = UniqueKeywords({
+              feathercast::core::JoinKeywords(existing.keywords),
+              feathercast::core::JoinKeywords(entry.keywords),
+          });
+          existing = std::move(entry);
+          for (const auto& identity : candidateIdentities) {
+            identities.emplace(identity, *foundIndex);
+          }
+          return;
+        }
         existing.adminSupported = existing.adminSupported || entry.adminSupported;
         existing.systemEssential = existing.systemEssential || entry.systemEssential;
+        existing.isGame = existing.isGame || entry.isGame;
+        if (!entry.gameProvider.empty() &&
+            existing.gameProvider.find(entry.gameProvider) == std::wstring::npos) {
+          if (!existing.gameProvider.empty()) existing.gameProvider += L" + ";
+          existing.gameProvider += entry.gameProvider;
+        }
+        if (entry.isGame && !entry.path.empty()) existing.path = entry.path;
         if (existing.iconKey.empty()) existing.iconKey = std::move(entry.iconKey);
         if (existing.targetPath.empty()) existing.targetPath = std::move(entry.targetPath);
         existing.keywords = UniqueKeywords({
             feathercast::core::JoinKeywords(existing.keywords),
             feathercast::core::JoinKeywords(entry.keywords),
         });
+        for (const auto& identity : candidateIdentities) {
+          identities.emplace(identity, *foundIndex);
+        }
         return;
       }
-      identities.emplace(std::move(identity), apps.size());
+      for (const auto& identity : candidateIdentities) {
+        identities.emplace(identity, apps.size());
+      }
       apps.push_back(std::move(entry));
     };
 
@@ -3724,6 +3812,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     }
 
     for (auto& entry : AppsFolderEntries(stopToken, generation)) {
+      if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
+      addUnique(std::move(entry));
+    }
+
+    for (auto& entry : feathercast::games::DiscoverInstalledGames(apps, stopToken)) {
       if (DiscoveryCanceled(stopToken, generation)) return std::nullopt;
       addUnique(std::move(entry));
     }
@@ -4105,6 +4198,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       snap->clipboardSearchItems.push_back(ToSearchItem(item, snapshotSettings));
     }
 
+    for (const auto& item : appItems) {
+      if (item.app.isGame) snap->gameItems.push_back(item);
+    }
+    std::sort(snap->gameItems.begin(), snap->gameItems.end(),
+              [](const DisplayItem& left, const DisplayItem& right) {
+                return Lower(left.app.name) < Lower(right.app.name);
+              });
+    for (const auto& item : snap->gameItems) {
+      snap->gameSearchItems.push_back(ToSearchItem(item, snapshotSettings));
+    }
+
     std::vector<DisplayItem> windowItems;
     if (snapshotSettings.showOpenWindows) {
       for (const auto& window : windows) windowItems.push_back(WindowDisplay(window));
@@ -4124,7 +4228,11 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         if (byId.contains(id)) snap->recent.push_back(byId[id]);
       }
       for (const auto& item : appItems) {
-        if (item.app.systemEssential || item.app.source == L"alias" || item.app.source == L"quicklink") snap->system.push_back(item);
+        if (!item.app.isGame &&
+            (item.app.systemEssential || item.app.source == L"alias" ||
+             item.app.source == L"quicklink")) {
+          snap->system.push_back(item);
+        }
         if (item.app.source == L"system-folder") snap->systemFolders.push_back(item);
       }
     }
@@ -5403,6 +5511,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::wstring SearchPlaceholder() const {
     if (browseView_ == BrowseView::Clipboard) return L"Search clipboard history...";
     if (browseView_ == BrowseView::Emoji) return L"Search emoji...";
+    if (browseView_ == BrowseView::Games) return L"Search installed games...";
     if (browseView_ == BrowseView::Capabilities) return L"Search FeatherCast features...";
     if (actionMode_) return L"Actions for " + actionTarget_.Name();
     return L"Search apps, files, commands, and more...";
@@ -5420,6 +5529,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (browseView_ == BrowseView::Emoji) {
       return emptyQuery ? L"No emoji available" : L"No matching emoji";
     }
+    if (browseView_ == BrowseView::Games) {
+      return emptyQuery ? L"No installed games found" : L"No matching games";
+    }
     if (browseView_ == BrowseView::Capabilities) {
       return emptyQuery ? L"No features available"
                         : L"No matching features — try apps, calculator, clipboard, or shortcuts";
@@ -5433,6 +5545,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       }
       return scopedQuery.terms.empty() ? L"No indexed files in the selected folders"
                                        : L"No matching indexed files";
+    }
+    if (scopedQuery.scope == feathercast::search_scope::Scope::Games) {
+      return scopedQuery.terms.empty() ? L"No installed games found"
+                                       : L"No matching games";
     }
     if (!appsReady_.load(std::memory_order_acquire)) return L"Loading apps...";
     return emptyQuery ? L"No items available"
@@ -6637,6 +6753,21 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         rect(2.0f, 9.5f, 6.5f, 14.0f, 1.0f);
         rect(9.5f, 9.5f, 14.0f, 14.0f, 1.0f);
         break;
+      case ResultIcon::Gamepad:
+        line(3.0f, 6.0f, 5.0f, 4.0f);
+        line(5.0f, 4.0f, 11.0f, 4.0f);
+        line(11.0f, 4.0f, 13.0f, 6.0f);
+        line(13.0f, 6.0f, 14.2f, 11.2f);
+        line(14.2f, 11.2f, 12.8f, 13.0f);
+        line(12.8f, 13.0f, 9.8f, 10.5f);
+        line(9.8f, 10.5f, 6.2f, 10.5f);
+        line(6.2f, 10.5f, 3.2f, 13.0f);
+        line(3.2f, 13.0f, 1.8f, 11.2f);
+        line(1.8f, 11.2f, 3.0f, 6.0f);
+        plus(5.3f, 7.5f, 1.5f);
+        dot(10.7f, 7.0f, 0.8f);
+        dot(12.2f, 8.5f, 0.8f);
+        break;
       case ResultIcon::Windows:
         rect(1.8f, 4.5f, 11.5f, 13.8f, 1.3f);
         rect(4.5f, 1.8f, 14.2f, 11.1f, 1.3f);
@@ -7661,6 +7792,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (item.utility) return L"Local utility - " + item.utility->value;
     if (item.isCommand || item.isAction) return item.commandDetail;
     if (item.isWindow) return item.window.processName.empty() ? L"Open window" : L"Open window - " + item.window.processName;
+    if (item.app.isGame) {
+      return item.app.gameProvider.empty() ? L"Installed game"
+                                           : item.app.gameProvider + L" game";
+    }
     if (item.app.source == L"shortcut") return L"Desktop app";
     if (item.app.source == L"quicklink") return L"Quicklink";
     if (item.app.source == L"file") {
@@ -8567,6 +8702,17 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                 CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&workerWicFactory)))) {
       return std::nullopt;
+    }
+    const std::filesystem::path sourcePath(key);
+    const std::wstring sourceExtension =
+        Lower(sourcePath.extension().wstring());
+    std::error_code sourceEc;
+    if ((sourceExtension == L".png" || sourceExtension == L".jpg" ||
+         sourceExtension == L".jpeg" || sourceExtension == L".bmp") &&
+        std::filesystem::is_regular_file(sourcePath, sourceEc)) {
+      if (auto decoded = DecodeIconFile(workerWicFactory.Get(), sourcePath, key)) {
+        return decoded;
+      }
     }
     const auto png = IconCachePath(key);
     std::error_code ec;
@@ -10269,6 +10415,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         return;
       case CommandKind::EmojiPicker:
         EnterBrowseView(BrowseView::Emoji);
+        return;
+      case CommandKind::Games:
+        EnterBrowseView(BrowseView::Games);
         return;
       case CommandKind::DiscoverFeatherCast:
         EnterBrowseView(BrowseView::Capabilities);

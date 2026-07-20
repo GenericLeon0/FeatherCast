@@ -13,6 +13,7 @@ namespace feathercast::search_scope {
 enum class Scope {
   All,
   Apps,
+  Games,
   Windows,
   Files,
   Commands,
@@ -27,9 +28,10 @@ struct Descriptor {
   std::wstring_view detail;
 };
 
-inline constexpr std::array<Descriptor, 6> kDescriptors = {{
+inline constexpr std::array<Descriptor, 7> kDescriptors = {{
     {Scope::Files, L"@files", L"Files", L"Search file names, paths, and enabled content"},
     {Scope::Apps, L"@apps", L"Apps", L"Search installed apps and quicklinks"},
+    {Scope::Games, L"@games", L"Games", L"Search locally installed games"},
     {Scope::Windows, L"@windows", L"Windows", L"Search open windows"},
     {Scope::Commands, L"@commands", L"Commands", L"Search FeatherCast commands"},
     {Scope::Clipboard, L"@clipboard", L"Clipboard", L"Search clipboard history"},

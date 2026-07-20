@@ -124,6 +124,7 @@ enum class CommandKind {
   CheckForUpdates,
   ClipboardHistory,
   EmojiPicker,
+  Games,
   DiscoverFeatherCast,
   VolumeControl,
   VolumeUp,
@@ -169,6 +170,7 @@ enum class BrowseView {
   None,
   Clipboard,
   Emoji,
+  Games,
   Capabilities,
 };
 
@@ -275,6 +277,8 @@ struct AppEntry {
   std::wstring cwd;
   std::wstring appUserModelId;
   std::wstring iconKey;
+  bool isGame = false;
+  std::wstring gameProvider;
   bool adminSupported = false;
   bool systemEssential = false;
   bool fileIsDirectory = false;
@@ -435,7 +439,9 @@ struct DisplayItem {
     if (isCommand) return L"";
     return isWindow
                ? (!window.iconKey.empty() ? window.iconKey : window.exe)
-               : (!app.iconKey.empty() ? app.iconKey : app.path);
+               : (!app.iconKey.empty()
+                      ? app.iconKey
+                      : (app.isGame ? std::wstring{} : app.path));
   }
 };
 
@@ -456,6 +462,8 @@ struct SearchSnapshot {
   std::vector<DisplayItem> snippetItems;
   std::vector<DisplayItem> clipboardItems;
   std::vector<feathercast::core::SearchItem> clipboardSearchItems;
+  std::vector<DisplayItem> gameItems;
+  std::vector<feathercast::core::SearchItem> gameSearchItems;
 };
 
 struct SnapshotBuildRequest {

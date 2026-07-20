@@ -103,7 +103,7 @@ int main() {
     assert(scope::Token(scope::Scope::All).empty());
 
     const auto allSuggestions = scope::Suggestions(L"@");
-    assert(allSuggestions.size() == 6);
+    assert(allSuggestions.size() == 7);
     const auto fileSuggestions = scope::Suggestions(L"@fi");
     assert(fileSuggestions.size() == 1);
     assert(fileSuggestions.front()->scope == scope::Scope::Files);
@@ -161,7 +161,7 @@ int main() {
     scopedResults = feathercast::search_pipeline::ComputeResults(request);
     assert(scopedResults.sections.size() == 1);
     assert(scopedResults.sections.front().title == L"Search scopes");
-    assert(scopedResults.flatItems.size() == 6);
+    assert(scopedResults.flatItems.size() == 7);
   }
 
   wchar_t temporary[MAX_PATH]{};

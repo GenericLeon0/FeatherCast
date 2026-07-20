@@ -5,6 +5,7 @@ namespace {
 
 ResultIcon CapabilityIcon(const std::wstring& id) noexcept {
   if (id == L"apps") return ResultIcon::AppGrid;
+  if (id == L"games") return ResultIcon::Gamepad;
   if (id == L"windows") return ResultIcon::Windows;
   if (id == L"window-management") return ResultIcon::WindowLayout;
   if (id == L"actions") return ResultIcon::Actions;
@@ -52,6 +53,7 @@ ResultIcon CommandIcon(app::CommandKind kind) noexcept {
     case CommandKind::CheckForUpdates: return ResultIcon::Download;
     case CommandKind::ClipboardHistory: return ResultIcon::Clipboard;
     case CommandKind::EmojiPicker: return ResultIcon::Smile;
+    case CommandKind::Games: return ResultIcon::Gamepad;
     case CommandKind::DiscoverFeatherCast: return ResultIcon::Compass;
     case CommandKind::VolumeControl: return ResultIcon::Sliders;
     case CommandKind::VolumeUp: return ResultIcon::SpeakerPlus;
@@ -127,6 +129,7 @@ ResultIcon ResolveResultIcon(const app::DisplayItem& item) noexcept {
     }
   }
   if (item.isWindow) return ResultIcon::Windows;
+  if (item.app.isGame) return ResultIcon::Gamepad;
   if (item.app.source == L"quicklink") return ResultIcon::Link;
   if (item.app.source == L"file") {
     return item.app.fileIsDirectory ? ResultIcon::Folder : ResultIcon::File;

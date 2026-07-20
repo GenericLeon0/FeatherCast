@@ -7,10 +7,13 @@ FeatherCast is a lightweight native Windows app launcher. A global shortcut open
 ## Features
 
 - App search across system and per-user Start Menu shortcuts plus AppsFolder entries
+- Local installed-game discovery for Steam, Epic Games, GOG Galaxy, EA app,
+  Ubisoft Connect, Battle.net, and Xbox/Microsoft Store without a FeatherCast login
+- Dedicated Games browser, `@games` scope, provider labels, and local game artwork
 - Open-window switching with foreground restore for minimized windows
 - Open-window actions for screen halves, centering, and moving to the next display
 - Token-aware fuzzy search ranked for launcher usage
-- Search scopes: `@files`, `@apps`, `@windows`, `@commands`, `@clipboard`, and `@snippets`
+- Search scopes: `@files`, `@apps`, `@games`, `@windows`, `@commands`, `@clipboard`, and `@snippets`
 - Optional recursive live indexing for explicitly selected local folders
 - Separately enabled local full-text search for supported text and source files
 - On-demand text, image, and metadata preview pane
@@ -57,6 +60,11 @@ names and paths; when local content indexing is enabled, it also adds deduplicat
 `Content match` results. An empty `@files` query shows recently modified files.
 Press `Esc` once to remove an active scope, or `Ctrl+Space` on a file result to
 open its preview.
+
+The Games command opens a dedicated view of locally installed games. `@games`
+searches the same library directly. Discovery reads only local launcher
+manifests, registry entries, package registrations, and icon caches; it does not
+sync owned libraries or store launcher credentials.
 
 The tray icon runs in the background. Left-click opens search; right-click opens the menu.
 

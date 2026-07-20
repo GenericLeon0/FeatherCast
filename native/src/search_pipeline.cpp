@@ -136,6 +136,8 @@ bool MatchesScope(const DisplayItem& item, search_scope::Scope scope) {
     case search_scope::Scope::Apps:
       return plainApp && item.app.source != L"file" &&
              item.app.source != L"system-folder";
+    case search_scope::Scope::Games:
+      return plainApp && item.app.isGame;
     case search_scope::Scope::Windows: return item.isWindow;
     case search_scope::Scope::Files:
       return plainApp && item.app.source == L"file";
@@ -150,6 +152,7 @@ std::wstring ScopeTitle(search_scope::Scope scope, bool empty) {
   using search_scope::Scope;
   switch (scope) {
     case Scope::Apps: return L"Apps";
+    case Scope::Games: return L"Games";
     case Scope::Windows: return L"Open windows";
     case Scope::Files: return empty ? L"Recently modified" : L"Names & paths";
     case Scope::Commands: return L"Commands";
@@ -221,6 +224,15 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       items.push_back(SymbolDisplay(emoji));
     }
     addSection(L"Emoji", take(items));
+  } else if (request.browseView == BrowseView::Games) {
+    if (request.empty) {
+      addSection(L"Games", take(snapshot->gameItems));
+    } else {
+      const auto order = core::Search(request.query, snapshot->gameSearchItems);
+      std::vector<DisplayItem> hits;
+      for (const auto index : order) hits.push_back(snapshot->gameItems[index]);
+      addSection(L"Games", take(hits));
+    }
   } else if (request.browseView == BrowseView::Capabilities) {
     std::map<std::wstring, std::vector<DisplayItem>> grouped;
     std::vector<std::wstring> categoryOrder;
@@ -359,6 +371,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       std::vector<DisplayItem> rest(
           hits.size() > 1 ? hits.begin() + 1 : hits.end(), hits.end());
       std::vector<DisplayItem> recent;
+      std::vector<DisplayItem> games;
       std::vector<DisplayItem> apps;
       std::vector<DisplayItem> windows;
       std::vector<DisplayItem> system;
@@ -381,13 +394,16 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
         if (plainApp && item.app.source == L"system-folder") {
           systemFolders.push_back(item);
         }
+        if (plainApp && item.app.isGame) games.push_back(item);
         if (plainApp && item.app.source != L"file" &&
             request.recentIds.contains(PrimaryAppId(item.app))) {
           recent.push_back(item);
         }
-        if (plainApp && item.app.source == L"shortcut") apps.push_back(item);
+        if (plainApp && !item.app.isGame && item.app.source == L"shortcut") {
+          apps.push_back(item);
+        }
         if (item.isWindow) windows.push_back(item);
-        if (plainApp && item.app.source != L"shortcut" &&
+        if (plainApp && !item.app.isGame && item.app.source != L"shortcut" &&
             item.app.source != L"quicklink" && item.app.source != L"file" &&
             item.app.source != L"system-folder") {
           system.push_back(item);
@@ -399,6 +415,7 @@ app::ResultsCollection ComputeResults(const app::QueryRequest& request) {
       addSection(L"Snippets", take(snippets, 20));
       addSection(L"Clipboard History", take(clipboard, 20));
       addSection(L"Recently used", take(recent, 8));
+      addSection(L"Games", take(games, 80));
       addSection(L"Apps", take(apps, 80));
       addSection(L"Files & Folders", take(files, 40));
       addSection(L"System Folders", take(systemFolders, 30));

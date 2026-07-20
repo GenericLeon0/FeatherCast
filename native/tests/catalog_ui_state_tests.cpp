@@ -53,8 +53,17 @@ int main() {
          feathercast::app::CapabilityActionKind::SeedQuery);
 
   using feathercast::ui::ResultIcon;
+  feathercast::app::DisplayItem gameFallback;
+  gameFallback.app.name = L"Game without a local icon";
+  gameFallback.app.path = L"E:\\Games\\Fixture";
+  gameFallback.app.isGame = true;
+  assert(gameFallback.IconKey().empty());
+  assert(feathercast::ui::ResolveResultIcon(gameFallback) ==
+         ResultIcon::Gamepad);
+
   const std::array capabilityIcons{
       std::pair{L"apps", ResultIcon::AppGrid},
+      std::pair{L"games", ResultIcon::Gamepad},
       std::pair{L"windows", ResultIcon::Windows},
       std::pair{L"window-management", ResultIcon::WindowLayout},
       std::pair{L"actions", ResultIcon::Actions},
@@ -89,6 +98,7 @@ int main() {
   using feathercast::app::CommandKind;
   const std::array commandIcons{
       std::pair{CommandKind::Settings, ResultIcon::Gear},
+      std::pair{CommandKind::Games, ResultIcon::Gamepad},
       std::pair{CommandKind::Quit, ResultIcon::Exit},
       std::pair{CommandKind::Restart, ResultIcon::Refresh},
       std::pair{CommandKind::RefreshApps, ResultIcon::Refresh},

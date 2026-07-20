@@ -7,6 +7,7 @@ namespace feathercast::ui {
 enum class ResultIcon {
   App,
   AppGrid,
+  Gamepad,
   Windows,
   WindowLayout,
   Actions,
