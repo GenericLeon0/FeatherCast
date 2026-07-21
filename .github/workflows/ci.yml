@@ -51,6 +51,13 @@ jobs:
       - name: Verify self-contained runtime and startup
         shell: pwsh
         run: |
+          function Invoke-SelfTest([string]$Path, [string]$Label) {
+            $selfTest = Start-Process $Path -ArgumentList '--self-test' -PassThru -Wait
+            if ($selfTest.ExitCode -ne 0) {
+              throw "$Label self-test failed with exit code $($selfTest.ExitCode)."
+            }
+          }
+
           $dumpbin = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio" `
             -Recurse -Filter dumpbin.exe -ErrorAction Stop |
             Where-Object FullName -Match 'Hostx64\\x64\\dumpbin\.exe$' |
@@ -65,10 +72,8 @@ jobs:
               throw "$file depends on a dynamic MSVC runtime."
             }
           }
-          & build-native\Release\FeatherCast.exe --self-test
-          if ($LASTEXITCODE -ne 0) { throw "FeatherCast self-test failed." }
-          & build-native\Release\FeatherCastPluginHost.exe --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Plugin host self-test failed." }
+          Invoke-SelfTest 'build-native\Release\FeatherCast.exe' 'FeatherCast'
+          Invoke-SelfTest 'build-native\Release\FeatherCastPluginHost.exe' 'Plugin host'
 
       - name: Validate tag version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -234,26 +239,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          function Invoke-SelfTest([string]$Path, [string]$Label) {
+            $selfTest = Start-Process $Path -ArgumentList '--self-test' -PassThru -Wait
+            if ($selfTest.ExitCode -ne 0) {
+              throw "$Label self-test failed with exit code $($selfTest.ExitCode)."
+            }
+          }
+
           $installer = Get-ChildItem FeatherCast-*-win64.exe | Select-Object -First 1
           if (-not $installer) { throw "NSIS installer was not generated." }
 
           # Exercise a real in-place upgrade when a published predecessor exists.
-          $releases = gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName |
-            ConvertFrom-Json
-          $previousTag = $releases |
-            Where-Object tagName -ne '${{ github.ref_name }}' |
-            Select-Object -ExpandProperty tagName -First 1
+          $previousTag = $null
+          $releaseJson = gh release list --exclude-drafts --exclude-pre-releases `
+            --limit 20 --json tagName 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            $previousTag = $releaseJson |
+              ConvertFrom-Json |
+              Where-Object tagName -ne '${{ github.ref_name }}' |
+              Select-Object -ExpandProperty tagName -First 1
+          } else {
+            Write-Warning "Unable to list previous releases; running a clean-install smoke test. $releaseJson"
+          }
           if ($previousTag) {
             $previousDirectory = Join-Path $env:RUNNER_TEMP 'previous-release'
             New-Item -ItemType Directory -Force $previousDirectory | Out-Null
-            gh release download $previousTag --pattern 'FeatherCast-*-win64.exe' --dir $previousDirectory
+            $downloaded = $false
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Get-ChildItem $previousDirectory -File -ErrorAction SilentlyContinue |
+                Remove-Item -Force
+              $downloadOutput = gh release download $previousTag `
+                --pattern 'FeatherCast-*-win64.exe' --dir $previousDirectory 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $downloaded = $true
+                break
+              }
+              Write-Warning "Previous release download attempt $attempt failed. $downloadOutput"
+              if ($attempt -lt 3) { Start-Sleep -Seconds ([Math]::Pow(2, $attempt)) }
+            }
             $previousInstaller = Get-ChildItem $previousDirectory -Filter 'FeatherCast-*-win64.exe' |
               Select-Object -First 1
-            if ($previousInstaller) {
+            if ($downloaded -and $previousInstaller) {
               $previousProcess = Start-Process $previousInstaller.FullName -ArgumentList '/S' -PassThru -Wait
               if ($previousProcess.ExitCode -ne 0) {
                 throw "Previous installer failed with exit code $($previousProcess.ExitCode)."
               }
+            } else {
+              Write-Warning "Previous release $previousTag is unavailable; running a clean-install smoke test."
             }
           }
 
@@ -292,12 +324,10 @@ jobs:
               throw "Upgrade changed user data: $preservedFile"
             }
           }
-          & $app --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed FeatherCast self-test failed." }
+          Invoke-SelfTest $app 'Installed FeatherCast'
           $pluginHost = Join-Path $installRoot 'bin\FeatherCastPluginHost.exe'
           if (-not (Test-Path $pluginHost)) { throw "Installed plugin host was not found." }
-          & $pluginHost --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed plugin host self-test failed." }
+          Invoke-SelfTest $pluginHost 'Installed plugin host'
 
           $zip = Get-ChildItem FeatherCast-*-win64.zip | Select-Object -First 1
           $portableRoot = Join-Path $env:RUNNER_TEMP 'portable-release'
@@ -309,10 +339,8 @@ jobs:
           if (-not $portableApp -or -not $portableHost) {
             throw "Portable release binaries were not found."
           }
-          & $portableApp.FullName --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Portable FeatherCast self-test failed." }
-          & $portableHost.FullName --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Portable plugin host self-test failed." }
+          Invoke-SelfTest $portableApp.FullName 'Portable FeatherCast'
+          Invoke-SelfTest $portableHost.FullName 'Portable plugin host'
 
           $uninstallRoots = @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -380,5 +408,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          $assets = Get-ChildItem release-assets -File | ForEach-Object { $_.FullName }
-          gh release create ${{ github.ref_name }} --draft --generate-notes @assets
+          $assets = @(Get-ChildItem release-assets -File)
+          $assetPaths = @($assets | ForEach-Object FullName)
+          $tag = '${{ github.ref_name }}'
+          $releaseJson = gh api "repos/$env:GH_REPO/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw "Unable to inspect existing GitHub releases." }
+          $matchingReleases = @($releaseJson |
+            ConvertFrom-Json |
+            Where-Object tag_name -eq $tag)
+
+          if ($matchingReleases.Count -gt 1) {
+            $ids = $matchingReleases | ForEach-Object id
+            throw "Multiple releases already use tag $tag (IDs: $($ids -join ', ')). Remove the duplicate drafts and rerun this job."
+          }
+          if ($matchingReleases.Count -eq 1) {
+            gh release upload $tag @assetPaths --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Unable to update the existing draft release for $tag." }
+          } else {
+            gh release create $tag --draft --generate-notes @assetPaths
+            if ($LASTEXITCODE -ne 0) { throw "Unable to create the draft release for $tag." }
+          }

@@ -81,7 +81,12 @@ class PersistenceService {
   bool SaveSettingsForStartup(const settings::Settings& settings,
                               std::wstring* error = nullptr) const;
   StorageStartupState LoadStorageForStartup(std::size_t fileLimit,
-                                            std::size_t clipboardLimit);
+                                            std::size_t clipboardLimit,
+                                            bool loadFiles = true);
+  // Loads the persisted file index on demand.  This keeps startup cheap when
+  // the Files scope is not used while preserving the existing synchronous API
+  // used by the UI thread for a small, bounded result set.
+  std::vector<storage::FileIndexEntry> LoadFileIndex(std::size_t limit);
 
   void Start();
   void Stop(bool drainPending = true);

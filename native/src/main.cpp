@@ -1371,7 +1371,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     settingsOpacity_.Snap(1.0);
     volumeOpacity_.Snap(1.0);
     confirmationProgress_.Snap(0.0);
-    pendingResultsOpacity_.Snap(1.0);
     overlayVisualScroll_.Snap(0.0);
     settingsVisualScroll_.Snap(0.0);
     settingsPageProgress_.Snap(1.0);
@@ -1458,7 +1457,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     persistence_.Start();
     fileSearchService_.Start();
     previewService_.Start();
-    fileIndexService_.Start();
     PromptForPrivacyConsentIfNeeded();
     LoadPersistentState();
     UpdateClipboardListenerRegistration();
@@ -1498,7 +1496,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         [this](const DiscoveryRequest& request, std::stop_token token) {
           return PerformDiscovery(request, token);
         });
-    StartIconWorkers();
     StartAppDiscovery();
     StartCurrencyFetch();
     StartAutomaticUpdateCheck();
@@ -2280,10 +2277,15 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       NotifyWinEvent(EVENT_OBJECT_REORDER, hwnd_, OBJID_CLIENT, CHILDID_SELF);
     }
     auto decodedIcons = iconEvents_.Drain();
-    for (auto& icon : decodedIcons) {
-      pendingDecodedIcons_.insert_or_assign(icon.key, std::move(icon));
+    // Icons are only useful while the search overlay is visible.  Discovery
+    // and icon workers can finish after the overlay was dismissed; retaining
+    // those decoded pixel buffers would otherwise grow the hidden process.
+    if (visible_) {
+      for (auto& icon : decodedIcons) {
+        StorePendingDecodedIcon(std::move(icon));
+      }
     }
-    if (!decodedIcons.empty()) {
+    if (visible_ && !decodedIcons.empty()) {
       InvalidateRect(hwnd_, nullptr, FALSE);
     }
     for (auto& queued : networkEvents_.Drain()) {
@@ -3260,7 +3262,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void LoadPersistentState() {
     const auto state = persistence_.LoadStorageForStartup(
-        FileIndexLimit(), ClipboardHistoryLimit());
+        FileIndexLimit(), ClipboardHistoryLimit(), false);
     if (!state.opened) {
       const auto& error = state.error;
       const std::wstring detail =
@@ -3280,12 +3282,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
           L"FeatherCast Storage Recovery", MB_OK | MB_ICONWARNING);
     }
 
-    if (settings_.fileIndexEnabled) {
-      for (const auto& entry : state.files) {
-        if (!entry.path.empty() && !entry.name.empty()) fileIndex_.push_back(FileIndexApp(entry));
-      }
-      fileSearchService_.UpdateFiles(fileIndex_);
-    }
     if (settings_.clipboardHistoryEnabled) {
       for (const auto& entry : state.clipboard) {
         ClipboardEntry item;
@@ -3324,7 +3320,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!discoveryService_.Refresh(std::move(request))) {
       ReportBackgroundFailure(L"The discovery worker is unavailable.");
     }
-    if (!skipFileIndexOnce) ConfigureFileIndex();
+    // File indexing is intentionally demand-loaded.  Starting a full crawl
+    // here makes an otherwise idle launcher scan the user's folders at every
+    // process start; ConfigureFileIndex() is called when the Files scope or a
+    // privacy/rebuild action explicitly needs it.
   }
 
   std::vector<std::wstring> ResolvedFileIndexRoots() const {
@@ -3339,6 +3338,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   }
 
   void ConfigureFileIndex() {
+    if (!settings_.fileIndexEnabled) {
+      StopFileIndexService();
+      return;
+    }
+    if (!fileIndexServiceStarted_) {
+      fileIndexService_.Start();
+      fileIndexServiceStarted_ = true;
+    }
     feathercast::files::IndexRequest request;
     request.generation = ++fileIndexGeneration_;
     request.limit = FileIndexLimit();
@@ -3347,10 +3354,37 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!fileIndexService_.Reconfigure(std::move(request))) {
       ReportBackgroundFailure(L"The live file index worker is unavailable.");
     }
+    fileIndexConfigured_ = true;
+  }
+
+  void StopFileIndexService() {
+    if (!fileIndexServiceStarted_) return;
+    fileIndexService_.Stop();
+    fileIndexServiceStarted_ = false;
+    fileIndexConfigured_ = false;
+  }
+
+  bool EnsureFileIndexLoaded() {
+    if (!settings_.fileIndexEnabled || fileIndexLoaded_) return fileIndexLoaded_;
+    const auto entries = persistence_.LoadFileIndex(FileIndexLimit());
+    std::vector<AppEntry> files;
+    files.reserve(entries.size());
+    for (const auto& entry : entries) {
+      if (!entry.path.empty() && !entry.name.empty()) files.push_back(FileIndexApp(entry));
+    }
+    {
+      std::lock_guard lock(dataMutex_);
+      fileIndex_ = files;
+    }
+    fileSearchService_.UpdateFiles(std::move(files));
+    fileIndexLoaded_ = true;
+    MarkSearchDataChanged();
+    return true;
   }
 
   void OnFileIndexReady(feathercast::files::IndexStatus status) {
-    if (!fileIndexService_.IsCurrent(status.generation)) return;
+    if (!fileIndexServiceStarted_ ||
+        !fileIndexService_.IsCurrent(status.generation)) return;
     const auto entryCount = status.entries.size();
     std::vector<AppEntry> files;
     files.reserve(status.entries.size());
@@ -3423,10 +3457,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       SetSettingsStatus(StatusSeverity::Success,
                         L"Apps refreshed; file indexing continues in the background.");
     }
-    const auto generation = result.generation;
-    launchExecutor_.Submit([this, generation](std::stop_token token) {
-      PrecacheIcons(token, generation);
-    });
   }
 
   // Loads cached FX rates immediately, then refreshes from the network in the
@@ -4043,6 +4073,12 @@ class FeatherCastApp : public feathercast::accessibility::Model {
 
   void RequestSearch() {
     overlayStatus_.reset();
+    const auto requestedScope = feathercast::search_scope::Parse(query_).scope;
+    if (settings_.fileIndexEnabled &&
+        requestedScope == feathercast::search_scope::Scope::Files) {
+      EnsureFileIndexLoaded();
+      if (!fileIndexConfigured_) ConfigureFileIndex();
+    }
     QueryRequest req = GatherRequest();
     if (std::abs(overlayVisualScroll_.Target() -
                  static_cast<double>(scroll_)) > 0.001) {
@@ -4057,8 +4093,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (!req.compactClear && !req.actionMode &&
         req.browseView == BrowseView::None &&
         req.scope == feathercast::search_scope::Scope::Files) {
-      pendingResultsOpacity_.Retarget(0.38, 0.060,
-                                      visible_ && FadeAnimationsAllowed());
       if (!fileSearchService_.Query(
               {req.generation, req.query, req.limit,
                settings_.fileContentIndexEnabled})) {
@@ -4067,12 +4101,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       return;
     }
     if (req.compactClear || req.empty || req.actionMode) {
-      pendingResultsOpacity_.Snap(1.0);
       ApplyResults(ComputeResults(req));
     } else {
-      pendingResultsOpacity_.Retarget(0.38, 0.060,
-                                      visible_ && FadeAnimationsAllowed());
-      if (pendingResultsOpacity_.Active()) RequestAnimationFrame();
       DispatchToWorker(std::move(req));
     }
   }
@@ -4365,9 +4395,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // UI thread: commit a freshly computed result set to the rendered state.
   void ApplyResults(ResultsCollection result) {
     if (!searchPresentation_.Publish(result.generation)) return;
-    pendingResultsOpacity_.Retarget(1.0, 0.060,
-                                    visible_ && FadeAnimationsAllowed());
-    if (pendingResultsOpacity_.Active()) RequestAnimationFrame();
     const ResultPositions oldPositions = CaptureResultPositions();
     const bool preserveSelection = query_ == displayedQuery_;
     const std::wstring selectedKey =
@@ -4562,9 +4589,29 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     if (isForeground) {
       EnterInteractiveScheduling();
     } else {
-      // Retain prepared search, rendering, icon, emoji, and extension state so
-      // the next launcher invocation stays warm. Only query-specific results
-      // are discarded; reusable capacity is intentionally kept.
+      // File watchers and the indexing worker are only needed while the
+      // launcher is actively being used. Stop them with the overlay so a
+      // hidden launcher does not keep crawling user folders.
+      StopFileIndexService();
+      // Drop query-independent snapshots and decoded icon buffers while idle.
+      // They are rebuilt lazily on the next invocation and can otherwise keep
+      // hundreds of megabytes resident after a large discovery/index pass.
+      snapshot_.reset();
+      snapshotRevision_ = 0;
+      snapshotScheduledRevision_ = 0;
+      ClearIconBitmaps();
+      iconResolver_.ClearPending();
+      StopIconThreads();
+
+      {
+        std::lock_guard lock(dataMutex_);
+        fileIndex_.clear();
+      }
+      fileSearchService_.UpdateFiles({});
+      fileIndexLoaded_ = false;
+
+      // Only query-specific results are discarded here; the source data stays
+      // available for the next search without another discovery pass.
       searchPresentation_.Invalidate();
       searchCoordinator_.Invalidate(searchPresentation_.Requested());
       fileSearchService_.Invalidate(searchPresentation_.Requested());
@@ -4575,6 +4622,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // Background work remains unobtrusive without forcing page faults,
       // re-decoding icons, or restarting plugin hosts on every reopen.
       EnterBackgroundScheduling();
+      SetTimer(hwnd_, TIMER_MEM_TRIM, 1000, nullptr);
     }
   }
 
@@ -5907,7 +5955,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     snap(settingsOpacity_);
     snap(volumeOpacity_);
     snap(confirmationProgress_);
-    snap(pendingResultsOpacity_);
     snap(settingsPageProgress_);
     for (auto& [_, animation] : switchAnimations_) snap(animation);
     for (auto& [_, element] : resultRowMotion_) snap(element.opacity);
@@ -6112,8 +6159,8 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     return HasRevealAnimation() || animatingSelection_ ||
            overlayOpacity_.Active() || settingsOpacity_.Active() ||
            volumeOpacity_.Active() || confirmationProgress_.Active() ||
-           pendingResultsOpacity_.Active() || overlayVisualScroll_.Active() ||
-           settingsVisualScroll_.Active() || settingsPageProgress_.Active() ||
+           overlayVisualScroll_.Active() || settingsVisualScroll_.Active() ||
+           settingsPageProgress_.Active() ||
            settingsCategoryTop_.Active() || volumeVisualPercent_.Active() ||
            overlayBounds_.Active() || settingsBounds_.Active() ||
            volumeBounds_.Active() || HasElementMotion(resultRowMotion_) ||
@@ -6153,7 +6200,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     settingsOpacity_.Update(deltaTime);
     volumeOpacity_.Update(deltaTime);
     confirmationProgress_.Update(deltaTime);
-    pendingResultsOpacity_.Update(deltaTime);
     overlayVisualScroll_.Update(deltaTime);
     settingsVisualScroll_.Update(deltaTime);
     settingsPageProgress_.Update(deltaTime);
@@ -7332,16 +7378,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     float y = resultsTop -
               static_cast<float>(overlayVisualScroll_.Value());
     int rowIndex = 0;
-    const float resultsOpacity = static_cast<float>(
-        std::clamp(pendingResultsOpacity_.Value(), 0.0, 1.0));
-    const bool dimStaleResults = resultsOpacity < 0.999f && !sections_.empty();
-    if (dimStaleResults) {
-      activeRT_->PushLayer(
-          D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
-                                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                D2D1::IdentityMatrix(), resultsOpacity),
-          nullptr);
-    }
     activeRT_->PushAxisAlignedClip(D2D1::RectF(0, resultsTop, resultsRight, resultsBottom), D2D1_ANTIALIAS_MODE_ALIASED);
     DrawSelectionPill(resultsRight);
     for (const auto& section : sections_) {
@@ -7418,7 +7454,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                                   resultsBottom - 8.0f});
       if (!previewSideBySide) hits_.clear();
     }
-    if (dimStaleResults) activeRT_->PopLayer();
 
     if (sections_.empty()) {
       DrawTextBlock(EmptyResultsMessage(),
@@ -8641,6 +8676,36 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     iconBitmaps_.clear();
     iconLru_.clear();
     pendingDecodedIcons_.clear();
+    pendingDecodedIconOrder_.clear();
+    pendingDecodedIconBytes_ = 0;
+  }
+
+  void StorePendingDecodedIcon(
+      feathercast::runtime::DecodedIcon icon) {
+    if (icon.key.empty()) return;
+    const auto bytes = icon.pixels.size();
+    if (auto existing = pendingDecodedIcons_.find(icon.key);
+        existing != pendingDecodedIcons_.end()) {
+      pendingDecodedIconBytes_ -=
+          std::min(pendingDecodedIconBytes_, existing->second.pixels.size());
+      existing->second = std::move(icon);
+    } else {
+      pendingDecodedIconOrder_.push_back(icon.key);
+      pendingDecodedIcons_.emplace(icon.key, std::move(icon));
+    }
+    pendingDecodedIconBytes_ += bytes;
+
+    while ((pendingDecodedIcons_.size() > kPendingDecodedIconCap ||
+            pendingDecodedIconBytes_ > kPendingDecodedIconBudget) &&
+           !pendingDecodedIconOrder_.empty()) {
+      const auto key = std::move(pendingDecodedIconOrder_.front());
+      pendingDecodedIconOrder_.pop_front();
+      const auto found = pendingDecodedIcons_.find(key);
+      if (found == pendingDecodedIcons_.end()) continue;
+      pendingDecodedIconBytes_ -=
+          std::min(pendingDecodedIconBytes_, found->second.pixels.size());
+      pendingDecodedIcons_.erase(found);
+    }
   }
 
   ComPtr<ID2D1Bitmap> IconBitmap(const std::wstring& key) {
@@ -8660,10 +8725,14 @@ class FeatherCastApp : public feathercast::accessibility::Model {
                   DXGI_FORMAT_B8G8R8A8_UNORM,
                   D2D1_ALPHA_MODE_PREMULTIPLIED)),
               bitmap.GetAddressOf()))) {
+        pendingDecodedIconBytes_ -=
+            std::min(pendingDecodedIconBytes_, decoded->second.pixels.size());
         pendingDecodedIcons_.erase(decoded);
         StoreIconBitmap(key, bitmap);
         return bitmap;
       }
+      pendingDecodedIconBytes_ -=
+          std::min(pendingDecodedIconBytes_, decoded->second.pixels.size());
       pendingDecodedIcons_.erase(decoded);
     }
 
@@ -8674,6 +8743,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   // Hand the key to the persistent icon worker pool. No thread is created here,
   // so repeated searches no longer accumulate threads.
   void QueueIcon(const std::wstring& key) {
+    // Start workers only when an icon is actually requested by a visible
+    // result.  This keeps idle startup free of icon threads and shell work.
+    StartIconWorkers();
     iconResolver_.Queue(key);
   }
 
@@ -9159,6 +9231,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     const bool wasRecording = recording_;
     feathercast::ui::SettingsController::SelectCategory(settingsState_, category);
     settingsFocusIndex_ = SettingsCategoryIndex(category);
+    if (category == SettingsCategory::Privacy && settings_.fileIndexEnabled) {
+      EnsureFileIndexLoaded();
+      if (!fileIndexConfigured_) ConfigureFileIndex();
+    }
     if (wasRecording) {
       shortcutRecorder_.Reset();
     }
@@ -9674,11 +9750,16 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settings_.fileIndexEnabled = !settings_.fileIndexEnabled;
         if (!settings_.fileIndexEnabled) {
           settings_.fileContentIndexEnabled = false;
+          StopFileIndexService();
           std::lock_guard lock(dataMutex_);
           fileIndex_.clear();
+          fileIndexLoaded_ = false;
         }
         PersistSettings();
-        ConfigureFileIndex();
+        if (settings_.fileIndexEnabled) {
+          EnsureFileIndexLoaded();
+          ConfigureFileIndex();
+        }
         RequestSearch();
         break;
       case HitType::FileContentIndexToggle:
@@ -9698,7 +9779,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
         settings_.fileContentIndexEnabled =
             !settings_.fileContentIndexEnabled;
         PersistSettings();
-        ConfigureFileIndex();
+        if (settings_.fileIndexEnabled) ConfigureFileIndex();
         break;
       case HitType::FileIndexLimitDown:
         settings_.fileIndexMaxEntries = std::clamp(
@@ -10245,6 +10326,7 @@ class FeatherCastApp : public feathercast::accessibility::Model {
       // Prevent a currently running index build from repopulating the database
       // after the verified DELETE commits.
       discoveryGeneration_ = discoveryService_.Cancel();
+      StopFileIndexService();
     }
     SetSettingsStatus(
         StatusSeverity::Progress,
@@ -10948,7 +11030,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
     std::error_code ec;
     std::filesystem::remove_all(IconCacheDir(), ec);
     std::filesystem::create_directories(IconCacheDir(), ec);
-    if (!stopThreads_) StartIconWorkers();
+    if (!stopThreads_ && visible_) StartIconWorkers();
+    // App discovery is useful for the launcher immediately, but the file
+    // index is demand-loaded when the Files scope is first selected.
     StartAppDiscovery();
     RequestSearch();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -11163,7 +11247,6 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   feathercast::motion::ScalarAnimation settingsOpacity_;
   feathercast::motion::ScalarAnimation volumeOpacity_;
   feathercast::motion::ScalarAnimation confirmationProgress_;
-  feathercast::motion::ScalarAnimation pendingResultsOpacity_;
   feathercast::motion::ScalarAnimation overlayVisualScroll_;
   feathercast::motion::ScalarAnimation settingsVisualScroll_;
   feathercast::motion::ScalarAnimation settingsPageProgress_;
@@ -11239,6 +11322,9 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::atomic<bool> appsReady_ = false;
   std::uint64_t discoveryGeneration_ = 0;
   std::uint64_t fileIndexGeneration_ = 0;
+  bool fileIndexServiceStarted_ = false;
+  bool fileIndexConfigured_ = false;
+  bool fileIndexLoaded_ = false;
   std::uint64_t previewGeneration_ = 0;
   uint64_t snapshotScheduledRevision_ = 0;
   feathercast::interaction::SearchPresentationState searchPresentation_;
@@ -11287,6 +11373,10 @@ class FeatherCastApp : public feathercast::accessibility::Model {
   std::unordered_map<std::wstring, feathercast::runtime::DecodedIcon>
       pendingDecodedIcons_;
   static constexpr size_t kIconCacheCap = 256;
+  static constexpr size_t kPendingDecodedIconCap = 256;
+  static constexpr size_t kPendingDecodedIconBudget = 16 * 1024 * 1024;
+  std::deque<std::wstring> pendingDecodedIconOrder_;
+  size_t pendingDecodedIconBytes_ = 0;
 
   ComPtr<IDWriteFactory> dwriteFactory_;
   ComPtr<IWICImagingFactory> wicFactory_;
@@ -11381,10 +11471,12 @@ int RunFeatherCastSelfTest() {
   };
 
   // A windowless render-target lifecycle stress test. Recreating the complete
-  // WARP stack every 50 iterations simulates recovery from device loss; varied
-  // target sizes, DPI values, colors and text formats cover resize, DPI and
-  // theme/high-contrast invalidation without creating or focusing any HWND.
+  // WARP stack every 50 iterations simulates recovery from device loss. Each
+  // pass also mirrors the search overlay's transparent frame, clipped results,
+  // and per-row transition layer so typing regressions fail without showing or
+  // focusing an HWND.
   HRESULT lifecycleResult = S_OK;
+  int lifecycleFailureExit = 12;
   for (unsigned cycle = 0; cycle < 500; ++cycle) {
     if (cycle % 50 == 0) {
       lifecycleResult = recreateDevice();
@@ -11419,19 +11511,118 @@ int RunFeatherCastSelfTest() {
                          : D2D1::ColorF(0.24f, 0.52f, 0.96f, 1.0f),
         &brush);
     if (FAILED(lifecycleResult)) break;
-    renderContext->BeginDraw();
-    renderContext->Clear(
+    ComPtr<ID2D1SolidColorBrush> panelBrush;
+    lifecycleResult = renderContext->CreateSolidColorBrush(
         highContrastPass ? D2D1::ColorF(D2D1::ColorF::Black)
-                         : D2D1::ColorF(0.04f, 0.05f, 0.07f, 1.0f));
-    static constexpr wchar_t kText[] = L"FeatherCast lifecycle";
-    renderContext->DrawTextW(
-        kText, ARRAYSIZE(kText) - 1, format.Get(),
-        D2D1::RectF(8.0f, 8.0f, static_cast<float>(width - 8),
-                    static_cast<float>(height - 8)),
+                         : D2D1::ColorF(0.04f, 0.05f, 0.07f, 0.72f),
+        &panelBrush);
+    if (FAILED(lifecycleResult)) break;
+    renderContext->BeginDraw();
+    renderContext->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+    renderContext->FillRectangle(
+        D2D1::RectF(0.0f, 0.0f, static_cast<float>(width),
+                    static_cast<float>(height)),
+        panelBrush.Get());
+    renderContext->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(16.0f, 20.0f, 32.0f, 36.0f),
+                          4.0f, 4.0f),
         brush.Get());
+    static constexpr wchar_t kQuery[] = L"FeatherCast search";
+    renderContext->DrawTextW(
+        kQuery, ARRAYSIZE(kQuery) - 1, format.Get(),
+        D2D1::RectF(16.0f, 16.0f, static_cast<float>(width - 16), 52.0f),
+        brush.Get());
+    const D2D1_RECT_F resultsClip = D2D1::RectF(
+        0.0f, 60.0f, static_cast<float>(width),
+        static_cast<float>(height - 40));
+    renderContext->PushAxisAlignedClip(resultsClip,
+                                       D2D1_ANTIALIAS_MODE_ALIASED);
+    D2D1_MATRIX_3X2_F baseTransform{};
+    renderContext->GetTransform(&baseTransform);
+    const float rowOffset = static_cast<float>(cycle % 5);
+    renderContext->SetTransform(
+        D2D1::Matrix3x2F::Translation(0.0f, rowOffset) * baseTransform);
+    renderContext->PushLayer(
+        D2D1::LayerParameters(
+            D2D1::InfiniteRect(), nullptr,
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(),
+            0.65f + static_cast<float>(cycle % 4) * 0.1f),
+        nullptr);
+    renderContext->FillRoundedRectangle(
+        D2D1::RoundedRect(
+            D2D1::RectF(8.0f, 76.0f, static_cast<float>(width - 8), 126.0f),
+            8.0f, 8.0f),
+        brush.Get());
+    static constexpr wchar_t kResult[] = L"Visible search result";
+    renderContext->DrawTextW(
+        kResult, ARRAYSIZE(kResult) - 1, format.Get(),
+        D2D1::RectF(20.0f, 88.0f, static_cast<float>(width - 20), 118.0f),
+        panelBrush.Get());
+    renderContext->PopLayer();
+    renderContext->SetTransform(baseTransform);
+    static constexpr wchar_t kStatus[] = L"Searching...";
+    renderContext->DrawTextW(
+        kStatus, ARRAYSIZE(kStatus) - 1, format.Get(),
+        D2D1::RectF(static_cast<float>(width - 140), 64.0f,
+                    static_cast<float>(width - 16), 92.0f),
+        brush.Get());
+    renderContext->PopAxisAlignedClip();
     lifecycleResult = renderContext->EndDraw();
     renderContext->SetTarget(nullptr);
     if (FAILED(lifecycleResult)) break;
+
+    if (cycle % 25 == 0) {
+      ComPtr<ID2D1Bitmap1> readback;
+      const auto readbackProperties = D2D1::BitmapProperties1(
+          D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+          D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED),
+          dpi, dpi);
+      lifecycleResult = renderContext->CreateBitmap(
+          D2D1::SizeU(width, height), nullptr, 0, &readbackProperties,
+          &readback);
+      if (FAILED(lifecycleResult)) {
+        lifecycleFailureExit = 13;
+        break;
+      }
+      lifecycleResult = readback->CopyFromBitmap(nullptr, target.Get(), nullptr);
+      if (FAILED(lifecycleResult)) {
+        lifecycleFailureExit = 14;
+        break;
+      }
+      D2D1_MAPPED_RECT mapped{};
+      lifecycleResult = readback->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+      if (FAILED(lifecycleResult)) {
+        lifecycleFailureExit = 15;
+        break;
+      }
+      const BYTE* panelPixel = mapped.bits + 2 * mapped.pitch + 2 * 4;
+      const float pixelScale = dpi / 96.0f;
+      const UINT searchX = std::min<UINT>(
+          width - 1, static_cast<UINT>(std::lround(24.0f * pixelScale)));
+      const UINT searchY = std::min<UINT>(
+          height - 1, static_cast<UINT>(std::lround(28.0f * pixelScale)));
+      const BYTE* searchPixel =
+          mapped.bits + static_cast<size_t>(searchY) * mapped.pitch +
+          static_cast<size_t>(searchX) * 4;
+      const bool hasVisiblePixel = panelPixel[3] != 0;
+      const bool searchContentDiffersFromPanel =
+          panelPixel[0] != searchPixel[0] ||
+          panelPixel[1] != searchPixel[1] ||
+          panelPixel[2] != searchPixel[2] ||
+          panelPixel[3] != searchPixel[3];
+      const HRESULT unmapResult = readback->Unmap();
+      if (FAILED(unmapResult)) {
+        lifecycleResult = unmapResult;
+        lifecycleFailureExit = 16;
+        break;
+      }
+      if (!hasVisiblePixel || !searchContentDiffersFromPanel) {
+        lifecycleResult = E_FAIL;
+        lifecycleFailureExit = 17;
+        break;
+      }
+    }
   }
 
   renderContext.Reset();
@@ -11442,7 +11633,7 @@ int RunFeatherCastSelfTest() {
   imagingFactory.Reset();
   writeFactory.Reset();
   CoUninitialize();
-  return SUCCEEDED(lifecycleResult) ? 0 : 12;
+  return SUCCEEDED(lifecycleResult) ? 0 : lifecycleFailureExit;
 }
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {

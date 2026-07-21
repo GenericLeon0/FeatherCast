@@ -27,7 +27,7 @@ bool PersistenceService::SaveSettingsForStartup(
 }
 
 StorageStartupState PersistenceService::LoadStorageForStartup(
-    std::size_t fileLimit, std::size_t clipboardLimit) {
+    std::size_t fileLimit, std::size_t clipboardLimit, bool loadFiles) {
   StorageStartupState state;
   state.opened = EnsureStorageOpen();
   if (!state.opened) {
@@ -37,9 +37,28 @@ StorageStartupState PersistenceService::LoadStorageForStartup(
 
   state.recoveredFromCorruption = storage_.RecoveredFromCorruption();
   state.quarantinedPath = storage_.QuarantinedPath();
-  state.files = storage_.LoadFileIndex(fileLimit);
+  if (loadFiles) state.files = storage_.LoadFileIndex(fileLimit);
   state.clipboard = storage_.LoadClipboardHistory(clipboardLimit);
   return state;
+}
+
+std::vector<storage::FileIndexEntry> PersistenceService::LoadFileIndex(
+    std::size_t limit) {
+  // Serialize the lazy read with queued index writes.  Directly reading the
+  // shared Storage instance from the UI thread could race the persistence
+  // executor while a live scan is committing its previous batch.
+  auto result = std::make_shared<std::promise<std::vector<storage::FileIndexEntry>>>();
+  auto ready = result->get_future();
+  if (!executor_.Submit([this, limit, result](std::stop_token token) {
+        if (token.stop_requested() || !EnsureStorageOpen()) {
+          result->set_value({});
+          return;
+        }
+        result->set_value(storage_.LoadFileIndex(limit));
+      })) {
+    return {};
+  }
+  return ready.get();
 }
 
 void PersistenceService::Start() {
